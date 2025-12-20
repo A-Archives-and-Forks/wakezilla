@@ -262,9 +262,8 @@ impl TurnOffLimiter {
                                 }
                             };
 
-                            let broadcast_addr = Ipv4Addr::new(255, 255, 255, 255);
                             let wol_config = Default::default();
-                            if let Err(e) = crate::wol::send_packets(&mac, broadcast_addr, wol_port, 3, &wol_config).await {
+                            if let Err(e) = crate::wol::send_packets(&mac, wol_port, 3, &wol_config).await {
                                 error!("Failed to send WOL packet for {}: {}", mac_str_clone, e);
                                 return;
                             }
@@ -370,13 +369,7 @@ impl TurnOffLimiter {
         }
 
         limiter
-            .proxy_internal(
-                local_port,
-                remote_addr,
-                machine,
-                wol_port,
-                rx,
-            )
+            .proxy_internal(local_port, remote_addr, machine, wol_port, rx)
             .await
     }
 }

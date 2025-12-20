@@ -151,15 +151,12 @@ async fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<
     info!("Processing WOL send command");
 
     let mac = wol::parse_mac(&args.mac).context("Failed to parse MAC address")?;
-
-    let bcast = args
-        .broadcast
-        .unwrap_or(config.get_default_broadcast_addr());
+    let bcast = config.get_default_broadcast_addr();
 
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             let result = handle.block_on(async {
-                wol::send_packets(&mac, bcast, args.port, args.count, config)
+                wol::send_packets(&mac, args.port, args.count, config)
                     .await
                     .context("Failed to send WOL packets")?;
 

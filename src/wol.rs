@@ -9,11 +9,11 @@ use tracing::{debug, info, instrument, warn};
 #[instrument(name = "send_wol_packets", skip(mac, config))]
 pub async fn send_packets(
     mac: &[u8; 6],
-    bcast: Ipv4Addr,
     port: u16,
     count: u32,
     config: &crate::config::Config,
 ) -> Result<()> {
+    let bcast = config.get_default_broadcast_addr();
     let packet = build_magic_packet(mac);
     debug!(
         "Built WOL magic packet for MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",

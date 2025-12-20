@@ -446,11 +446,10 @@ async fn execute_wake(mac_input: &str) -> (axum::http::StatusCode, String) {
         }
     };
 
-    let bcast = std::net::Ipv4Addr::new(255, 255, 255, 255);
     let port = 9; // Default WOL port
     let count = 3;
 
-    match crate::wol::send_packets(&parsed_mac, bcast, port, count, &Default::default()).await {
+    match crate::wol::send_packets(&parsed_mac, port, count, &Default::default()).await {
         Ok(_) => (
             axum::http::StatusCode::OK,
             format!("Sent WOL packet to {}", mac_input),
