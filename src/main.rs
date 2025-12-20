@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Send(args) => {
-            handle_send_command(args, &config)?;
+            handle_send_command(args, &config).await?;
         }
         Commands::ProxyServer(_args) => {
             if let Err(e) = proxy_server::start(config.server.proxy_port).await {
@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
 }
 
 #[instrument(name = "handle_send_command", skip(args, config))]
-fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<()> {
+async fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<()> {
     info!("Processing WOL send command");
 
     let mac = wol::parse_mac(&args.mac).context("Failed to parse MAC address")?;
@@ -179,7 +179,9 @@ fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<()> {
                         args.interval_ms,
                         args.connect_timeout_ms,
                         config,
-                    ) {
+                    )
+                    .await
+                    {
                         anyhow::bail!(
                             "Host {}:{} did not become reachable within {} seconds",
                             ip,

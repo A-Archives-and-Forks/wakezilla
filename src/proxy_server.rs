@@ -181,7 +181,7 @@ async fn is_machine_on_api(
         let url = format!(
             "http://{}:{}/health",
             machine.ip,
-            machine.turn_off_port.unwrap_or(3000)
+            machine.turn_off_port.unwrap_or(3001)
         );
         let response = reqwest::get(&url).await;
         match response {
@@ -383,9 +383,17 @@ async fn delete_machine_api(
 
     // Remove connections from pool for this machine's IP
     if let Some(machine) = machines.iter().find(|m| m.mac == payload.mac) {
-        let target_addr = SocketAddr::from((machine.ip, 0));
-        state.connection_pool.remove_target(target_addr).await;
-        debug!("Removed connections from pool for machine {}", machine.ip);
+        //let target_addr = SocketAddr::from((machine.ip, 0));
+        for port_forward in &machine.port_forwards {
+            state
+                .connection_pool
+                .remove_target(SocketAddr::from((machine.ip, port_forward.local_port)))
+                .await;
+            debug!(
+                "Removed connections from pool for machine {} on port {}",
+                machine.ip, port_forward.local_port
+            );
+        }
     }
 
     machines.retain(|m| m.mac != payload.mac);
