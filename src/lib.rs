@@ -1,6 +1,5 @@
 pub mod client_server;
 pub mod config;
-pub mod connection_pool;
 pub mod forward;
 pub mod proxy_server;
 pub mod scanner;

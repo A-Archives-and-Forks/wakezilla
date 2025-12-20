@@ -1,4 +1,3 @@
-use crate::connection_pool::ConnectionPool;
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -138,7 +137,6 @@ fn default_can_be_turned_off() -> bool {
 pub struct AppState {
     pub machines: Arc<RwLock<Vec<Machine>>>,
     pub proxies: Arc<RwLock<HashMap<String, watch::Sender<bool>>>>,
-    pub connection_pool: ConnectionPool,
     pub turn_off_limiter: Arc<forward::TurnOffLimiter>,
     pub monitor_handle: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
 }
@@ -191,7 +189,6 @@ pub fn start_proxy_if_configured(machine: &Machine, state: &AppState) {
         let proxy_key = format!("{}-{}-{}", machine.mac, local_port, pf.target_port);
 
         let proxies_clone = state.proxies.clone();
-        let connection_pool_clone = state.connection_pool.clone();
         let limiter_clone = state.turn_off_limiter.clone();
         tokio::spawn(async move {
             let mut proxies = proxies_clone.write().await;
@@ -206,7 +203,6 @@ pub fn start_proxy_if_configured(machine: &Machine, state: &AppState) {
                 machine_clone,
                 wol_port,
                 rx,
-                connection_pool_clone,
                 limiter_clone,
             )
             .await

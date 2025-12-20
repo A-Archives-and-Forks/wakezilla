@@ -5,7 +5,6 @@ use tracing::{error, info, instrument, warn};
 
 mod client_server;
 mod config;
-mod connection_pool;
 mod forward;
 mod proxy_server;
 mod scanner;

@@ -1,4 +1,3 @@
-use crate::connection_pool::ConnectionPool;
 use anyhow::Result;
 use axum::{
     body::Body,
@@ -14,7 +13,7 @@ use std::sync::Arc;
 use tokio::{net::TcpListener, sync::RwLock};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use validator::Validate;
 
 use crate::forward;
@@ -95,19 +94,9 @@ async fn spa_fallback(req: Request<Body>) -> Response<Body> {
 pub async fn start(port: u16) -> Result<()> {
     let initial_machines = web::load_machines().unwrap_or_default();
 
-    // Create connection pool and start cleanup task
-    let connection_pool = ConnectionPool::new();
-    let cleanup_handle = connection_pool.start_cleanup_task();
-
-    // Spawn cleanup task
-    tokio::spawn(async move {
-        cleanup_handle.await.ok();
-    });
-
     let state = AppState {
         machines: Arc::new(RwLock::new(initial_machines.clone())),
         proxies: Arc::new(RwLock::new(HashMap::new())),
-        connection_pool,
         turn_off_limiter: Arc::new(forward::TurnOffLimiter::new()),
         monitor_handle: Arc::new(std::sync::Mutex::new(None)),
     };
@@ -381,21 +370,6 @@ async fn delete_machine_api(
 
     let mut machines = state.machines.write().await;
 
-    // Remove connections from pool for this machine's IP
-    if let Some(machine) = machines.iter().find(|m| m.mac == payload.mac) {
-        //let target_addr = SocketAddr::from((machine.ip, 0));
-        for port_forward in &machine.port_forwards {
-            state
-                .connection_pool
-                .remove_target(SocketAddr::from((machine.ip, port_forward.local_port)))
-                .await;
-            debug!(
-                "Removed connections from pool for machine {} on port {}",
-                machine.ip, port_forward.local_port
-            );
-        }
-    }
-
     machines.retain(|m| m.mac != payload.mac);
 
     if let Err(e) = web::save_machines(&machines) {
@@ -545,7 +519,6 @@ mod tests {
         let state = AppState {
             machines: Arc::new(RwLock::new(machines)),
             proxies: Arc::new(RwLock::new(HashMap::new())),
-            connection_pool: ConnectionPool::new(),
             turn_off_limiter: Arc::new(forward::TurnOffLimiter::new()),
             monitor_handle: Arc::new(std::sync::Mutex::new(None)),
         };
