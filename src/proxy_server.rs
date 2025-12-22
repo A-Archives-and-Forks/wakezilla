@@ -91,12 +91,14 @@ async fn spa_fallback(req: Request<Body>) -> Response<Body> {
     }
 }
 
-pub async fn start(port: u16) -> Result<()> {
+pub async fn start(config: crate::config::Config) -> Result<()> {
+    let port = config.server.proxy_port;
     let initial_machines = web::load_machines().unwrap_or_default();
 
     let state = AppState {
         machines: Arc::new(RwLock::new(initial_machines.clone())),
         proxies: Arc::new(RwLock::new(HashMap::new())),
+        config: Arc::new(config),
         turn_off_limiter: Arc::new(forward::TurnOffLimiter::new()),
         monitor_handle: Arc::new(std::sync::Mutex::new(None)),
     };
@@ -435,7 +437,7 @@ async fn api_turn_off_remote_machine(
     )
 }
 
-async fn execute_wake(mac_input: &str) -> (axum::http::StatusCode, String) {
+async fn execute_wake(state: &AppState, mac_input: &str) -> (axum::http::StatusCode, String) {
     let parsed_mac = match wol::parse_mac(mac_input) {
         Ok(mac) => mac,
         Err(e) => {
@@ -446,10 +448,10 @@ async fn execute_wake(mac_input: &str) -> (axum::http::StatusCode, String) {
         }
     };
 
-    let port = 9; // Default WOL port
-    let count = 3;
+    let port = state.config.wol.default_port;
+    let count = state.config.wol.default_packet_count;
 
-    match crate::wol::send_packets(&parsed_mac, port, count, &Default::default()).await {
+    match crate::wol::send_packets(&parsed_mac, port, count, &state.config).await {
         Ok(_) => (
             axum::http::StatusCode::OK,
             format!("Sent WOL packet to {}", mac_input),
@@ -461,8 +463,11 @@ async fn execute_wake(mac_input: &str) -> (axum::http::StatusCode, String) {
     }
 }
 
-async fn api_wake_machine(Path(mac): Path<String>) -> impl IntoResponse {
-    let (status, message) = execute_wake(&mac).await;
+async fn api_wake_machine(
+    State(state): State<AppState>,
+    Path(mac): Path<String>,
+) -> impl IntoResponse {
+    let (status, message) = execute_wake(&state, &mac).await;
     (
         status,
         Json(serde_json::json!({
@@ -477,7 +482,7 @@ mod tests {
     use crate::test_support::ENV_LOCK;
     use axum::{
         body::{to_bytes, Body},
-        extract::Path,
+        extract::{Path, State},
         http::{Method, Request, StatusCode},
         response::IntoResponse,
         Json,
@@ -518,6 +523,7 @@ mod tests {
         let state = AppState {
             machines: Arc::new(RwLock::new(machines)),
             proxies: Arc::new(RwLock::new(HashMap::new())),
+            config: Arc::new(crate::config::Config::default()),
             turn_off_limiter: Arc::new(forward::TurnOffLimiter::new()),
             monitor_handle: Arc::new(std::sync::Mutex::new(None)),
         };
@@ -692,14 +698,16 @@ mod tests {
 
     #[tokio::test]
     async fn execute_wake_rejects_invalid_mac() {
-        let (status, message) = execute_wake("invalid").await;
+        let state = state_with_machines(vec![]);
+        let (status, message) = execute_wake(&state, "invalid").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(message.contains("Invalid MAC address"));
     }
 
     #[tokio::test]
     async fn api_wake_machine_returns_json_for_invalid_mac() {
-        let response = api_wake_machine(Path("invalid".to_string()))
+        let state = state_with_machines(vec![]);
+        let response = api_wake_machine(State(state), Path("invalid".to_string()))
             .await
             .into_response();
 

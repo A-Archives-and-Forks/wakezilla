@@ -130,7 +130,7 @@ async fn main() -> Result<()> {
             handle_send_command(args, &config).await?;
         }
         Commands::ProxyServer(_args) => {
-            if let Err(e) = proxy_server::start(config.server.proxy_port).await {
+            if let Err(e) = proxy_server::start(config.clone()).await {
                 error!("Proxy server error: {}", e);
                 std::process::exit(1);
             }

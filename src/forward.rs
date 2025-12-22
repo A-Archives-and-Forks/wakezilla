@@ -1,4 +1,4 @@
-use crate::{web::Machine, wol};
+use crate::{config::Config, web::Machine, wol};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -205,8 +205,8 @@ impl TurnOffLimiter {
         local_port: u16,
         remote_addr: SocketAddr,
         machine: Machine,
-        wol_port: u16,
         mut rx: watch::Receiver<bool>,
+        config: Arc<Config>,
     ) -> Result<()> {
         let listen_addr = format!("0.0.0.0:{}", local_port);
         let listener = TcpListener::bind(&listen_addr)
@@ -241,6 +241,7 @@ impl TurnOffLimiter {
                     let mac_str_clone = machine.mac.clone();
                     let rate_limiter = self.clone();
                     let machine_ip_clone = machine_ip;
+                    let config_clone = Arc::clone(&config);
 
                     tokio::spawn(async move {
                         // Update last_request whenever we receive a connection
@@ -262,8 +263,16 @@ impl TurnOffLimiter {
                                 }
                             };
 
-                            let wol_config = Default::default();
-                            if let Err(e) = crate::wol::send_packets(&mac, wol_port, 3, &wol_config).await {
+                            let wol_port = config_clone.wol.default_port;
+                            let wol_count = config_clone.wol.default_packet_count;
+                            if let Err(e) = crate::wol::send_packets(
+                                &mac,
+                                wol_port,
+                                wol_count,
+                                &config_clone,
+                            )
+                            .await
+                            {
                                 error!("Failed to send WOL packet for {}: {}", mac_str_clone, e);
                                 return;
                             }
@@ -343,9 +352,9 @@ impl TurnOffLimiter {
         local_port: u16,
         remote_addr: SocketAddr,
         machine: Machine,
-        wol_port: u16,
         rx: watch::Receiver<bool>,
         limiter: Arc<TurnOffLimiter>,
+        config: Arc<Config>,
     ) -> Result<()> {
         // Initialize machine configuration if turn-off is enabled
         if machine.can_be_turned_off {
@@ -369,7 +378,7 @@ impl TurnOffLimiter {
         }
 
         limiter
-            .proxy_internal(local_port, remote_addr, machine, wol_port, rx)
+            .proxy_internal(local_port, remote_addr, machine, rx, config)
             .await
     }
 }
