@@ -241,9 +241,11 @@ pub fn restart_global_monitor(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ENV_LOCK;
+    use once_cell::sync::Lazy;
     use std::net::Ipv4Addr;
     use tempfile::{tempdir, NamedTempFile};
+
+    static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
 
     struct EnvGuard {
         key: &'static str,

@@ -7,7 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use std::sync::Arc;
-use wakezilla::connection_pool::ConnectionPool;
+use wakezilla::config::Config;
 use wakezilla::forward::{self, TurnOffLimiter};
 use wakezilla::web::Machine;
 
@@ -67,7 +67,6 @@ async fn proxy_forwards_tcp_traffic_and_can_shutdown() {
     };
 
     let (tx, rx) = watch::channel(true);
-    let connection_pool = ConnectionPool::new();
     let local_port = match find_free_port() {
         Ok(port) => port,
         Err(err) if err.kind() == ErrorKind::PermissionDenied => {
@@ -81,14 +80,14 @@ async fn proxy_forwards_tcp_traffic_and_can_shutdown() {
     };
 
     let limiter = Arc::new(TurnOffLimiter::new());
+    let config = Arc::new(Config::default());
     let proxy_task = tokio::spawn(forward::TurnOffLimiter::proxy(
         local_port,
         remote_addr,
         machine,
-        9,
         rx,
-        connection_pool.clone(),
         limiter,
+        config,
     ));
 
     // Give the proxy a moment to bind its listener

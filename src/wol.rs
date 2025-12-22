@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[tokio::test]
-    fn check_host_returns_true_when_host_up() {
+    async fn check_host_returns_true_when_host_up() {
         let listener = match TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => listener,
             Err(err) if err.kind() == ErrorKind::PermissionDenied => {

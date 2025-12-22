@@ -479,7 +479,6 @@ async fn api_wake_machine(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ENV_LOCK;
     use axum::{
         body::{to_bytes, Body},
         extract::{Path, State},
@@ -487,6 +486,7 @@ mod tests {
         response::IntoResponse,
         Json,
     };
+    use once_cell::sync::Lazy;
     use std::collections::HashMap;
     use std::io::ErrorKind;
     use std::net::Ipv4Addr;
@@ -495,6 +495,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::{watch, Mutex as AsyncMutex, RwLock};
+
+    static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
 
     struct EnvGuard {
         key: &'static str,

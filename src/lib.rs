@@ -6,6 +6,3 @@ pub mod scanner;
 pub mod system;
 pub mod web;
 pub mod wol;
-
-#[cfg(test)]
-pub(crate) mod test_support;
