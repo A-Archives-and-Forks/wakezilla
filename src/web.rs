@@ -1,4 +1,3 @@
-use crate::connection_pool::ConnectionPool;
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -31,6 +30,7 @@ where
     Ipv4Addr::from_str(&s).map_err(serde::de::Error::custom)
 }
 
+use crate::config::Config;
 use crate::forward;
 
 const DEFAULT_DB_PATH: &str = "machines.json";
@@ -138,7 +138,7 @@ fn default_can_be_turned_off() -> bool {
 pub struct AppState {
     pub machines: Arc<RwLock<Vec<Machine>>>,
     pub proxies: Arc<RwLock<HashMap<String, watch::Sender<bool>>>>,
-    pub connection_pool: ConnectionPool,
+    pub config: Arc<Config>,
     pub turn_off_limiter: Arc<forward::TurnOffLimiter>,
     pub monitor_handle: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
 }
@@ -182,16 +182,15 @@ pub fn save_machines(machines: &[Machine]) -> Result<()> {
 pub fn start_proxy_if_configured(machine: &Machine, state: &AppState) {
     for pf in &machine.port_forwards {
         let remote_addr = SocketAddr::new(machine.ip.into(), pf.target_port);
-        let wol_port = 9; // Default WOL port
         let local_port = pf.local_port;
         let machine_clone = machine.clone();
+        let config_clone = state.config.clone();
 
         let (tx, rx) = watch::channel(true);
         // The key for the proxy should probably include the port to be unique
         let proxy_key = format!("{}-{}-{}", machine.mac, local_port, pf.target_port);
 
         let proxies_clone = state.proxies.clone();
-        let connection_pool_clone = state.connection_pool.clone();
         let limiter_clone = state.turn_off_limiter.clone();
         tokio::spawn(async move {
             let mut proxies = proxies_clone.write().await;
@@ -204,10 +203,9 @@ pub fn start_proxy_if_configured(machine: &Machine, state: &AppState) {
                 local_port,
                 remote_addr,
                 machine_clone,
-                wol_port,
                 rx,
-                connection_pool_clone,
                 limiter_clone,
+                config_clone,
             )
             .await
             {
@@ -243,9 +241,11 @@ pub fn restart_global_monitor(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ENV_LOCK;
+    use once_cell::sync::Lazy;
     use std::net::Ipv4Addr;
     use tempfile::{tempdir, NamedTempFile};
+
+    static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
 
     struct EnvGuard {
         key: &'static str,

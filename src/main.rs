@@ -5,16 +5,12 @@ use tracing::{error, info, instrument, warn};
 
 mod client_server;
 mod config;
-mod connection_pool;
 mod forward;
 mod proxy_server;
 mod scanner;
 mod system;
 mod web;
 mod wol;
-
-#[cfg(test)]
-mod test_support;
 
 /// Simple Wake-on-LAN sender + post-WOL reachability check.
 #[derive(Parser, Debug)]
@@ -128,10 +124,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Send(args) => {
-            handle_send_command(args, &config)?;
+            handle_send_command(args, &config).await?;
         }
         Commands::ProxyServer(_args) => {
-            if let Err(e) = proxy_server::start(config.server.proxy_port).await {
+            if let Err(e) = proxy_server::start(config.clone()).await {
                 error!("Proxy server error: {}", e);
                 std::process::exit(1);
             }
@@ -148,19 +144,16 @@ async fn main() -> Result<()> {
 }
 
 #[instrument(name = "handle_send_command", skip(args, config))]
-fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<()> {
+async fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<()> {
     info!("Processing WOL send command");
 
     let mac = wol::parse_mac(&args.mac).context("Failed to parse MAC address")?;
-
-    let bcast = args
-        .broadcast
-        .unwrap_or(config.get_default_broadcast_addr());
+    let bcast = config.get_default_broadcast_addr();
 
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             let result = handle.block_on(async {
-                wol::send_packets(&mac, bcast, args.port, args.count, config)
+                wol::send_packets(&mac, args.port, args.count, config)
                     .await
                     .context("Failed to send WOL packets")?;
 
@@ -179,7 +172,9 @@ fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<()> {
                         args.interval_ms,
                         args.connect_timeout_ms,
                         config,
-                    ) {
+                    )
+                    .await
+                    {
                         anyhow::bail!(
                             "Host {}:{} did not become reachable within {} seconds",
                             ip,

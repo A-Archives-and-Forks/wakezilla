@@ -1,5 +1,4 @@
-use crate::connection_pool::ConnectionPool;
-use crate::{web::Machine, wol};
+use crate::{config::Config, web::Machine, wol};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -29,6 +28,12 @@ struct MachineConfig {
 #[derive(Clone)]
 pub struct TurnOffLimiter {
     machines: Arc<Mutex<HashMap<Ipv4Addr, MachineConfig>>>,
+}
+
+impl Default for TurnOffLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TurnOffLimiter {
@@ -200,9 +205,8 @@ impl TurnOffLimiter {
         local_port: u16,
         remote_addr: SocketAddr,
         machine: Machine,
-        wol_port: u16,
         mut rx: watch::Receiver<bool>,
-        connection_pool: ConnectionPool,
+        config: Arc<Config>,
     ) -> Result<()> {
         let listen_addr = format!("0.0.0.0:{}", local_port);
         let listener = TcpListener::bind(&listen_addr)
@@ -237,8 +241,8 @@ impl TurnOffLimiter {
                     let mac_str_clone = machine.mac.clone();
                     let rate_limiter = self.clone();
                     let machine_ip_clone = machine_ip;
+                    let config_clone = Arc::clone(&config);
 
-                    let connection_pool_clone = connection_pool.clone();
                     tokio::spawn(async move {
                         // Update last_request whenever we receive a connection
                         rate_limiter.update_last_request(machine_ip_clone);
@@ -259,9 +263,16 @@ impl TurnOffLimiter {
                                 }
                             };
 
-                            let broadcast_addr = Ipv4Addr::new(255, 255, 255, 255);
-                            let wol_config = Default::default();
-                            if let Err(e) = crate::wol::send_packets(&mac, broadcast_addr, wol_port, 3, &wol_config).await {
+                            let wol_port = config_clone.wol.default_port;
+                            let wol_count = config_clone.wol.default_packet_count;
+                            if let Err(e) = crate::wol::send_packets(
+                                &mac,
+                                wol_port,
+                                wol_count,
+                                &config_clone,
+                            )
+                            .await
+                            {
                                 error!("Failed to send WOL packet for {}: {}", mac_str_clone, e);
                                 return;
                             }
@@ -291,22 +302,31 @@ impl TurnOffLimiter {
                             }
                         }
 
-                        let mut outbound = match connection_pool_clone.get_connection(remote_addr_clone).await {
-                            Ok(stream) => {
-                                debug!("Successfully obtained or created connection to {}", remote_addr_clone);
+                        let mut outbound = match tokio::time::timeout(
+                            Duration::from_secs(30),
+                            tokio::net::TcpStream::connect(remote_addr_clone),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => {
+                                debug!("Successfully connected to {}", remote_addr_clone);
                                 stream
                             }
-                            Err(e) => {
-                                error!("Failed to obtain connection to remote {}: {}", remote_addr_clone, e);
+                            Ok(Err(e)) => {
+                                error!(
+                                    "Failed to connect to remote {}: {}",
+                                    remote_addr_clone, e
+                                );
+                                return;
+                            }
+                            Err(_) => {
+                                error!("Timeout connecting to remote {}", remote_addr_clone);
                                 return;
                             }
                         };
 
                         match copy_bidirectional(&mut inbound, &mut outbound).await {
                             Ok(_) => {
-                                // Most targets close the connection after each request.
-                                // Drop the stream instead of reusing a socket that is very
-                                // likely already shut down by the remote endpoint.
                                 drop(outbound);
                                 debug!(
                                     "Completed data transfer for {} (connection closed)",
@@ -314,9 +334,7 @@ impl TurnOffLimiter {
                                 );
                             }
                             Err(e) => {
-                                // Drop the broken connection so it isn't re-used from the pool.
                                 drop(outbound);
-                                connection_pool_clone.remove_target(remote_addr_clone).await;
                                 warn!(
                                     "Error forwarding data between {} and {}: {}",
                                     client_addr, remote_addr_clone, e
@@ -334,10 +352,9 @@ impl TurnOffLimiter {
         local_port: u16,
         remote_addr: SocketAddr,
         machine: Machine,
-        wol_port: u16,
         rx: watch::Receiver<bool>,
-        connection_pool: ConnectionPool,
         limiter: Arc<TurnOffLimiter>,
+        config: Arc<Config>,
     ) -> Result<()> {
         // Initialize machine configuration if turn-off is enabled
         if machine.can_be_turned_off {
@@ -361,14 +378,7 @@ impl TurnOffLimiter {
         }
 
         limiter
-            .proxy_internal(
-                local_port,
-                remote_addr,
-                machine,
-                wol_port,
-                rx,
-                connection_pool,
-            )
+            .proxy_internal(local_port, remote_addr, machine, rx, config)
             .await
     }
 }

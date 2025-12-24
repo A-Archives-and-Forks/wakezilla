@@ -7,7 +7,7 @@ use http_body_util::BodyExt;
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 use tower::util::ServiceExt;
-use wakezilla::connection_pool::ConnectionPool;
+use wakezilla::config::Config;
 use wakezilla::forward::TurnOffLimiter;
 use wakezilla::proxy_server::{api_routes, build_router};
 use wakezilla::web::{AppState, Machine};
@@ -35,13 +35,14 @@ fn setup_state(temp_dir: &TempDir) -> (AppState, EnvVarGuard) {
         "WAKEZILLA__STORAGE__MACHINES_DB_PATH",
         db_path.to_str().expect("temp path should be valid utf-8"),
     );
+    let config = Config::from_env().unwrap_or_default();
 
     let machines = Arc::new(RwLock::new(Vec::<Machine>::new())) as Arc<RwLock<Vec<Machine>>>;
     let proxies = Arc::new(RwLock::new(HashMap::new()));
     let state = AppState {
         machines,
         proxies,
-        connection_pool: ConnectionPool::new(),
+        config: Arc::new(config),
         turn_off_limiter: Arc::new(TurnOffLimiter::new()),
         monitor_handle: Arc::new(std::sync::Mutex::new(None)),
     };

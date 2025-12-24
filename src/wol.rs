@@ -2,17 +2,18 @@ use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::time::sleep;
 use tracing::{debug, info, instrument, warn};
 
 /// Send WOL magic packets.
 #[instrument(name = "send_wol_packets", skip(mac, config))]
 pub async fn send_packets(
     mac: &[u8; 6],
-    bcast: Ipv4Addr,
     port: u16,
     count: u32,
     config: &crate::config::Config,
 ) -> Result<()> {
+    let bcast = config.get_default_broadcast_addr();
     let packet = build_magic_packet(mac);
     debug!(
         "Built WOL magic packet for MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -46,7 +47,7 @@ pub async fn send_packets(
 
 /// Poll a TCP port on a host until it becomes reachable or a timeout is hit.
 #[instrument(name = "check_host_reachability", skip(ip))]
-pub fn check_host(
+pub async fn check_host(
     ip: IpAddr,
     check_tcp_port: u16,
     wait_secs: u64,
@@ -80,7 +81,8 @@ pub fn check_host(
             "Host {}:{} not reachable, waiting {:?} before next check",
             ip, check_tcp_port, poll_every
         );
-        std::thread::sleep(poll_every);
+
+        sleep(poll_every).await;
     }
 }
 
@@ -208,15 +210,15 @@ mod tests {
         drop(listener);
     }
 
-    #[test]
-    fn check_host_returns_false_when_unreachable() {
+    #[tokio::test]
+    async fn check_host_returns_false_when_unreachable() {
         let config = Config::default();
-        let result = check_host(IpAddr::V4(Ipv4Addr::LOCALHOST), 65_000, 0, 10, 10, &config);
+        let result = check_host(IpAddr::V4(Ipv4Addr::LOCALHOST), 65_000, 0, 10, 10, &config).await;
         assert!(!result);
     }
 
-    #[test]
-    fn check_host_returns_true_when_host_up() {
+    #[tokio::test]
+    async fn check_host_returns_true_when_host_up() {
         let listener = match TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => listener,
             Err(err) if err.kind() == ErrorKind::PermissionDenied => {
@@ -227,7 +229,7 @@ mod tests {
         };
         let addr = listener.local_addr().expect("failed to get addr");
         let config = Config::default();
-        let is_up = check_host(addr.ip(), addr.port(), 1, 10, 50, &config);
+        let is_up = check_host(addr.ip(), addr.port(), 1, 10, 50, &config).await;
         assert!(is_up);
         drop(listener);
     }
