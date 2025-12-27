@@ -1,6 +1,6 @@
 use crate::{config::Config, web::Machine, wol};
 use anyhow::{Context, Result};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,8 +16,6 @@ fn turn_off_url(remote_ip: &str, turn_off_port: u16) -> String {
 }
 
 struct MachineConfig {
-    request_times: VecDeque<Instant>,
-    max_requests: usize,
     window: Duration,
     turn_off_port: u16,
     mac: String,
@@ -47,8 +45,6 @@ impl TurnOffLimiter {
         let window_minutes = machine.inactivity_period.max(1);
         let window_secs = window_minutes.saturating_mul(60);
         let config = MachineConfig {
-            request_times: VecDeque::new(),
-            max_requests: 0, // No longer used for rate limiting
             window: Duration::from_secs(window_secs as u64),
             turn_off_port,
             mac: machine.mac.clone(),
@@ -82,66 +78,15 @@ impl TurnOffLimiter {
         }
     }
 
-    fn record_request(&self, ip: Ipv4Addr) -> Option<(usize, u16, String, Duration)> {
-        let mut machines = self.machines.lock().unwrap();
-        let config = machines.get_mut(&ip)?;
-
-        if config.max_requests == 0 {
-            return None;
-        }
-
-        let now = Instant::now();
-        config.request_times.push_back(now);
-        config.last_request = now;
-
-        while let Some(oldest) = config.request_times.front() {
-            if now.duration_since(*oldest) > config.window {
-                config.request_times.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        let current = config.request_times.len();
-        if current >= config.max_requests && !config.triggered.swap(true, Ordering::SeqCst) {
-            Some((
-                current,
-                config.turn_off_port,
-                config.mac.clone(),
-                config.window,
-            ))
-        } else {
-            None
-        }
-    }
-
     pub fn update_last_request(&self, ip: Ipv4Addr) {
         let mut machines = self.machines.lock().unwrap();
         if let Some(config) = machines.get_mut(&ip) {
             config.last_request = Instant::now();
+            config.triggered.store(false, Ordering::SeqCst);
             debug!(
                 "Updated last_request for machine {} (IP: {})",
                 config.mac, ip
             );
-        }
-    }
-
-    fn check_and_trigger_turn_off(&self, ip: Ipv4Addr) {
-        debug!("Checking request limit for {}", ip);
-        if let Some((hit_count, turn_off_port, mac, window)) = self.record_request(ip) {
-            let remote_ip = ip.to_string();
-            tokio::spawn(async move {
-                info!(
-                    "Request limit reached for {}: {} requests within {:?}, sending turn-off signal",
-                    mac, hit_count, window
-                );
-                if let Err(e) = turn_off_remote_machine(&remote_ip, turn_off_port).await {
-                    error!(
-                        "Failed to send turn-off signal for {} on {}:{}: {}",
-                        mac, remote_ip, turn_off_port, e
-                    );
-                }
-            });
         }
     }
 
@@ -246,7 +191,6 @@ impl TurnOffLimiter {
                     tokio::spawn(async move {
                         // Update last_request whenever we receive a connection
                         rate_limiter.update_last_request(machine_ip_clone);
-                        rate_limiter.check_and_trigger_turn_off(machine_ip_clone);
 
                         let connect_timeout = Duration::from_millis(1000);
                         if !wol::tcp_check(remote_addr_clone, connect_timeout) {
