@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::sleep;
 use tracing::{debug, info, instrument, warn};
 
@@ -67,7 +67,7 @@ pub async fn check_host(
 
     loop {
         debug!("Checking if {}:{} is reachable", ip, check_tcp_port);
-        if tcp_check(target, connect_timeout) {
+        if tcp_check(target, connect_timeout).await {
             info!("Host {}:{} is UP ✅", ip, check_tcp_port);
             return true;
         }
@@ -87,8 +87,11 @@ pub async fn check_host(
 }
 
 /// One-shot TCP "ping": returns true if connect succeeds within timeout.
-pub fn tcp_check(addr: SocketAddr, timeout: Duration) -> bool {
-    TcpStream::connect_timeout(&addr, timeout).is_ok()
+pub async fn tcp_check(addr: SocketAddr, timeout: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
 }
 
 /// Parse MAC address from common string formats.
@@ -192,8 +195,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tcp_check_reports_true_when_server_listening() {
+    #[tokio::test]
+    async fn tcp_check_reports_true_when_server_listening() {
         let listener = match TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => listener,
             Err(err) if err.kind() == ErrorKind::PermissionDenied => {
@@ -206,7 +209,7 @@ mod tests {
             Err(err) => panic!("failed to bind listener: {err}"),
         };
         let addr = listener.local_addr().expect("failed to get addr");
-        assert!(tcp_check(addr, Duration::from_millis(100)));
+        assert!(tcp_check(addr, Duration::from_millis(100)).await);
         drop(listener);
     }
 
