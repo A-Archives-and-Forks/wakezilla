@@ -193,7 +193,7 @@ impl TurnOffLimiter {
                         rate_limiter.update_last_request(machine_ip_clone);
 
                         let connect_timeout = Duration::from_millis(1000);
-                        if !wol::tcp_check(remote_addr_clone, connect_timeout) {
+                        if !wol::tcp_check(remote_addr_clone, connect_timeout).await {
                             info!(
                                 "Host {} seems to be down. Sending WOL packet to MAC {}.",
                                 remote_addr_clone, mac_str_clone
@@ -229,7 +229,7 @@ impl TurnOffLimiter {
                             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
                             let mut host_up = false;
                             while tokio::time::Instant::now() < deadline {
-                                if wol::tcp_check(remote_addr_clone, connect_timeout) {
+                                if wol::tcp_check(remote_addr_clone, connect_timeout).await {
                                     info!("Host {} is now up.", remote_addr_clone);
                                     host_up = true;
                                     break;
