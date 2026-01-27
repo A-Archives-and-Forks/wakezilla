@@ -282,12 +282,17 @@ impl NetworkInterface {
     )?;
 
         // Use buffer_unordered to limit concurrent hostname lookups,
-        // preventing DNS/task spikes on large subnets
+        // preventing DNS/task spikes on large subnets.
+        // Offload blocking DNS lookups to spawn_blocking to avoid blocking the executor.
         let discovered_devices: Vec<DiscoveredDevice> =
             futures_util::stream::iter(discovered_devices_no_hostname)
                 .map(|mut device| async move {
                     if let Ok(ip_addr) = device.ip.parse::<IpAddr>() {
-                        device.hostname = dns_lookup::lookup_addr(&ip_addr).ok();
+                        let hostname_result =
+                            tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip_addr))
+                                .await;
+                        // Handle both the JoinError and the lookup Result
+                        device.hostname = hostname_result.ok().and_then(|r| r.ok());
                     }
                     device
                 })
