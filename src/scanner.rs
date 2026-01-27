@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use futures_util::future::join_all;
+use futures_util::StreamExt;
 use ipnetwork::IpNetwork;
 use pnet::datalink::{self, Channel, Config, NetworkInterface as PnetNetworkInterface};
 use pnet::packet::arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket};
@@ -10,6 +10,10 @@ use serde::Serialize;
 use std::net::IpAddr;
 use std::time::Duration;
 use tracing::{info, warn};
+
+/// Maximum number of concurrent hostname lookups during network scans.
+/// This prevents overwhelming DNS servers on large subnets.
+const HOSTNAME_LOOKUP_CONCURRENCY: usize = 32;
 
 #[derive(Serialize, Debug, Clone)]
 pub struct DiscoveredDevice {
@@ -277,22 +281,19 @@ impl NetworkInterface {
          or use 'sudo' on macOS/Linux."
     )?;
 
-        let lookups = discovered_devices_no_hostname
-            .into_iter()
-            .map(|mut device| {
-                tokio::spawn(async move {
+        // Use buffer_unordered to limit concurrent hostname lookups,
+        // preventing DNS/task spikes on large subnets
+        let discovered_devices: Vec<DiscoveredDevice> =
+            futures_util::stream::iter(discovered_devices_no_hostname)
+                .map(|mut device| async move {
                     if let Ok(ip_addr) = device.ip.parse::<IpAddr>() {
                         device.hostname = dns_lookup::lookup_addr(&ip_addr).ok();
                     }
                     device
                 })
-            });
-
-        let discovered_devices = join_all(lookups)
-            .await
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>();
+                .buffer_unordered(HOSTNAME_LOOKUP_CONCURRENCY)
+                .collect()
+                .await;
 
         info!(
             "Network scan finished. Found {} devices.",
