@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "wakezilla"
-version = "0.1.44-rc1"
+version = "0.1.44-rc2"
 edition = "2021"
 build = "build.rs"
 license = "MIT"

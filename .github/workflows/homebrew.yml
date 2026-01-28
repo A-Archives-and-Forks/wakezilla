@@ -1,0 +1,60 @@
+name: Homebrew Tap
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+        with:
+          path: source
+
+      - name: Download release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p source/release
+          cd source/release
+          gh release download "${TAG}" -p "SHA256SUMS"
+
+      - name: Checkout tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: guibeira/homebrew-wakezilla
+          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Generate formula
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          bash source/scripts/release/generate_homebrew_formula.sh \
+            "${VERSION}" \
+            source/release/SHA256SUMS \
+            tap/Formula/wakezilla.rb \
+            guibeira \
+            wakezilla
+
+      - name: Commit and push formula
+        run: |
+          set -euo pipefail
+          cd tap
+          if git diff --quiet -- Formula/wakezilla.rb; then
+            echo "No formula changes; skipping commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/wakezilla.rb
+          git commit -m "release: wakezilla ${GITHUB_REF_NAME#v}"
+          git push
