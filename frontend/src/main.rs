@@ -1,6 +1,5 @@
 use leptos::prelude::*;
 use std::collections::HashMap;
-use std::convert::TryFrom;
 
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
@@ -15,7 +14,6 @@ use leptos_router::{
     hooks::use_params_map,
     path,
 };
-use validator::Validate;
 
 use web_sys::{SubmitEvent, console};
 
@@ -24,8 +22,8 @@ use crate::api::{
     get_details_machine, is_machine_online, turn_off_machine, wake_machine,
 };
 use crate::models::{
-    DiscoveredDevice, Machine, NetworkInterface, PortForward,
-    UpdateMachinePayload,
+    DiscoveredDevice, Machine, NetworkInterface, PortForward, UpdateMachinePayload,
+    validate_machine_form,
 };
 
 #[component]
@@ -86,7 +84,7 @@ fn MachineDetailPage() -> impl IntoView {
     let (name, set_name) = signal(String::new());
     let (ip, set_ip) = signal(String::new());
     let (description, set_description) = signal(String::new());
-    let (turn_off_port, set_turn_off_port) = signal::<Option<u32>>(None);
+    let (turn_off_port, set_turn_off_port) = signal::<Option<u16>>(None);
     let (can_be_turned_off, set_can_be_turned_off) = signal(false);
     let (port_forwards, set_port_forwards) = signal::<Vec<PortForward>>(vec![]);
     let (inactivity_period, set_inactivity_period) = signal(60u32);
@@ -149,20 +147,10 @@ fn MachineDetailPage() -> impl IntoView {
             ip: updated_machine.ip.clone(),
             name: updated_machine.name.clone(),
             description: updated_machine.description.clone(),
-            turn_off_port: updated_machine
-                .turn_off_port
-                .and_then(|port| u16::try_from(port).ok()),
+            turn_off_port: updated_machine.turn_off_port,
             can_be_turned_off: updated_machine.can_be_turned_off,
-            inactivity_period: updated_machine.inactivity_period,
-            port_forwards: updated_machine
-                .port_forwards
-                .iter()
-                .map(|pf| PortForward {
-                    name: Some(pf.name.clone().unwrap_or_default()),
-                    local_port: pf.local_port,
-                    target_port: pf.target_port,
-                })
-                .collect(),
+            inactivity_period: Some(updated_machine.inactivity_period),
+            port_forwards: Some(updated_machine.port_forwards),
         };
 
         leptos::task::spawn_local(async move {
@@ -1369,52 +1357,43 @@ fn AddMachine(
 
         set_loading.set(true);
         let navigate = navigate.clone();
-        match machine_form_data.get().validate() {
-            Ok(_) => {
-                console::log_1(&"Form is valid".into());
-                let current_machines = registred_machines.get();
-                let mut new_machines = current_machines.clone();
+        let validation_errors = validate_machine_form(&machine_form_data.get());
+        if validation_errors.is_empty() {
+            console::log_1(&"Form is valid".into());
+            let current_machines = registred_machines.get();
+            let mut new_machines = current_machines.clone();
 
-                leptos::task::spawn_local(async move {
-                    if (create_machine(machine_form_data.get()).await).is_ok() {
-                        //console_log(&format!("Loaded {:?} machines", machines));
-                        let new_machine = machine_form_data.get();
-                        new_machines.insert(0, new_machine.clone());
+            leptos::task::spawn_local(async move {
+                if (create_machine(machine_form_data.get()).await).is_ok() {
+                    //console_log(&format!("Loaded {:?} machines", machines));
+                    let new_machine = machine_form_data.get();
+                    new_machines.insert(0, new_machine.clone());
 
-                        set_registred_machines.set(new_machines);
-                        // Clear the form
-                        set_machine_form_data.set(Machine {
-                            name: "".to_string(),
-                            mac: "".to_string(),
-                            ip: "".to_string(),
-                            description: None,
-                            turn_off_port: None,
-                            can_be_turned_off: false,
-                            inactivity_period: 60,
-                            port_forwards: vec![],
-                        });
-                        set_port_forwards.set(vec![]);
-                        set_show_turn_off_port.set(false);
-                        set_errors.set(HashMap::new());
-                        let url = format!("/machines/{}", new_machine.mac);
-                        navigate(&url, Default::default());
-                    } else {
-                        console_log("Error creating machine");
-                    }
-                });
-                set_loading.set(false);
-            }
-            Err(e) => {
-                let mut new_errors = HashMap::new();
-                for (field, errors) in e.field_errors() {
-                    let mut field_errors = vec![];
-                    for error in errors {
-                        field_errors.push(error.code.to_string());
-                    }
-                    new_errors.insert(field.to_string(), field_errors);
+                    set_registred_machines.set(new_machines);
+                    // Clear the form
+                    set_machine_form_data.set(Machine {
+                        name: "".to_string(),
+                        mac: "".to_string(),
+                        ip: "".to_string(),
+                        description: None,
+                        turn_off_port: None,
+                        can_be_turned_off: false,
+                        inactivity_period: 60,
+                        port_forwards: vec![],
+                    });
+                    set_port_forwards.set(vec![]);
+                    set_show_turn_off_port.set(false);
+                    set_errors.set(HashMap::new());
+                    let url = format!("/machines/{}", new_machine.mac);
+                    navigate(&url, Default::default());
+                } else {
+                    console_log("Error creating machine");
                 }
-                set_errors.set(new_errors);
-            }
+            });
+            set_loading.set(false);
+        } else {
+            set_errors.set(validation_errors);
+            set_loading.set(false);
         }
     };
 

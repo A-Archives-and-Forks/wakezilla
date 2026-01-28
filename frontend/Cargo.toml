@@ -17,8 +17,8 @@ web-sys = "0.3"
 console_error_panic_hook = "0.1"
 console_log = "1.0.0"
 log = "0.4.27"
-validator = { version = "0.18", default-features = false }
 futures = "0.3"
+wakezilla-common = { path = "../common" }
 
 # Explicitly add newer versions of problematic dependencies
 libc = "0.2"

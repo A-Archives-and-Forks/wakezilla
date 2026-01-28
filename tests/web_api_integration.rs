@@ -10,7 +10,8 @@ use tower::util::ServiceExt;
 use wakezilla::config::Config;
 use wakezilla::forward::TurnOffLimiter;
 use wakezilla::proxy_server::{api_routes, build_router};
-use wakezilla::web::{AppState, Machine};
+use wakezilla::web::{AppState, Machine as InternalMachine};
+use wakezilla::Machine;
 
 struct EnvVarGuard {
     key: &'static str,
@@ -37,7 +38,8 @@ fn setup_state(temp_dir: &TempDir) -> (AppState, EnvVarGuard) {
     );
     let config = Config::from_env().unwrap_or_default();
 
-    let machines = Arc::new(RwLock::new(Vec::<Machine>::new())) as Arc<RwLock<Vec<Machine>>>;
+    let machines =
+        Arc::new(RwLock::new(Vec::<InternalMachine>::new())) as Arc<RwLock<Vec<InternalMachine>>>;
     let proxies = Arc::new(RwLock::new(HashMap::new()));
     let state = AppState {
         machines,
@@ -50,8 +52,8 @@ fn setup_state(temp_dir: &TempDir) -> (AppState, EnvVarGuard) {
     (state, guard)
 }
 
-fn sample_machine() -> Machine {
-    Machine {
+fn sample_machine() -> InternalMachine {
+    InternalMachine {
         mac: "AA:BB:CC:DD:EE:FF".to_string(),
         ip: "127.0.0.1".parse().expect("valid ip"),
         name: "Workstation".to_string(),
@@ -61,6 +63,39 @@ fn sample_machine() -> Machine {
         inactivity_period: 60,
         port_forwards: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn add_machine_accepts_null_port_forward_name() {
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let (state, _guard) = setup_state(&temp_dir);
+    let app = build_router(state.clone()).merge(api_routes(state.clone()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/machines")
+                .method("POST")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "mac": "22:33:44:55:66:77",
+                        "ip": "192.168.1.20",
+                        "name": "Host",
+                        "description": null,
+                        "turn_off_port": null,
+                        "can_be_turned_off": false,
+                        "inactivity_period": null,
+                        "port_forwards": [{"name": null, "local_port": 8080, "target_port": 80}]
+                    }))
+                    .expect("serialize payload"),
+                ))
+                .expect("failed to build add-machine request"),
+        )
+        .await
+        .expect("add-machine handler failed");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
 }
 
 #[tokio::test]

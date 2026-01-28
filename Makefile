@@ -10,7 +10,7 @@ dependencies:
 
 build:
 	echo "Building frontend and backend..." && \
-	cd frontend && trunk build --release && cd .. && \
+	cd frontend && env NO_COLOR=true trunk build --release && cd .. && \
 	echo "Frontend build complete." && \
 	cargo build --release && \
 	echo "Backend build complete."
@@ -35,4 +35,3 @@ docker-build:
 # Linux: uses --network host for full WOL broadcast support
 docker-run:
 	docker run --rm --network host -v ${PWD}/wakezilla-data:/opt/wakezilla wakezilla proxy-server
-
