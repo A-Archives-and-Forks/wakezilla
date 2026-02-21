@@ -1,101 +1,69 @@
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PortForward {
-    pub name: Option<String>,
-    pub local_port: u16,
-    pub target_port: u16,
-}
+pub use wakezilla_common::{
+    DiscoveredDevice, Machine, NetworkInterface, PortForward, UpdateMachinePayload,
+};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct NetworkInterface {
-    pub name: String,
-    pub ip: String,
-    pub mac: String,
-    pub is_up: bool,
-}
+pub fn validate_machine_form(machine: &Machine) -> HashMap<String, Vec<String>> {
+    let mut errors = HashMap::new();
 
-#[derive(Deserialize, Debug, Clone)]
-pub struct DiscoveredDevice {
-    pub ip: String,
-    pub mac: String,
-    pub hostname: Option<String>,
-}
+    if machine.name.trim().is_empty() {
+        errors.insert("name".to_string(), vec!["Name is required".to_string()]);
+    }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Machine {
-    pub name: String,
-    pub mac: String,
-    pub ip: String,
-    pub description: Option<String>,
-    pub turn_off_port: Option<u32>,
-    pub can_be_turned_off: bool,
-    pub inactivity_period: u32,
-    pub port_forwards: Vec<PortForward>,
-}
+    if machine.ip.parse::<std::net::IpAddr>().is_err() {
+        errors.insert("ip".to_string(), vec!["Invalid IP address".to_string()]);
+    }
 
-#[derive(Debug, Serialize, Clone)]
-pub struct UpdateMachinePayload {
-    pub mac: String,
-    pub ip: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub turn_off_port: Option<u16>,
-    pub can_be_turned_off: bool,
-    pub inactivity_period: u32,
-    pub port_forwards: Vec<PortForward>,
-}
+    if let Some(port) = machine.turn_off_port
+        && port == 0
+    {
+        errors.insert(
+            "turn_off_port".to_string(),
+            vec!["Port must be between 1 and 65535".to_string()],
+        );
+    }
 
-impl validator::Validate for Machine {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        let mut errors = validator::ValidationErrors::new();
+    if machine.mac.trim().is_empty() {
+        errors.insert(
+            "mac".to_string(),
+            vec!["MAC address is required".to_string()],
+        );
+    }
 
-        // Add custom validation logic here if needed
-        // For now, we'll just return Ok
-        if self.name.is_empty() {
-            errors.add("name", validator::ValidationError::new("Name is required"));
-        }
-        let ip = self.ip.parse::<std::net::IpAddr>();
-
-        if ip.is_err() {
-            errors.add("ip", validator::ValidationError::new("Invalid IP address"));
-        }
-
-        // check if turn_off_port is Some and in range 1-65535
-        if let Some(port) = self.turn_off_port
-            && (0 == port || port > 65535)
-        {
-            errors.add(
-                "turn_off_port",
-                validator::ValidationError::new("Port must be between 1 and 65535"),
-            );
-        }
-
-        if self.mac.is_empty() {
-            errors.add(
-                "mac",
-                validator::ValidationError::new("MAC address is required"),
-            );
-        }
-        let is_valid_mac = self
+    if !machine.mac.trim().is_empty() {
+        let is_valid_mac = machine
             .mac
             .chars()
             .filter(|c| c.is_ascii_hexdigit() || *c == ':' || *c == '-')
             .count()
-            == self.mac.len()
-            && (self.mac.len() == 17 || self.mac.len() == 12);
+            == machine.mac.len()
+            && (machine.mac.len() == 17 || machine.mac.len() == 12);
 
         if !is_valid_mac {
-            errors.add(
-                "mac",
-                validator::ValidationError::new("Invalid MAC address"),
-            );
+            errors.insert("mac".to_string(), vec!["Invalid MAC address".to_string()]);
         }
+    }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+    errors
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn validate_machine_form_rejects_invalid_ip() {
+        let machine = wakezilla_common::Machine {
+            name: "x".into(),
+            mac: "AA:BB:CC:DD:EE:FF".into(),
+            ip: "bad-ip".into(),
+            description: None,
+            turn_off_port: None,
+            can_be_turned_off: false,
+            inactivity_period: 30,
+            port_forwards: vec![],
+        };
+
+        let errors = super::validate_machine_form(&machine);
+        assert!(errors.contains_key("ip"));
     }
 }

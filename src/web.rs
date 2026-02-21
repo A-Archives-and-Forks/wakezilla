@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{watch, RwLock};
 use tracing::{error, info};
-use validator::{Validate, ValidationError};
+use validator::ValidationError;
 
 use serde::{Deserializer, Serializer};
 use std::str::FromStr;
@@ -73,12 +73,7 @@ pub struct PortForward {
     pub target_port: u16,
 }
 
-#[derive(Deserialize)]
-pub struct DeleteForm {
-    pub mac: String,
-}
-
-fn validate_ip(ip: &str) -> Result<(), ValidationError> {
+pub fn validate_ip(ip: &str) -> Result<(), ValidationError> {
     if ip.parse::<IpAddr>().is_ok() {
         Ok(())
     } else {
@@ -89,49 +84,15 @@ fn validate_ip(ip: &str) -> Result<(), ValidationError> {
 static MAC_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$").unwrap());
 
-fn validate_mac(mac: &str) -> Result<(), ValidationError> {
+pub fn validate_mac(mac: &str) -> Result<(), ValidationError> {
     if MAC_REGEX.is_match(mac) {
         Ok(())
     } else {
         Err(ValidationError::new("Invalid MAC address"))
     }
 }
-#[derive(Debug, Deserialize, Validate)]
-pub struct AddMachineForm {
-    #[validate(custom(function = "validate_mac"))]
-    pub mac: String,
-    #[validate(custom(function = "validate_ip"))]
-    pub ip: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub turn_off_port: Option<u16>,
-    #[serde(default = "default_can_be_turned_off")]
-    pub can_be_turned_off: bool,
-    pub inactivity_period: Option<u32>,
-    pub port_forwards: Option<Vec<PortForward>>,
-}
-
-#[derive(Debug, Deserialize, Validate)]
-pub struct MachinePayload {
-    #[validate(custom(function = "validate_mac"))]
-    pub mac: String,
-    #[validate(custom(function = "validate_ip"))]
-    pub ip: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub turn_off_port: Option<u16>,
-    #[serde(default = "default_can_be_turned_off")]
-    pub can_be_turned_off: bool,
-    pub inactivity_period: Option<u32>,
-    pub port_forwards: Option<Vec<PortForward>>,
-}
-
 pub fn get_default_inactivity_period() -> u32 {
     30
-}
-
-fn default_can_be_turned_off() -> bool {
-    false
 }
 
 #[derive(Clone)]
@@ -141,6 +102,65 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub turn_off_limiter: Arc<forward::TurnOffLimiter>,
     pub monitor_handle: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+}
+
+pub fn api_port_forward_to_internal(pf: &wakezilla_common::PortForward) -> PortForward {
+    PortForward {
+        name: pf.name.clone().unwrap_or_default(),
+        local_port: pf.local_port,
+        target_port: pf.target_port,
+    }
+}
+
+pub fn internal_port_forward_to_api(pf: &PortForward) -> wakezilla_common::PortForward {
+    wakezilla_common::PortForward {
+        name: if pf.name.trim().is_empty() {
+            None
+        } else {
+            Some(pf.name.clone())
+        },
+        local_port: pf.local_port,
+        target_port: pf.target_port,
+    }
+}
+
+pub fn machine_to_api_machine(machine: &Machine) -> wakezilla_common::Machine {
+    wakezilla_common::Machine {
+        name: machine.name.clone(),
+        mac: machine.mac.clone(),
+        ip: machine.ip.to_string(),
+        description: machine.description.clone(),
+        turn_off_port: machine.turn_off_port,
+        can_be_turned_off: machine.can_be_turned_off,
+        inactivity_period: machine.inactivity_period,
+        port_forwards: machine
+            .port_forwards
+            .iter()
+            .map(internal_port_forward_to_api)
+            .collect(),
+    }
+}
+
+pub fn api_machine_to_internal(api: &wakezilla_common::Machine) -> Result<Machine> {
+    let ip = api
+        .ip
+        .parse::<Ipv4Addr>()
+        .with_context(|| format!("Invalid IPv4 address: {}", api.ip))?;
+
+    Ok(Machine {
+        mac: api.mac.clone(),
+        ip,
+        name: api.name.clone(),
+        description: api.description.clone(),
+        turn_off_port: api.turn_off_port,
+        can_be_turned_off: api.can_be_turned_off,
+        inactivity_period: api.inactivity_period,
+        port_forwards: api
+            .port_forwards
+            .iter()
+            .map(api_port_forward_to_internal)
+            .collect(),
+    })
 }
 
 /// Load machines using the configured database path

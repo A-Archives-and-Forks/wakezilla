@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::net::{IpAddr, Ipv4Addr};
 use tracing::{error, info, instrument, warn};
 
+mod api_models;
 mod client_server;
 mod config;
 mod forward;
@@ -11,6 +12,8 @@ mod scanner;
 mod system;
 mod web;
 mod wol;
+
+pub use api_models::*;
 
 /// Simple Wake-on-LAN sender + post-WOL reachability check.
 #[derive(Parser, Debug)]

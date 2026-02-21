@@ -14,17 +14,18 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
-use validator::Validate;
 
 use crate::forward;
 use crate::scanner;
-use crate::web::{self, AppState, DeleteForm, Machine};
+#[cfg(test)]
+use crate::web::Machine;
+use crate::web::{self, AppState};
 use crate::wol;
 use include_dir::{include_dir, Dir};
 use mime_guess::from_path;
 use std::path::{Component, Path as StdPath};
 
-static FRONTEND_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/dist");
+static FRONTEND_DIST: Dir<'_> = include_dir!("$WAKEZILLA_FRONTEND_DIST");
 
 fn respond_with_file(file: &include_dir::File<'_>) -> Response<Body> {
     let mime = from_path(file.path()).first_or_octet_stream();
@@ -155,7 +156,16 @@ pub fn build_router(state: AppState) -> Router {
 async fn scan_network_handler(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
     let interface = params.get("interface").map(|s| s.as_str());
     match scanner::NetworkInterface::scan_network_with_interface(interface).await {
-        Ok(devices) => Ok(Json(devices)),
+        Ok(devices) => Ok(Json(
+            devices
+                .into_iter()
+                .map(|d| wakezilla_common::DiscoveredDevice {
+                    ip: d.ip,
+                    mac: d.mac,
+                    hostname: d.hostname,
+                })
+                .collect::<Vec<_>>(),
+        )),
         Err(e) => {
             error!("Network scan failed: {}", e);
             Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
@@ -201,7 +211,17 @@ async fn is_machine_on_api(
 
 async fn list_interfaces_handler() -> impl IntoResponse {
     match scanner::NetworkInterface::list_interfaces().await {
-        Ok(interfaces) => Ok(Json(interfaces)),
+        Ok(interfaces) => Ok(Json(
+            interfaces
+                .into_iter()
+                .map(|iface| wakezilla_common::NetworkInterface {
+                    name: iface.name,
+                    ip: iface.ip,
+                    mac: iface.mac,
+                    is_up: iface.is_up,
+                })
+                .collect::<Vec<_>>(),
+        )),
         Err(e) => {
             error!("Failed to list interfaces: {}", e);
             Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
@@ -211,27 +231,28 @@ async fn list_interfaces_handler() -> impl IntoResponse {
 
 async fn add_machine_api(
     State(state): State<AppState>,
-    JsonExtract(payload): JsonExtract<web::AddMachineForm>,
+    JsonExtract(payload): JsonExtract<wakezilla_common::AddMachinePayload>,
 ) -> impl IntoResponse {
-    if let Err(errors) = payload.validate() {
-        let errors_map = errors
-            .field_errors()
-            .iter()
-            .map(|(key, value)| {
-                let error_messages: Vec<String> =
-                    value.iter().map(|error| error.code.to_string()).collect();
-                (key.to_string(), error_messages)
-            })
-            .collect::<HashMap<_, _>>();
-
+    let mut errors_map = HashMap::new();
+    if payload.name.trim().is_empty() {
+        errors_map.insert("name".to_string(), vec!["Name is required".to_string()]);
+    }
+    if web::validate_ip(&payload.ip).is_err() {
+        errors_map.insert("ip".to_string(), vec!["Invalid IP address".to_string()]);
+    }
+    if web::validate_mac(&payload.mac).is_err() {
+        errors_map.insert("mac".to_string(), vec!["Invalid MAC address".to_string()]);
+    }
+    if !errors_map.is_empty() {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "errors": errors_map })),
         );
     }
-    let new_machine = Machine {
+
+    let api_machine = wakezilla_common::Machine {
         mac: payload.mac,
-        ip: payload.ip.parse().expect("Invalid IP address"),
+        ip: payload.ip,
         name: payload.name,
         description: payload.description,
         turn_off_port: payload.turn_off_port,
@@ -241,6 +262,18 @@ async fn add_machine_api(
             .unwrap_or(web::get_default_inactivity_period()),
         port_forwards: payload.port_forwards.unwrap_or_default(),
     };
+    let new_machine = match web::api_machine_to_internal(&api_machine) {
+        Ok(machine) => machine,
+        Err(err) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "errors": { "ip": [err.to_string()] }
+                })),
+            );
+        }
+    };
+
     let mut machines = state.machines.write().await;
     web::start_proxy_if_configured(&new_machine, &state);
     machines.push(new_machine);
@@ -261,16 +294,21 @@ async fn add_machine_api(
 async fn show_machines_api(State(state): State<AppState>) -> impl IntoResponse {
     let mut machines = state.machines.read().await.clone();
     machines.reverse();
-    Json(machines)
+    Json(
+        machines
+            .iter()
+            .map(web::machine_to_api_machine)
+            .collect::<Vec<_>>(),
+    )
 }
 
 async fn get_machine_details_api(
     State(state): State<AppState>,
     Path(mac): Path<String>,
-) -> Result<Json<Machine>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<wakezilla_common::Machine>, (axum::http::StatusCode, Json<serde_json::Value>)> {
     let machines = state.machines.read().await;
     if let Some(machine) = machines.iter().find(|m| m.mac == mac).cloned() {
-        Ok(Json(machine))
+        Ok(Json(web::machine_to_api_machine(&machine)))
     } else {
         Err((
             axum::http::StatusCode::NOT_FOUND,
@@ -282,7 +320,7 @@ async fn get_machine_details_api(
 async fn update_machine_api(
     State(state): State<AppState>,
     Path(mac): Path<String>,
-    JsonExtract(payload): JsonExtract<web::MachinePayload>,
+    JsonExtract(payload): JsonExtract<wakezilla_common::UpdateMachinePayload>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
     let mut machines = state.machines.write().await;
 
@@ -300,9 +338,9 @@ async fn update_machine_api(
     // remove the machine to update
     machines.retain(|m| m.mac != mac);
 
-    let new_machine = Machine {
+    let api_machine = wakezilla_common::Machine {
         mac: payload.mac.clone(),
-        ip: payload.ip.parse().expect("Invalid IP address"),
+        ip: payload.ip.clone(),
         name: payload.name.clone(),
         description: payload.description.clone(),
         turn_off_port: payload.turn_off_port,
@@ -311,6 +349,17 @@ async fn update_machine_api(
             .inactivity_period
             .unwrap_or(web::get_default_inactivity_period()),
         port_forwards: payload.port_forwards.clone().unwrap_or_default(),
+    };
+    let new_machine = match web::api_machine_to_internal(&api_machine) {
+        Ok(machine) => machine,
+        Err(err) => {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "errors": { "ip": [err.to_string()] }
+                })),
+            ));
+        }
     };
 
     machines.push(new_machine.clone());
@@ -353,7 +402,7 @@ async fn update_machine_api(
 
 async fn delete_machine_api(
     State(state): State<AppState>,
-    JsonExtract(payload): JsonExtract<DeleteForm>,
+    JsonExtract(payload): JsonExtract<wakezilla_common::DeleteMachinePayload>,
 ) -> impl IntoResponse {
     // Stop all proxies associated with this machine
     info!("Deleting machine with MAC: {}", payload.mac);
@@ -605,7 +654,7 @@ mod tests {
         let _guard = EnvGuard::set_path("WAKEZILLA__STORAGE__MACHINES_DB_PATH", &file_path);
 
         let state = state_with_machines(vec![]);
-        let form = web::AddMachineForm {
+        let form = wakezilla_common::AddMachinePayload {
             mac: "AA:BB:CC:DD:EE:FF".to_string(),
             ip: "192.168.1.10".to_string(),
             name: "New machine".to_string(),
@@ -631,7 +680,7 @@ mod tests {
     #[tokio::test]
     async fn add_machine_api_returns_errors_for_invalid_payload() {
         let state = state_with_machines(vec![]);
-        let form = web::AddMachineForm {
+        let form = wakezilla_common::AddMachinePayload {
             mac: "invalid".to_string(),
             ip: "not-an-ip".to_string(),
             name: "Bad".to_string(),
@@ -733,7 +782,7 @@ mod tests {
         let _guard = EnvGuard::set_path("WAKEZILLA__STORAGE__MACHINES_DB_PATH", &file_path);
 
         let state = state_with_machines(vec![sample_machine()]);
-        let payload = web::MachinePayload {
+        let payload = wakezilla_common::UpdateMachinePayload {
             mac: "AA:BB:CC:DD:EE:FF".to_string(),
             ip: "10.0.0.2".to_string(),
             name: "Updated".to_string(),
@@ -782,7 +831,7 @@ mod tests {
 
         let response = delete_machine_api(
             State(state.clone()),
-            Json(DeleteForm {
+            Json(wakezilla_common::DeleteMachinePayload {
                 mac: machine.mac.clone(),
             }),
         )
