@@ -29,6 +29,13 @@
 cargo install wakezilla
 ```
 
+### Install via Homebrew
+
+```bash
+brew tap guibeira/wakezilla
+brew install wakezilla
+```
+
 ### Using pre-built docker image
 
 1. **Run the proxy server**:

@@ -12,20 +12,14 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: wakezilla-linux-x86_64
-            archive_type: tar.gz
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: wakezilla-macos-x86_64
-            archive_type: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: wakezilla-macos-arm64
-            archive_type: tar.gz
     
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: write
+      contents: read
     
     steps:
       - name: Checkout repository
@@ -84,17 +78,21 @@ jobs:
       - name: Create release archive
         shell: bash
         run: |
+          set -euo pipefail
+          VERSION="${{ steps.tag_version.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE="wakezilla-${VERSION}-${TARGET}.tar.gz"
           mkdir -p release
-          cp target/${{ matrix.target }}/release/wakezilla release/${{ matrix.artifact_name }}
-          chmod +x release/${{ matrix.artifact_name }}
-          cd release
-          tar czf ${{ matrix.artifact_name }}.${{ matrix.archive_type }} ${{ matrix.artifact_name }}
+          cp target/${TARGET}/release/wakezilla release/wakezilla
+          chmod +x release/wakezilla
+          tar -C release -czf "release/${ARCHIVE}" wakezilla
+          rm -f release/wakezilla
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: release/${{ matrix.artifact_name }}.${{ matrix.archive_type }}
+          name: release-${{ matrix.target }}
+          path: release/wakezilla-${{ steps.tag_version.outputs.version }}-${{ matrix.target }}.tar.gz
           retention-days: 1
 
   release:
@@ -121,9 +119,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release
+          merge-multiple: true
+
+      - name: Generate release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum *.tar.gz > SHA256SUMS
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref }}
           name: Release ${{ steps.tag_version.outputs.version }}
@@ -131,9 +137,9 @@ jobs:
             ## Release ${{ steps.tag_version.outputs.version }}
             
             ### Downloads
-            - **Linux (x86_64)**: `wakezilla-linux-x86_64.tar.gz`
-            - **macOS (x86_64)**: `wakezilla-macos-x86_64.tar.gz`
-            - **macOS (ARM64)**: `wakezilla-macos-arm64.tar.gz`
+            - **Linux (x86_64)**: `wakezilla-${{ steps.tag_version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz`
+            - **macOS (x86_64)**: `wakezilla-${{ steps.tag_version.outputs.version }}-x86_64-apple-darwin.tar.gz`
+            - **macOS (ARM64)**: `wakezilla-${{ steps.tag_version.outputs.version }}-aarch64-apple-darwin.tar.gz`
             
             ### Installation
             Extract the archive for your platform and run the binary.
@@ -141,7 +147,8 @@ jobs:
             ### Changes
             See [commit history](https://github.com/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.ref }}) for details.
           files: |
-            release/**/*
+            release/*.tar.gz
+            release/SHA256SUMS
           draft: false
           prerelease: false
         env:
