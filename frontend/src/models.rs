@@ -31,16 +31,18 @@ pub fn validate_machine_form(machine: &Machine) -> HashMap<String, Vec<String>> 
         );
     }
 
-    let is_valid_mac = machine
-        .mac
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit() || *c == ':' || *c == '-')
-        .count()
-        == machine.mac.len()
-        && (machine.mac.len() == 17 || machine.mac.len() == 12);
+    if !machine.mac.trim().is_empty() {
+        let is_valid_mac = machine
+            .mac
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit() || *c == ':' || *c == '-')
+            .count()
+            == machine.mac.len()
+            && (machine.mac.len() == 17 || machine.mac.len() == 12);
 
-    if !is_valid_mac {
-        errors.insert("mac".to_string(), vec!["Invalid MAC address".to_string()]);
+        if !is_valid_mac {
+            errors.insert("mac".to_string(), vec!["Invalid MAC address".to_string()]);
+        }
     }
 
     errors

@@ -9,5 +9,3 @@ pub mod web;
 pub mod wol;
 
 pub use api_models::*;
-
-extern crate self as wakezilla_common;

@@ -4059,6 +4059,7 @@ dependencies = [
  "tracing-futures",
  "tracing-subscriber",
  "validator",
+ "wakezilla-common",
  "which",
 ]
 

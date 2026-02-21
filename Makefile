@@ -10,7 +10,6 @@ dependencies:
 
 build:
 	echo "Building frontend and backend..." && \
-	cd frontend && env NO_COLOR=true trunk build --release && cd .. && \
 	echo "Frontend build complete." && \
 	cargo build --release && \
 	echo "Backend build complete."

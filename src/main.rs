@@ -15,8 +15,6 @@ mod wol;
 
 pub use api_models::*;
 
-extern crate self as wakezilla_common;
-
 /// Simple Wake-on-LAN sender + post-WOL reachability check.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
