@@ -114,6 +114,11 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/v}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Tag version: $VERSION"
+          if [[ "$VERSION" =~ (rc|alpha|beta|pre) ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -150,6 +155,6 @@ jobs:
             release/*.tar.gz
             release/SHA256SUMS
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.tag_version.outputs.prerelease }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
