@@ -161,6 +161,8 @@ jobs:
 
   publish-crate:
     needs: release
+    # Skip the entire job for prereleases before any environment gate fires.
+    if: ${{ !contains(github.ref, 'rc') && !contains(github.ref, 'alpha') && !contains(github.ref, 'beta') && !contains(github.ref, 'pre') }}
     runs-on: ubuntu-latest
     environment: main
     permissions:
@@ -173,30 +175,45 @@ jobs:
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          if [[ "$VERSION" =~ (rc|alpha|beta|pre) ]]; then
-            echo "prerelease=true" >> $GITHUB_OUTPUT
-          else
-            echo "prerelease=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Skip prerelease
-        if: steps.tag_version.outputs.prerelease == 'true'
-        shell: bash
-        run: echo "Prerelease detected — skipping crates.io publish."
 
       - name: Checkout repository
-        if: steps.tag_version.outputs.prerelease == 'false'
         uses: actions/checkout@v4
 
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${{ steps.tag_version.outputs.version }}"
+          MANIFEST_VERSION=$(
+            awk '
+              /^\[package\]/ { in_pkg = 1; next }
+              /^\[/          { in_pkg = 0 }
+              in_pkg && /^version[[:space:]]*=/ {
+                match($0, /"[^"]*"/)
+                print substr($0, RSTART + 1, RLENGTH - 2)
+                exit
+              }
+            ' Cargo.toml
+          )
+          if [[ "$TAG_VERSION" != "$MANIFEST_VERSION" ]]; then
+            echo "::error::Tag version '$TAG_VERSION' does not match Cargo.toml [package] version '$MANIFEST_VERSION'."
+            exit 1
+          fi
+          echo "Tag and manifest agree on version $TAG_VERSION."
+
       - name: Setup Rust toolchain
-        if: steps.tag_version.outputs.prerelease == 'false'
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Dry-run publish
+        shell: bash
+        run: cargo publish -p wakezilla --dry-run --no-verify --token "${CARGO_REGISTRY_TOKEN}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
       - name: Publish wakezilla to crates.io
-        if: steps.tag_version.outputs.prerelease == 'false'
         shell: bash
         run: cargo publish -p wakezilla --no-verify --token "${CARGO_REGISTRY_TOKEN}"
         env:
