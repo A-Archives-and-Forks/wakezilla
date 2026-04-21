@@ -158,3 +158,63 @@ jobs:
           prerelease: ${{ steps.tag_version.outputs.prerelease }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-crate:
+    needs: release
+    # Skip the entire job for prereleases before any environment gate fires.
+    if: ${{ !contains(github.ref, 'rc') && !contains(github.ref, 'alpha') && !contains(github.ref, 'beta') && !contains(github.ref, 'pre') }}
+    runs-on: ubuntu-latest
+    environment: main
+    permissions:
+      contents: read
+
+    steps:
+      - name: Extract version from tag
+        id: tag_version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${{ steps.tag_version.outputs.version }}"
+          MANIFEST_VERSION=$(
+            awk '
+              /^\[package\]/ { in_pkg = 1; next }
+              /^\[/          { in_pkg = 0 }
+              in_pkg && /^version[[:space:]]*=/ {
+                match($0, /"[^"]*"/)
+                print substr($0, RSTART + 1, RLENGTH - 2)
+                exit
+              }
+            ' Cargo.toml
+          )
+          if [[ "$TAG_VERSION" != "$MANIFEST_VERSION" ]]; then
+            echo "::error::Tag version '$TAG_VERSION' does not match Cargo.toml [package] version '$MANIFEST_VERSION'."
+            exit 1
+          fi
+          echo "Tag and manifest agree on version $TAG_VERSION."
+
+      - name: Setup Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Dry-run publish
+        shell: bash
+        run: cargo publish -p wakezilla --dry-run --no-verify --token "${CARGO_REGISTRY_TOKEN}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish wakezilla to crates.io
+        shell: bash
+        run: cargo publish -p wakezilla --no-verify --token "${CARGO_REGISTRY_TOKEN}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
