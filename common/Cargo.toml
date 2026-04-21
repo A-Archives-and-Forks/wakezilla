@@ -2,6 +2,10 @@
 name = "wakezilla-common"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Shared types for wakezilla, a Wake-on-LAN proxy server"
+repository = "https://github.com/guibeira/wakezilla"
+homepage = "https://github.com/guibeira/wakezilla"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

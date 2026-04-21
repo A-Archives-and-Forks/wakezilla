@@ -158,3 +158,46 @@ jobs:
           prerelease: ${{ steps.tag_version.outputs.prerelease }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-crate:
+    needs: release
+    runs-on: ubuntu-latest
+    environment: main
+    permissions:
+      contents: read
+
+    steps:
+      - name: Extract version from tag
+        id: tag_version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          if [[ "$VERSION" =~ (rc|alpha|beta|pre) ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Skip prerelease
+        if: steps.tag_version.outputs.prerelease == 'true'
+        shell: bash
+        run: echo "Prerelease detected — skipping crates.io publish."
+
+      - name: Checkout repository
+        if: steps.tag_version.outputs.prerelease == 'false'
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        if: steps.tag_version.outputs.prerelease == 'false'
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Publish wakezilla to crates.io
+        if: steps.tag_version.outputs.prerelease == 'false'
+        shell: bash
+        run: cargo publish -p wakezilla --no-verify --token "${CARGO_REGISTRY_TOKEN}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
