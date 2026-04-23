@@ -1,0 +1,76 @@
+name: Bootstrap Publish
+
+# One-shot workflow to publish wakezilla-common to crates.io (which has never
+# been published) and optionally re-publish wakezilla from a specific tag.
+# Designed to unblock the publish-crate job in release.yml when the helper
+# crate is missing from the registry.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to publish from (branch or tag, e.g., v0.1.46).'
+        required: true
+        type: string
+        default: 'main'
+      publish_common:
+        description: 'Publish wakezilla-common.'
+        required: false
+        type: boolean
+        default: true
+      publish_wakezilla:
+        description: 'Publish wakezilla after wakezilla-common is available.'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    environment: main
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Publish wakezilla-common
+        if: ${{ inputs.publish_common }}
+        shell: bash
+        run: cargo publish -p wakezilla-common --token "${CARGO_REGISTRY_TOKEN}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for wakezilla-common on crates.io index
+        if: ${{ inputs.publish_common && inputs.publish_wakezilla }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            body=$(curl -sfL -H "User-Agent: wakezilla-ci" \
+              "https://crates.io/api/v1/crates/wakezilla-common" || true)
+            if echo "$body" | grep -q '"name":"wakezilla-common"'; then
+              echo "wakezilla-common is indexed on crates.io"
+              exit 0
+            fi
+            echo "Attempt $i: not indexed yet, sleeping 10s..."
+            sleep 10
+          done
+          echo "::error::Timed out waiting for wakezilla-common to appear on the crates.io index."
+          exit 1
+
+      - name: Publish wakezilla
+        if: ${{ inputs.publish_wakezilla }}
+        shell: bash
+        run: cargo publish -p wakezilla --no-verify --token "${CARGO_REGISTRY_TOKEN}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
