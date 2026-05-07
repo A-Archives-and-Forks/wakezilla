@@ -1,15 +1,18 @@
 name: Homebrew Tap
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish to Homebrew, e.g. v0.1.49.'
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   publish:
-    if: ${{ !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source repository
@@ -17,12 +20,23 @@ jobs:
         with:
           path: source
 
+      - name: Verify Homebrew tap token is configured
+        shell: bash
+        env:
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN}" ]; then
+            echo "::error::Missing HOMEBREW_TAP_GITHUB_TOKEN. Create a token with Contents: read/write on guibeira/homebrew-wakezilla and add it as a repository secret."
+            exit 1
+          fi
+
       - name: Download release checksums
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ inputs.tag }}"
           mkdir -p source/release
           cd source/release
           gh release download "${TAG}" -p "SHA256SUMS"
@@ -37,8 +51,13 @@ jobs:
       - name: Generate formula
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ inputs.tag }}"
           VERSION="${TAG#v}"
+          if [[ "$VERSION" =~ (rc|alpha|beta|pre) ]]; then
+            echo "::error::Homebrew publishes stable releases only: ${TAG}"
+            exit 1
+          fi
+          mkdir -p tap/Formula
           bash source/scripts/release/generate_homebrew_formula.sh \
             "${VERSION}" \
             source/release/SHA256SUMS \
@@ -49,6 +68,8 @@ jobs:
       - name: Commit and push formula
         run: |
           set -euo pipefail
+          VERSION="${{ inputs.tag }}"
+          VERSION="${VERSION#v}"
           cd tap
           git add Formula/wakezilla.rb
           if git diff --cached --quiet -- Formula/wakezilla.rb; then
@@ -57,5 +78,5 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "release: wakezilla ${GITHUB_REF_NAME#v}"
+          git commit -m "release: wakezilla ${VERSION}"
           git push

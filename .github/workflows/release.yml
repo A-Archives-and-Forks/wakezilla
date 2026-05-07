@@ -100,6 +100,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.tag_version.outputs.version }}
+      prerelease: ${{ steps.tag_version.outputs.prerelease }}
     
     steps:
       - name: Checkout repository
@@ -146,6 +149,74 @@ jobs:
           prerelease: ${{ steps.tag_version.outputs.prerelease }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-homebrew:
+    needs: release
+    # Homebrew should track stable releases only.
+    if: ${{ needs.release.outputs.prerelease == 'false' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+        with:
+          path: source
+
+      - name: Verify Homebrew tap token is configured
+        shell: bash
+        env:
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN}" ]; then
+            echo "::error::Missing HOMEBREW_TAP_GITHUB_TOKEN. Create a token with Contents: read/write on guibeira/homebrew-wakezilla and add it as a repository secret."
+            exit 1
+          fi
+
+      - name: Download release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p source/release
+          cd source/release
+          gh release download "${TAG}" -p "SHA256SUMS"
+
+      - name: Checkout tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: guibeira/homebrew-wakezilla
+          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Generate formula
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.release.outputs.version }}"
+          mkdir -p tap/Formula
+          bash source/scripts/release/generate_homebrew_formula.sh \
+            "${VERSION}" \
+            source/release/SHA256SUMS \
+            tap/Formula/wakezilla.rb \
+            guibeira \
+            wakezilla
+
+      - name: Commit and push formula
+        run: |
+          set -euo pipefail
+          cd tap
+          git add Formula/wakezilla.rb
+          if git diff --cached --quiet -- Formula/wakezilla.rb; then
+            echo "No formula changes; skipping commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "release: wakezilla ${{ needs.release.outputs.version }}"
+          git push
 
   publish-crate:
     needs: release
