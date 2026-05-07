@@ -222,12 +222,12 @@ jobs:
 
       - name: Dry-run publish
         shell: bash
-        run: cargo publish -p wakezilla --dry-run --no-verify --token "${CARGO_REGISTRY_TOKEN}"
+        run: cargo publish -p wakezilla --dry-run --no-verify --allow-dirty --token "${CARGO_REGISTRY_TOKEN}"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       - name: Publish wakezilla to crates.io
         shell: bash
-        run: cargo publish -p wakezilla --no-verify --token "${CARGO_REGISTRY_TOKEN}"
+        run: cargo publish -p wakezilla --no-verify --allow-dirty --token "${CARGO_REGISTRY_TOKEN}"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
