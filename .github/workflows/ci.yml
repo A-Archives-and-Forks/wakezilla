@@ -48,6 +48,7 @@ jobs:
       - name: Build frontend
         env:
           NO_COLOR: "true"
+          RUSTUP_TOOLCHAIN: nightly
         run: cd frontend && trunk build --release
 
   coverage:
