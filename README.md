@@ -32,7 +32,7 @@ cargo install wakezilla
 ### Install via Homebrew
 
 ```bash
-brew tap guibeira/wakezilla
+brew tap guibeira/wakezilla https://github.com/guibeira/wakezilla
 brew install wakezilla
 ```
 

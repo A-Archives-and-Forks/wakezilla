@@ -156,24 +156,13 @@ jobs:
     if: ${{ needs.release.outputs.prerelease == 'false' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: Checkout source repository
         uses: actions/checkout@v4
         with:
           path: source
-
-      - name: Verify Homebrew tap token is configured
-        shell: bash
-        env:
-          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN}" ]; then
-            echo "::error::Missing HOMEBREW_TAP_GITHUB_TOKEN. Create a token with Contents: read/write on guibeira/homebrew-wakezilla and add it as a repository secret."
-            exit 1
-          fi
 
       - name: Download release checksums
         env:
@@ -185,11 +174,10 @@ jobs:
           cd source/release
           gh release download "${TAG}" -p "SHA256SUMS"
 
-      - name: Checkout tap repository
+      - name: Checkout repository tap
         uses: actions/checkout@v4
         with:
-          repository: guibeira/homebrew-wakezilla
-          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          ref: ${{ github.event.repository.default_branch }}
           path: tap
 
       - name: Generate formula
@@ -216,7 +204,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -m "release: wakezilla ${{ needs.release.outputs.version }}"
-          git push
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
 
   publish-crate:
     needs: release
