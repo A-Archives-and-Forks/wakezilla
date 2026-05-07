@@ -88,6 +88,7 @@ fn main() {
         Some("frontend"),
         &[
             ("NO_COLOR", "true"),
+            ("RUSTUP_TOOLCHAIN", "nightly"),
             (
                 "CARGO_TARGET_DIR",
                 frontend_build_target_dir

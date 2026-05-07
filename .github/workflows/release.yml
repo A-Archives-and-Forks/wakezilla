@@ -205,6 +205,8 @@ jobs:
 
       - name: Build packaged frontend assets
         shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: nightly
         run: |
           set -euo pipefail
           rm -rf frontend-dist
