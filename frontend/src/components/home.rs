@@ -22,6 +22,7 @@ pub fn HomePage() -> impl IntoView {
 
     let (registred_machines, set_registred_machines) = signal::<Vec<Machine>>(vec![]);
     let (status_machine, set_status_machine) = signal::<HashMap<String, bool>>(HashMap::new());
+    let (status_request_id, set_status_request_id) = signal(0_u64);
 
     // Load initial registred machines
     Effect::new(move || {
@@ -36,8 +37,12 @@ pub fn HomePage() -> impl IntoView {
     // check the status of registred machines when they change
     Effect::new(move |_| {
         let machines = registred_machines.get();
+        let request_id = status_request_id.get_untracked().wrapping_add(1);
+        set_status_request_id.set(request_id);
+
         if machines.is_empty() {
             // console_log("No registred machines");
+            set_status_machine.set(HashMap::new());
             return;
         }
 
@@ -63,7 +68,9 @@ pub fn HomePage() -> impl IntoView {
             for (mac, is_online) in results {
                 status_map.insert(mac, is_online);
             }
-            set_status_machine.set(status_map);
+            if status_request_id.get_untracked() == request_id {
+                set_status_machine.set(status_map);
+            }
         });
     });
 

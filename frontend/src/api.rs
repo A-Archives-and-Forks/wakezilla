@@ -32,6 +32,24 @@ fn compute_api_base() -> String {
     }
 }
 
+fn encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut encoded, "%{byte:02X}");
+            }
+        }
+    }
+
+    encoded
+}
+
 pub async fn create_machine(machine: Machine) -> Result<(), String> {
     Request::post(&format!("{}/machines", API_BASE.as_str()))
         .json(&machine)
@@ -44,6 +62,7 @@ pub async fn create_machine(machine: Machine) -> Result<(), String> {
 }
 
 pub async fn get_details_machine(mac: &str) -> Result<Machine, String> {
+    let mac = encode_path_segment(mac);
     Request::get(&format!("{}/machines/{}", API_BASE.as_str(), mac))
         .send()
         .await
@@ -54,6 +73,7 @@ pub async fn get_details_machine(mac: &str) -> Result<Machine, String> {
 }
 
 pub async fn update_machine(mac: &str, payload: &UpdateMachinePayload) -> Result<(), String> {
+    let mac = encode_path_segment(mac);
     Request::put(&format!("{}/machines/{}", API_BASE.as_str(), mac))
         .json(payload)
         .map_err(|e| e.to_string())?
@@ -96,12 +116,13 @@ pub async fn fetch_interfaces() -> Result<Vec<NetworkInterface>, String> {
 }
 
 pub async fn fetch_scan_network(device: String) -> Result<Vec<DiscoveredDevice>, String> {
-    let url = if device.is_empty() {
-        format!("{}/scan", API_BASE.as_str())
+    let request = Request::get(&format!("{}/scan", API_BASE.as_str()));
+    let request = if device.is_empty() {
+        request
     } else {
-        format!("{}/scan?interface={}", API_BASE.as_str(), device)
+        request.query([("interface", device.as_str())])
     };
-    Request::get(&url)
+    request
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -111,6 +132,7 @@ pub async fn fetch_scan_network(device: String) -> Result<Vec<DiscoveredDevice>,
 }
 
 pub async fn turn_off_machine(mac: &str) -> Result<String, String> {
+    let mac = encode_path_segment(mac);
     let response = Request::post(&format!(
         "{}/machines/{}/remote-turn-off",
         API_BASE.as_str(),
@@ -136,6 +158,7 @@ pub async fn turn_off_machine(mac: &str) -> Result<String, String> {
 }
 
 pub async fn wake_machine(mac: &str) -> Result<String, String> {
+    let mac = encode_path_segment(mac);
     let response = Request::post(&format!("{}/machines/{}/wake", API_BASE.as_str(), mac))
         .send()
         .await
@@ -157,6 +180,7 @@ pub async fn wake_machine(mac: &str) -> Result<String, String> {
 }
 
 pub async fn is_machine_online(mac: &str) -> bool {
+    let mac = encode_path_segment(mac);
     let response = Request::get(&format!("{}/machines/{}/is-on", API_BASE.as_str(), mac))
         .send()
         .await
