@@ -19,6 +19,21 @@ pub struct Machine {
     pub port_forwards: Vec<PortForward>,
 }
 
+impl Default for Machine {
+    fn default() -> Self {
+        Self {
+            name: "".to_string(),
+            mac: "".to_string(),
+            ip: "".to_string(),
+            description: None,
+            turn_off_port: None,
+            can_be_turned_off: false,
+            inactivity_period: 60,
+            port_forwards: vec![],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AddMachinePayload {
     pub mac: String,
