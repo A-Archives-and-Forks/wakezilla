@@ -10,6 +10,7 @@ mod forward;
 mod proxy_server;
 mod scanner;
 mod system;
+mod tui;
 mod web;
 mod wol;
 
@@ -31,6 +32,20 @@ pub enum Commands {
     ProxyServer(ServeArgs),
     /// Start a client server
     ClientServer(ClientServerArgs),
+    /// Start the terminal UI against a running proxy server
+    Tui(TuiArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command()]
+pub struct TuiArgs {
+    /// Base URL for the Wakezilla proxy server API
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:3000",
+        help_heading = "TUI Options"
+    )]
+    api_url: String,
 }
 
 #[derive(Parser, Debug)]
@@ -101,41 +116,33 @@ pub struct SendArgs {
 #[tokio::main]
 #[instrument(name = "wakezilla_main", skip_all)]
 async fn main() -> Result<()> {
-    let env_filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stdout)
-        .with_env_filter(env_filter)
-        .init();
-
-    // Load configuration from environment variables
-    let config = config::Config::from_env().unwrap_or_else(|e| {
-        warn!(
-            "Failed to load configuration from environment: {} - using defaults",
-            e
-        );
-        Default::default()
-    });
-
-    info!(
-        "Using configuration: server_proxy_port={}, server_client_port={}, wol_default_port={}, machines_db_path={}",
-        config.server.proxy_port, config.server.client_port, config.wol.default_port, config.storage.machines_db_path
-    );
-
     let cli = Cli::parse();
 
+    init_tracing();
+
     match cli.command {
+        Commands::Tui(args) => {
+            tui::run(tui::TuiConfig {
+                api_base_url: args.api_url,
+            })
+            .await?;
+        }
         Commands::Send(args) => {
+            let config = load_config();
+            log_config(&config);
             handle_send_command(args, &config).await?;
         }
         Commands::ProxyServer(_args) => {
+            let config = load_config();
+            log_config(&config);
             if let Err(e) = proxy_server::start(config.clone()).await {
                 error!("Proxy server error: {}", e);
                 std::process::exit(1);
             }
         }
         Commands::ClientServer(_args) => {
+            let config = load_config();
+            log_config(&config);
             if let Err(e) = client_server::start(config.server.client_port).await {
                 error!("Client server error: {}", e);
                 std::process::exit(1);
@@ -144,6 +151,60 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn init_tracing() {
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(env_filter)
+        .init();
+}
+
+fn load_config() -> config::Config {
+    config::Config::from_env().unwrap_or_else(|e| {
+        warn!(
+            "Failed to load configuration from environment: {} - using defaults",
+            e
+        );
+        Default::default()
+    })
+}
+
+fn log_config(config: &config::Config) {
+    info!(
+        "Using configuration: server_proxy_port={}, server_client_port={}, wol_default_port={}, machines_db_path={}",
+        config.server.proxy_port, config.server.client_port, config.wol.default_port, config.storage.machines_db_path
+    );
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn cli_accepts_tui_subcommand_with_default_api_url() {
+        let cli = Cli::try_parse_from(["wakezilla", "tui"]).expect("tui subcommand parses");
+
+        match cli.command {
+            Commands::Tui(args) => assert_eq!(args.api_url, "http://127.0.0.1:3000"),
+            other => panic!("expected Tui command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_tui_api_url_override() {
+        let cli =
+            Cli::try_parse_from(["wakezilla", "tui", "--api-url", "http://192.168.1.200:3000"])
+                .expect("tui subcommand parses with api override");
+
+        match cli.command {
+            Commands::Tui(args) => assert_eq!(args.api_url, "http://192.168.1.200:3000"),
+            other => panic!("expected Tui command, got {other:?}"),
+        }
+    }
 }
 
 #[instrument(name = "handle_send_command", skip(args, config))]
