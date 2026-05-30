@@ -9,6 +9,7 @@ mod config;
 mod forward;
 mod proxy_server;
 mod scanner;
+mod service;
 mod system;
 mod tui;
 mod web;
