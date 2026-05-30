@@ -7,6 +7,7 @@
 //! - Validates configuration at runtime
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Default configuration file path for machines database
 pub const DEFAULT_MACHINES_DB_PATH: &str = "machines.json";
@@ -46,6 +47,63 @@ impl Config {
             )
             .build()?
             .try_deserialize()
+    }
+}
+
+/// OS-standard directory for the Wakezilla system config file.
+pub fn config_dir() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/etc/wakezilla")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Library/Application Support/wakezilla")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var("ProgramData")
+            .unwrap_or_else(|_| "C:\\ProgramData".to_string());
+        PathBuf::from(base).join("wakezilla")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        PathBuf::from("/etc/wakezilla")
+    }
+}
+
+/// Full path to the system config file.
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+impl Config {
+    /// Serialize this config to a TOML file, creating parent directories.
+    pub fn save_to(&self, path: &Path) -> Result<(), anyhow::Error> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let toml_str = toml::to_string_pretty(self)?;
+        std::fs::write(path, toml_str)?;
+        Ok(())
+    }
+
+    /// Load config from a TOML file (optional) merged with `WAKEZILLA__*` env vars.
+    pub fn load_from(path: &Path) -> Result<Self, config::ConfigError> {
+        config::Config::builder()
+            .add_source(config::File::from(path).required(false))
+            .add_source(
+                config::Environment::with_prefix("WAKEZILLA")
+                    .separator("__")
+                    .try_parsing(true),
+            )
+            .build()?
+            .try_deserialize()
+    }
+
+    /// Load config from the OS-standard path, falling back to defaults on error.
+    pub fn load() -> Self {
+        Self::load_from(&config_path()).unwrap_or_default()
     }
 }
 
