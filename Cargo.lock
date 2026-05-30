@@ -4289,6 +4289,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio 1.47.1",
+ "toml 0.8.23",
  "tower",
  "tower-http",
  "tracing",
