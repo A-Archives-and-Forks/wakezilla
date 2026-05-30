@@ -31,3 +31,23 @@ fn launchd_plist_contains_label_exe_and_subcommand() {
     assert!(plist.contains("client-server"));
     assert!(plist.contains("<key>RunAtLoad</key>"));
 }
+
+#[test]
+fn validate_succeeds_when_port_is_listening() {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    // Listener stays alive for the duration of the test.
+    service::validate(port, 5).expect("validate connects to open port");
+}
+
+#[test]
+fn validate_fails_when_port_is_closed() {
+    // Bind then drop to obtain an almost-certainly-free port.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let result = service::validate(port, 2);
+    assert!(result.is_err(), "validate should fail on closed port");
+}

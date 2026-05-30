@@ -1,5 +1,9 @@
 //! OS-native system service installation for the `setup` subcommand.
 
+use anyhow::{anyhow, Context, Result};
+use std::net::TcpStream;
+use std::time::Duration;
+
 /// Which Wakezilla server the service runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -96,4 +100,28 @@ pub fn generate_launchd_plist(mode: Mode, exe: &str) -> String {
         exe = exe,
         sub = mode.subcommand(),
     )
+}
+
+/// Validate the service is up by TCP-connecting to `127.0.0.1:port`.
+/// Retries up to `attempts` times with a 500ms pause and per-attempt 1s timeout.
+pub fn validate(port: u16, attempts: u32) -> Result<()> {
+    let addr = format!("127.0.0.1:{port}");
+    let socket = addr
+        .parse()
+        .with_context(|| format!("invalid validation address {addr}"))?;
+
+    for attempt in 1..=attempts {
+        match TcpStream::connect_timeout(&socket, Duration::from_secs(1)) {
+            Ok(_) => return Ok(()),
+            Err(_) if attempt < attempts => {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "service did not accept connections on {addr} after {attempts} attempts: {e}"
+                ));
+            }
+        }
+    }
+    Err(anyhow!("service not reachable on {addr}"))
 }
