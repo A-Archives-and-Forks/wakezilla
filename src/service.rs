@@ -178,7 +178,8 @@ pub fn install(mode: Mode, exe: &str) -> Result<()> {
             &[
                 "create",
                 mode.service_name(),
-                &format!("binPath= {bin_path}"),
+                "binPath=",
+                &bin_path,
                 "start=",
                 "auto",
             ],
