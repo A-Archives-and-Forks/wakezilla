@@ -78,6 +78,9 @@ fn helper_methods_return_expected_durations() {
 
 #[test]
 fn config_save_load_round_trip_preserves_ports() {
+    // `load_from` merges `WAKEZILLA__*` env vars, so hold the env lock to avoid
+    // interference from tests that set those vars concurrently.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("config.toml");
 

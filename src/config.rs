@@ -103,7 +103,15 @@ impl Config {
 
     /// Load config from the OS-standard path, falling back to defaults on error.
     pub fn load() -> Self {
-        Self::load_from(&config_path()).unwrap_or_default()
+        let path = config_path();
+        Self::load_from(&path).unwrap_or_else(|e| {
+            tracing::warn!(
+                "Failed to load configuration from {}: {} - using defaults",
+                path.display(),
+                e
+            );
+            Self::default()
+        })
     }
 }
 
