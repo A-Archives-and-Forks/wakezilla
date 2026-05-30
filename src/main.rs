@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::net::{IpAddr, Ipv4Addr};
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, instrument};
 
 mod api_models;
 mod client_server;
@@ -17,6 +17,7 @@ mod web;
 mod wol;
 
 pub use api_models::*;
+use setup::SetupArgs;
 
 /// Simple Wake-on-LAN sender + post-WOL reachability check.
 #[derive(Parser, Debug)]
@@ -36,6 +37,8 @@ pub enum Commands {
     ClientServer(ClientServerArgs),
     /// Start the terminal UI against a running proxy server
     Tui(TuiArgs),
+    /// Configure this host to auto-start a Wakezilla server as a system service
+    Setup(SetupArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -150,6 +153,12 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Commands::Setup(args) => {
+            if let Err(e) = setup::run(args) {
+                error!("Setup error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     Ok(())
@@ -166,13 +175,7 @@ fn init_tracing() {
 }
 
 fn load_config() -> config::Config {
-    config::Config::from_env().unwrap_or_else(|e| {
-        warn!(
-            "Failed to load configuration from environment: {} - using defaults",
-            e
-        );
-        Default::default()
-    })
+    config::Config::load()
 }
 
 fn log_config(config: &config::Config) {
@@ -205,6 +208,32 @@ mod cli_tests {
         match cli.command {
             Commands::Tui(args) => assert_eq!(args.api_url, "http://192.168.1.200:3000"),
             other => panic!("expected Tui command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_setup_subcommand_with_flags() {
+        let cli = Cli::try_parse_from(["wakezilla", "setup", "--mode", "proxy", "--port", "3000"])
+            .expect("setup subcommand parses");
+
+        match cli.command {
+            Commands::Setup(args) => {
+                assert_eq!(args.mode.as_deref(), Some("proxy"));
+                assert_eq!(args.port, Some(3000));
+            }
+            other => panic!("expected Setup command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_setup_subcommand_without_flags() {
+        let cli = Cli::try_parse_from(["wakezilla", "setup"]).expect("bare setup parses");
+        match cli.command {
+            Commands::Setup(args) => {
+                assert!(args.mode.is_none());
+                assert!(args.port.is_none());
+            }
+            other => panic!("expected Setup command, got {other:?}"),
         }
     }
 }
