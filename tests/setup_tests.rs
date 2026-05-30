@@ -51,3 +51,14 @@ fn validate_fails_when_port_is_closed() {
     let result = service::validate(port, 2);
     assert!(result.is_err(), "validate should fail on closed port");
 }
+
+#[test]
+fn build_config_sets_correct_port_for_mode() {
+    let proxy = wakezilla::setup::build_config(Mode::Proxy, 5000);
+    assert_eq!(proxy.server.proxy_port, 5000);
+    assert_eq!(proxy.server.client_port, 3001); // untouched default
+
+    let client = wakezilla::setup::build_config(Mode::Client, 6000);
+    assert_eq!(client.server.client_port, 6000);
+    assert_eq!(client.server.proxy_port, 3000); // untouched default
+}

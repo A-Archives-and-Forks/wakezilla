@@ -10,6 +10,7 @@ mod forward;
 mod proxy_server;
 mod scanner;
 mod service;
+mod setup;
 mod system;
 mod tui;
 mod web;
