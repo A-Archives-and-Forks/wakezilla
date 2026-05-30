@@ -159,6 +159,9 @@ pub fn is_elevated() -> bool {
 }
 
 /// Install, enable, and start the system service for `mode`.
+///
+/// Idempotent: re-running over an existing install overwrites the unit/plist and
+/// reloads/recreates the service so a changed mode or port takes effect.
 /// `exe` is the absolute path to the wakezilla binary.
 pub fn install(mode: Mode, exe: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -167,7 +170,10 @@ pub fn install(mode: Mode, exe: &str) -> Result<()> {
         let path = format!("/etc/systemd/system/{}.service", mode.service_name());
         std::fs::write(&path, unit).with_context(|| format!("writing {path}"))?;
         run("systemctl", &["daemon-reload"])?;
-        run("systemctl", &["enable", "--now", mode.service_name()])?;
+        run("systemctl", &["enable", mode.service_name()])?;
+        // restart (not `enable --now`) so an already-running service picks up the
+        // updated unit; restart also starts it if it was stopped.
+        run("systemctl", &["restart", mode.service_name()])?;
         Ok(())
     }
     #[cfg(target_os = "macos")]
@@ -175,11 +181,18 @@ pub fn install(mode: Mode, exe: &str) -> Result<()> {
         let plist = generate_launchd_plist(mode, exe);
         let path = format!("/Library/LaunchDaemons/{}.plist", mode.launchd_label());
         std::fs::write(&path, plist).with_context(|| format!("writing {path}"))?;
+        // Unload any previous instance (ignored if not loaded) so the updated
+        // plist is reloaded on a re-run instead of erroring "already loaded".
+        run_ignore_err("launchctl", &["unload", &path]);
         run("launchctl", &["load", "-w", &path])?;
         Ok(())
     }
     #[cfg(target_os = "windows")]
     {
+        // Best-effort teardown of any previous instance so `sc create` does not
+        // error "service already exists" on a re-run.
+        run_ignore_err("sc", &["stop", mode.service_name()]);
+        run_ignore_err("sc", &["delete", mode.service_name()]);
         let bin_path = format!("\"{exe}\" {}", mode.subcommand());
         run(
             "sc",
@@ -213,4 +226,11 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
         return Err(anyhow!("{cmd} {args:?} exited with {status}"));
     }
     Ok(())
+}
+
+/// Run a command, ignoring its outcome. Used for best-effort teardown of a prior
+/// install (e.g. unloading/deleting an existing service) before reinstalling.
+#[allow(dead_code)]
+fn run_ignore_err(cmd: &str, args: &[&str]) {
+    let _ = Command::new(cmd).args(args).status();
 }
