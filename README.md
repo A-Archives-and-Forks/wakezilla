@@ -118,6 +118,19 @@ docker run -d \
    You can check the health of the client server by visiting:
    http://<client-ip>:3001/health
 
+### Set up auto-start (system service)
+
+1. **Run the interactive setup wizard** (requires `sudo`/admin privileges):
+   ```bash
+    sudo wakezilla setup
+   ```
+
+   This interactively configures the host to auto-start the proxy or client
+   server as a system service (systemd on Linux, launchd on macOS, or the
+   Windows Service Manager). It writes an OS-standard config file, installs and
+   enables the service, then validates that the service is reachable after
+   install. Pass `--mode <proxy|client>` and `--port <PORT>` to skip the prompts.
+
 
 ## Usage
 

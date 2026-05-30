@@ -38,6 +38,8 @@ pub struct Config {
 
 impl Config {
     /// Load configuration from environment variables
+    // Retained as public env-based loader; used by tests and as library API.
+    #[allow(dead_code)]
     pub fn from_env() -> Result<Self, config::ConfigError> {
         config::Config::builder()
             .add_source(
@@ -62,8 +64,7 @@ pub fn config_dir() -> PathBuf {
     }
     #[cfg(target_os = "windows")]
     {
-        let base = std::env::var("ProgramData")
-            .unwrap_or_else(|_| "C:\\ProgramData".to_string());
+        let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
         PathBuf::from(base).join("wakezilla")
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

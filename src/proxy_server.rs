@@ -647,6 +647,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // ENV_LOCK serializes mutation of process env vars across these tests; it must be held
+    // across the awaited handler call, so the sync guard intentionally spans the await point.
+    #[allow(clippy::await_holding_lock)]
     async fn add_machine_api_persists_new_entry() {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp_dir = tempdir().expect("failed to create temp dir");
@@ -775,6 +778,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // ENV_LOCK serializes mutation of process env vars across these tests; it must be held
+    // across the awaited handler call, so the sync guard intentionally spans the await point.
+    #[allow(clippy::await_holding_lock)]
     async fn update_machine_api_applies_changes() {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp_dir = tempdir().expect("failed to create temp dir");
@@ -814,6 +820,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // ENV_LOCK serializes mutation of process env vars across these tests; it must be held
+    // across the awaited handler call, so the sync guard intentionally spans the await point.
+    #[allow(clippy::await_holding_lock)]
     async fn delete_machine_api_stops_proxy_and_removes_machine() {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp_dir = tempdir().expect("failed to create temp dir");

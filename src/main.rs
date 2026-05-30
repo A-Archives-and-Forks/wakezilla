@@ -185,59 +185,6 @@ fn log_config(config: &config::Config) {
     );
 }
 
-#[cfg(test)]
-mod cli_tests {
-    use super::*;
-
-    #[test]
-    fn cli_accepts_tui_subcommand_with_default_api_url() {
-        let cli = Cli::try_parse_from(["wakezilla", "tui"]).expect("tui subcommand parses");
-
-        match cli.command {
-            Commands::Tui(args) => assert_eq!(args.api_url, "http://127.0.0.1:3000"),
-            other => panic!("expected Tui command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cli_accepts_tui_api_url_override() {
-        let cli =
-            Cli::try_parse_from(["wakezilla", "tui", "--api-url", "http://192.168.1.200:3000"])
-                .expect("tui subcommand parses with api override");
-
-        match cli.command {
-            Commands::Tui(args) => assert_eq!(args.api_url, "http://192.168.1.200:3000"),
-            other => panic!("expected Tui command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cli_accepts_setup_subcommand_with_flags() {
-        let cli = Cli::try_parse_from(["wakezilla", "setup", "--mode", "proxy", "--port", "3000"])
-            .expect("setup subcommand parses");
-
-        match cli.command {
-            Commands::Setup(args) => {
-                assert_eq!(args.mode.as_deref(), Some("proxy"));
-                assert_eq!(args.port, Some(3000));
-            }
-            other => panic!("expected Setup command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cli_accepts_setup_subcommand_without_flags() {
-        let cli = Cli::try_parse_from(["wakezilla", "setup"]).expect("bare setup parses");
-        match cli.command {
-            Commands::Setup(args) => {
-                assert!(args.mode.is_none());
-                assert!(args.port.is_none());
-            }
-            other => panic!("expected Setup command, got {other:?}"),
-        }
-    }
-}
-
 #[instrument(name = "handle_send_command", skip(args, config))]
 async fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<()> {
     info!("Processing WOL send command");
@@ -288,5 +235,58 @@ async fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<
             }
         }
         Err(_) => Err(anyhow::anyhow!("No runtime context available")),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn cli_accepts_tui_subcommand_with_default_api_url() {
+        let cli = Cli::try_parse_from(["wakezilla", "tui"]).expect("tui subcommand parses");
+
+        match cli.command {
+            Commands::Tui(args) => assert_eq!(args.api_url, "http://127.0.0.1:3000"),
+            other => panic!("expected Tui command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_tui_api_url_override() {
+        let cli =
+            Cli::try_parse_from(["wakezilla", "tui", "--api-url", "http://192.168.1.200:3000"])
+                .expect("tui subcommand parses with api override");
+
+        match cli.command {
+            Commands::Tui(args) => assert_eq!(args.api_url, "http://192.168.1.200:3000"),
+            other => panic!("expected Tui command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_setup_subcommand_with_flags() {
+        let cli = Cli::try_parse_from(["wakezilla", "setup", "--mode", "proxy", "--port", "3000"])
+            .expect("setup subcommand parses");
+
+        match cli.command {
+            Commands::Setup(args) => {
+                assert_eq!(args.mode.as_deref(), Some("proxy"));
+                assert_eq!(args.port, Some(3000));
+            }
+            other => panic!("expected Setup command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_setup_subcommand_without_flags() {
+        let cli = Cli::try_parse_from(["wakezilla", "setup"]).expect("bare setup parses");
+        match cli.command {
+            Commands::Setup(args) => {
+                assert!(args.mode.is_none());
+                assert!(args.port.is_none());
+            }
+            other => panic!("expected Setup command, got {other:?}"),
+        }
     }
 }

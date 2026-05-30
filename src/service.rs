@@ -31,6 +31,8 @@ impl Mode {
     }
 
     /// systemd unit / Windows service name.
+    // Platform-conditional: used by the systemd (Linux) / launchd (macOS) / Windows install paths; some are cfg'd out per-OS.
+    #[allow(dead_code)]
     pub fn service_name(self) -> &'static str {
         match self {
             Mode::Proxy => "wakezilla-proxy",
@@ -39,6 +41,8 @@ impl Mode {
     }
 
     /// launchd label (reverse-DNS).
+    // Platform-conditional: used by the systemd (Linux) / launchd (macOS) / Windows install paths; some are cfg'd out per-OS.
+    #[allow(dead_code)]
     pub fn launchd_label(self) -> &'static str {
         match self {
             Mode::Proxy => "dev.wakezilla.proxy",
@@ -56,6 +60,8 @@ impl Mode {
 }
 
 /// Render a systemd unit file. `exe` is the absolute path to the wakezilla binary.
+// Platform-conditional: used by the systemd (Linux) / launchd (macOS) / Windows install paths; some are cfg'd out per-OS.
+#[allow(dead_code)]
 pub fn generate_systemd_unit(mode: Mode, exe: &str) -> String {
     format!(
         "[Unit]\n\
@@ -78,6 +84,8 @@ pub fn generate_systemd_unit(mode: Mode, exe: &str) -> String {
 }
 
 /// Render a launchd LaunchDaemon plist.
+// Platform-conditional: used by the systemd (Linux) / launchd (macOS) / Windows install paths; some are cfg'd out per-OS.
+#[allow(dead_code)]
 pub fn generate_launchd_plist(mode: Mode, exe: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\

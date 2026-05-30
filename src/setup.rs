@@ -228,13 +228,18 @@ fn draw_wizard(f: &mut Frame, w: &Wizard) {
             let proxy = mode_span("Proxy server", w.mode == Mode::Proxy);
             let client = mode_span("Client server", w.mode == Mode::Client);
             vec![
-                Line::from("What do you want to configure? (Left/Right to switch, Enter to confirm)"),
+                Line::from(
+                    "What do you want to configure? (Left/Right to switch, Enter to confirm)",
+                ),
                 Line::from(""),
                 Line::from(vec![proxy, Span::raw("   "), client]),
             ]
         }
         Step::PortInput => vec![
-            Line::from(format!("Port for {} (Enter to confirm):", w.mode.subcommand())),
+            Line::from(format!(
+                "Port for {} (Enter to confirm):",
+                w.mode.subcommand()
+            )),
             Line::from(""),
             Line::from(Span::styled(
                 format!("> {}", w.port_input),
@@ -262,8 +267,8 @@ fn draw_wizard(f: &mut Frame, w: &Wizard) {
     let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
     f.render_widget(para, chunks[1]);
 
-    let footer = Paragraph::new("Esc / Ctrl-C: cancel")
-        .block(Block::default().borders(Borders::ALL));
+    let footer =
+        Paragraph::new("Esc / Ctrl-C: cancel").block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
 }
 
