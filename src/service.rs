@@ -234,3 +234,108 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
 fn run_ignore_err(cmd: &str, args: &[&str]) {
     let _ = Command::new(cmd).args(args).status();
 }
+
+/// Path to the on-disk service descriptor (systemd unit / launchd plist).
+/// Not defined on Windows, which has no descriptor file (services live in the SCM).
+#[cfg(target_os = "macos")]
+fn descriptor_path(mode: Mode) -> String {
+    format!("/Library/LaunchDaemons/{}.plist", mode.launchd_label())
+}
+#[cfg(target_os = "linux")]
+fn descriptor_path(mode: Mode) -> String {
+    format!("/etc/systemd/system/{}.service", mode.service_name())
+}
+
+/// True if the service for `mode` appears installed on this host.
+pub fn is_installed(mode: Mode) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        std::path::Path::new(&descriptor_path(mode)).exists()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("sc")
+            .args(["query", mode.service_name()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = mode;
+        false
+    }
+}
+
+/// The set of modes currently installed as services on this host.
+pub fn installed_modes() -> Vec<Mode> {
+    [Mode::Proxy, Mode::Client]
+        .into_iter()
+        .filter(|m| is_installed(*m))
+        .collect()
+}
+
+/// Start the installed service for `mode`.
+pub fn start(mode: Mode) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        run("systemctl", &["start", mode.service_name()])
+    }
+    #[cfg(target_os = "macos")]
+    {
+        run("launchctl", &["load", "-w", &descriptor_path(mode)])
+    }
+    #[cfg(target_os = "windows")]
+    {
+        run("sc", &["start", mode.service_name()])
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = mode;
+        Err(anyhow!("service control not supported on this OS"))
+    }
+}
+
+/// Stop the installed service for `mode`.
+pub fn stop(mode: Mode) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        run("systemctl", &["stop", mode.service_name()])
+    }
+    #[cfg(target_os = "macos")]
+    {
+        run("launchctl", &["unload", &descriptor_path(mode)])
+    }
+    #[cfg(target_os = "windows")]
+    {
+        run("sc", &["stop", mode.service_name()])
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = mode;
+        Err(anyhow!("service control not supported on this OS"))
+    }
+}
+
+/// Restart the installed service for `mode`.
+pub fn restart(mode: Mode) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        run("systemctl", &["restart", mode.service_name()])
+    }
+    #[cfg(target_os = "macos")]
+    {
+        run_ignore_err("launchctl", &["unload", &descriptor_path(mode)]);
+        run("launchctl", &["load", "-w", &descriptor_path(mode)])
+    }
+    #[cfg(target_os = "windows")]
+    {
+        run_ignore_err("sc", &["stop", mode.service_name()]);
+        run("sc", &["start", mode.service_name()])
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = mode;
+        Err(anyhow!("service control not supported on this OS"))
+    }
+}

@@ -17,7 +17,7 @@ mod web;
 mod wol;
 
 pub use api_models::*;
-use setup::SetupArgs;
+use setup::{ServiceArgs, SetupArgs};
 
 /// Simple Wake-on-LAN sender + post-WOL reachability check.
 #[derive(Parser, Debug)]
@@ -39,6 +39,8 @@ pub enum Commands {
     Tui(TuiArgs),
     /// Configure this host to auto-start a Wakezilla server as a system service
     Setup(SetupArgs),
+    /// Start, stop, or restart an installed Wakezilla service
+    Service(ServiceArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -156,6 +158,12 @@ async fn main() -> Result<()> {
         Commands::Setup(args) => {
             if let Err(e) = setup::run(args) {
                 error!("Setup error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Service(args) => {
+            if let Err(e) = setup::run_service(args) {
+                error!("Service error: {}", e);
                 std::process::exit(1);
             }
         }
@@ -288,5 +296,40 @@ mod cli_tests {
             }
             other => panic!("expected Setup command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_accepts_service_subcommand_with_action_and_mode() {
+        use setup::ServiceAction;
+        let cli = Cli::try_parse_from(["wakezilla", "service", "stop", "--mode", "client"])
+            .expect("service subcommand parses");
+
+        match cli.command {
+            Commands::Service(args) => {
+                assert_eq!(args.action, ServiceAction::Stop);
+                assert_eq!(args.mode.as_deref(), Some("client"));
+            }
+            other => panic!("expected Service command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_service_subcommand_without_mode() {
+        use setup::ServiceAction;
+        let cli = Cli::try_parse_from(["wakezilla", "service", "restart"])
+            .expect("bare service action parses");
+        match cli.command {
+            Commands::Service(args) => {
+                assert_eq!(args.action, ServiceAction::Restart);
+                assert!(args.mode.is_none());
+            }
+            other => panic!("expected Service command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_service_subcommand_without_action() {
+        let result = Cli::try_parse_from(["wakezilla", "service"]);
+        assert!(result.is_err(), "service requires an action argument");
     }
 }

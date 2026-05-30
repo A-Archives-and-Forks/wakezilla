@@ -131,6 +131,18 @@ docker run -d \
    enables the service, then validates that the service is reachable after
    install. Pass `--mode <proxy|client>` and `--port <PORT>` to skip the prompts.
 
+2. **Control an installed service** (requires `sudo`/admin privileges):
+   ```bash
+    sudo wakezilla service start
+    sudo wakezilla service stop
+    sudo wakezilla service restart
+   ```
+
+   Starts, stops, or restarts a service previously installed with `setup`. If
+   both the proxy and client are installed, an interactive picker asks which to
+   act on; pass `--mode <proxy|client>` to skip the prompt. If only one is
+   installed, it is selected automatically.
+
 
 ## Usage
 

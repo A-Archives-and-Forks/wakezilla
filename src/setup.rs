@@ -19,6 +19,27 @@ pub struct SetupArgs {
     pub port: Option<u16>,
 }
 
+/// Action for the `service` subcommand.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+/// CLI arguments for the `service` subcommand.
+#[derive(Parser, Debug)]
+#[command()]
+pub struct ServiceArgs {
+    /// Action to perform on the installed service.
+    #[arg(value_enum)]
+    pub action: ServiceAction,
+
+    /// Target server ("proxy" or "client"); skips the TUI prompt.
+    #[arg(long, help_heading = "Service Options")]
+    pub mode: Option<String>,
+}
+
 /// Build a Config with the chosen port placed in the correct field for `mode`.
 pub fn build_config(mode: Mode, port: u16) -> Config {
     let mut cfg = Config::default();
@@ -284,4 +305,142 @@ fn mode_span(label: &str, selected: bool) -> Span<'static> {
         Style::default()
     };
     Span::styled(text, style)
+}
+
+/// Entry point for the `service` subcommand: start/stop/restart an installed service.
+/// Requires elevation. Resolves the target mode from `--mode`, a single install, or a
+/// TUI picker when both proxy and client are installed.
+pub fn run_service(args: ServiceArgs) -> Result<()> {
+    if !service::is_elevated() {
+        eprintln!(
+            "wakezilla service must run with administrator privileges.\n\
+             Re-run with: sudo wakezilla service <action>   (Linux/macOS)  or  an elevated shell (Windows)."
+        );
+        std::process::exit(1);
+    }
+
+    let mode = match &args.mode {
+        Some(mode_str) => {
+            let mode = Mode::from_str_opt(mode_str).with_context(|| {
+                format!("invalid --mode '{mode_str}' (use 'proxy' or 'client')")
+            })?;
+            if !service::is_installed(mode) {
+                anyhow::bail!(
+                    "{} service is not installed. Run `wakezilla setup` first.",
+                    mode.subcommand()
+                );
+            }
+            mode
+        }
+        None => {
+            let installed = service::installed_modes();
+            match installed.as_slice() {
+                [] => {
+                    anyhow::bail!("No Wakezilla service is installed. Run `wakezilla setup` first.")
+                }
+                [only] => *only,
+                _ => pick_mode(&installed)?,
+            }
+        }
+    };
+
+    match args.action {
+        ServiceAction::Start => service::start(mode).context("failed to start service")?,
+        ServiceAction::Stop => service::stop(mode).context("failed to stop service")?,
+        ServiceAction::Restart => service::restart(mode).context("failed to restart service")?,
+    }
+
+    let verb = match args.action {
+        ServiceAction::Start => "started",
+        ServiceAction::Stop => "stopped",
+        ServiceAction::Restart => "restarted",
+    };
+    println!("{} service {verb}.", mode.subcommand());
+    Ok(())
+}
+
+/// Interactive picker to choose one mode from the installed set (Left/Right, Enter).
+fn pick_mode(modes: &[Mode]) -> Result<Mode> {
+    enable_raw_mode().context("failed to enable raw mode")?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).context("failed to enter alt screen")?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
+
+    let result = pick_mode_loop(&mut terminal, modes);
+
+    disable_raw_mode().ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    terminal.show_cursor().ok();
+
+    result
+}
+
+fn pick_mode_loop<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    modes: &[Mode],
+) -> Result<Mode> {
+    let mut selected = 0usize;
+
+    loop {
+        terminal.draw(|f| draw_pick_mode(f, modes, selected))?;
+
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+        if let Event::Key(key) = event::read()? {
+            if key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                return Err(anyhow::anyhow!("cancelled"));
+            }
+            match key.code {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                    selected = (selected + 1) % modes.len();
+                }
+                KeyCode::Enter => return Ok(modes[selected]),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn draw_pick_mode(f: &mut Frame, modes: &[Mode], selected: usize) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(3),
+        ])
+        .split(f.area());
+
+    let title = Paragraph::new("Wakezilla Service")
+        .style(Style::default().add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(title, chunks[0]);
+
+    let spans: Vec<Span> = modes
+        .iter()
+        .enumerate()
+        .flat_map(|(i, m)| {
+            let label = match m {
+                Mode::Proxy => "Proxy server",
+                Mode::Client => "Client server",
+            };
+            vec![mode_span(label, i == selected), Span::raw("   ")]
+        })
+        .collect();
+
+    let body = vec![
+        Line::from("Which service? (Left/Right to switch, Enter to select)"),
+        Line::from(""),
+        Line::from(spans),
+    ];
+    let para = Paragraph::new(body).block(Block::default().borders(Borders::ALL));
+    f.render_widget(para, chunks[1]);
+
+    let footer =
+        Paragraph::new("Esc / Ctrl-C: cancel").block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, chunks[2]);
 }
