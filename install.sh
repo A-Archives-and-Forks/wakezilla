@@ -43,6 +43,29 @@ Examples:
 USAGE
 }
 
+detect_libc() {
+  if [ -n "${WAKEZILLA_LIBC:-}" ]; then
+    printf '%s\n' "$WAKEZILLA_LIBC"
+    return 0
+  fi
+
+  # ldd prints its banner to stderr on glibc and stdout on musl; check both.
+  if ldd --version 2>&1 | grep -qi musl; then
+    printf 'musl\n'
+    return 0
+  fi
+
+  # Fallback: musl ships a loader named ld-musl-<arch>.so.* under /lib.
+  for loader in /lib/ld-musl-*.so.*; do
+    if [ -e "$loader" ]; then
+      printf 'musl\n'
+      return 0
+    fi
+  done
+
+  printf 'gnu\n'
+}
+
 detect_target() {
   if [ -n "${TARGET:-}" ]; then
     printf '%s\n' "$TARGET"
@@ -59,12 +82,12 @@ detect_target() {
   esac
 
   case "$uname_s:$arch" in
-    Linux:x86_64) printf 'x86_64-unknown-linux-gnu\n' ;;
-    Linux:aarch64) printf 'aarch64-unknown-linux-gnu\n' ;;
+    Linux:x86_64) printf 'x86_64-unknown-linux-%s\n' "$(detect_libc)" ;;
+    Linux:aarch64) printf 'aarch64-unknown-linux-%s\n' "$(detect_libc)" ;;
     Darwin:x86_64) printf 'x86_64-apple-darwin\n' ;;
     Darwin:aarch64) printf 'aarch64-apple-darwin\n' ;;
     *)
-      err "platform" "unsupported platform: $uname_s/$uname_m. Supported release targets are x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, x86_64-apple-darwin, aarch64-apple-darwin"
+      err "platform" "unsupported platform: $uname_s/$uname_m. Supported release targets are x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin"
       ;;
   esac
 }
