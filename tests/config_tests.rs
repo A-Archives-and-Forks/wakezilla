@@ -1,18 +1,26 @@
+use std::sync::Mutex;
 use std::time::Duration;
 
 use wakezilla::config::Config;
 
+/// Serializes tests that read or mutate the process environment, since env vars
+/// are global to the process and tests run concurrently by default.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 struct EnvGuard {
     keys: Vec<&'static str>,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl EnvGuard {
     fn set(vars: &[(&'static str, &str)]) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (key, value) in vars {
             std::env::set_var(key, value);
         }
         Self {
             keys: vars.iter().map(|(key, _)| *key).collect(),
+            _lock: lock,
         }
     }
 }
@@ -66,4 +74,36 @@ fn helper_methods_return_expected_durations() {
     assert_eq!(cfg.network_read_timeout(), Duration::from_secs(2));
     assert_eq!(cfg.health_check_interval(), Duration::from_millis(30_000));
     assert_eq!(cfg.system_shutdown_sleep_duration(), Duration::from_secs(5));
+}
+
+#[test]
+fn config_save_load_round_trip_preserves_ports() {
+    // `load_from` merges `WAKEZILLA__*` env vars, so hold the env lock to avoid
+    // interference from tests that set those vars concurrently.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+
+    let mut cfg = Config::default();
+    cfg.server.proxy_port = 4567;
+    cfg.server.client_port = 7654;
+
+    cfg.save_to(&path).expect("save_to writes toml");
+    assert!(path.exists(), "config file should be written");
+
+    let loaded = Config::load_from(&path).expect("load_from reads toml");
+    assert_eq!(loaded.server.proxy_port, 4567);
+    assert_eq!(loaded.server.client_port, 7654);
+}
+
+#[test]
+fn config_load_from_missing_file_returns_defaults() {
+    // `load_from` merges `WAKEZILLA__*` env vars, so hold the env lock to avoid
+    // interference from tests that set those vars concurrently.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("does-not-exist.toml");
+
+    let loaded = Config::load_from(&path).expect("missing file falls back to defaults");
+    assert_eq!(loaded.server.proxy_port, 3000);
 }

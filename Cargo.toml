@@ -59,6 +59,7 @@ regex = "1.11.2"
 once_cell = "1.19.0"
 anyhow = "1.0"
 config = { version = "0.14", features = ["toml", "yaml", "json"] }
+toml = "0.8"
 tower = "0.5"
 tower-http  = {version = "0.6.6", features = [ "cors", "fs"] }
 mime_guess = "2.0"

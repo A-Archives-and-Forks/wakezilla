@@ -118,6 +118,44 @@ docker run -d \
    You can check the health of the client server by visiting:
    http://<client-ip>:3001/health
 
+### Set up auto-start (system service)
+
+1. **Run the interactive setup wizard** (requires `sudo`/admin privileges):
+   ```bash
+    sudo wakezilla setup
+   ```
+
+   This interactively configures the host to auto-start the proxy or client
+   server as a system service (systemd on Linux, launchd on macOS, or the
+   Windows Service Manager). It writes an OS-standard config file, installs and
+   enables the service, then validates that the service is reachable after
+   install. Pass `--mode <proxy|client>` and `--port <PORT>` to skip the prompts.
+
+   If a configuration or service already exists, `setup` shows a summary of the
+   current config (and installed services) and asks for confirmation before
+   overwriting. Existing settings for the *other* server are preserved — only
+   the target server's port is updated. Pass `-y`/`--yes` to skip the
+   confirmation for non-interactive use.
+
+2. **Control an installed service** (requires `sudo`/admin privileges):
+   ```bash
+    sudo wakezilla service start
+    sudo wakezilla service stop
+    sudo wakezilla service restart
+    sudo wakezilla service status            # is it running?
+    sudo wakezilla service logs              # status + recent logs
+    sudo wakezilla service logs -f -n 100    # follow, last 100 lines
+   ```
+
+   Controls a service previously installed with `setup`. If both the proxy and
+   client are installed, an interactive picker asks which to act on; pass
+   `--mode <proxy|client>` to skip the prompt. If only one is installed, it is
+   selected automatically.
+
+   `logs` reads from journald on Linux and from the daemon's redirected log file
+   on macOS (`/Library/Logs/wakezilla/`). Log streaming is not captured for the
+   Windows service.
+
 
 ## Usage
 

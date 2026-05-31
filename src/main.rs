@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::net::{IpAddr, Ipv4Addr};
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, instrument};
 
 mod api_models;
 mod client_server;
@@ -9,12 +9,15 @@ mod config;
 mod forward;
 mod proxy_server;
 mod scanner;
+mod service;
+mod setup;
 mod system;
 mod tui;
 mod web;
 mod wol;
 
 pub use api_models::*;
+use setup::{ServiceArgs, SetupArgs};
 
 /// Simple Wake-on-LAN sender + post-WOL reachability check.
 #[derive(Parser, Debug)]
@@ -34,6 +37,10 @@ pub enum Commands {
     ClientServer(ClientServerArgs),
     /// Start the terminal UI against a running proxy server
     Tui(TuiArgs),
+    /// Configure this host to auto-start a Wakezilla server as a system service
+    Setup(SetupArgs),
+    /// Control an installed Wakezilla service (start/stop/restart/status/logs)
+    Service(ServiceArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -148,6 +155,18 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Commands::Setup(args) => {
+            if let Err(e) = setup::run(args) {
+                error!("Setup error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Service(args) => {
+            if let Err(e) = setup::run_service(args) {
+                error!("Service error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     Ok(())
@@ -164,13 +183,7 @@ fn init_tracing() {
 }
 
 fn load_config() -> config::Config {
-    config::Config::from_env().unwrap_or_else(|e| {
-        warn!(
-            "Failed to load configuration from environment: {} - using defaults",
-            e
-        );
-        Default::default()
-    })
+    config::Config::load()
 }
 
 fn log_config(config: &config::Config) {
@@ -178,33 +191,6 @@ fn log_config(config: &config::Config) {
         "Using configuration: server_proxy_port={}, server_client_port={}, wol_default_port={}, machines_db_path={}",
         config.server.proxy_port, config.server.client_port, config.wol.default_port, config.storage.machines_db_path
     );
-}
-
-#[cfg(test)]
-mod cli_tests {
-    use super::*;
-
-    #[test]
-    fn cli_accepts_tui_subcommand_with_default_api_url() {
-        let cli = Cli::try_parse_from(["wakezilla", "tui"]).expect("tui subcommand parses");
-
-        match cli.command {
-            Commands::Tui(args) => assert_eq!(args.api_url, "http://127.0.0.1:3000"),
-            other => panic!("expected Tui command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cli_accepts_tui_api_url_override() {
-        let cli =
-            Cli::try_parse_from(["wakezilla", "tui", "--api-url", "http://192.168.1.200:3000"])
-                .expect("tui subcommand parses with api override");
-
-        match cli.command {
-            Commands::Tui(args) => assert_eq!(args.api_url, "http://192.168.1.200:3000"),
-            other => panic!("expected Tui command, got {other:?}"),
-        }
-    }
 }
 
 #[instrument(name = "handle_send_command", skip(args, config))]
@@ -257,5 +243,134 @@ async fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<
             }
         }
         Err(_) => Err(anyhow::anyhow!("No runtime context available")),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn cli_accepts_tui_subcommand_with_default_api_url() {
+        let cli = Cli::try_parse_from(["wakezilla", "tui"]).expect("tui subcommand parses");
+
+        match cli.command {
+            Commands::Tui(args) => assert_eq!(args.api_url, "http://127.0.0.1:3000"),
+            other => panic!("expected Tui command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_tui_api_url_override() {
+        let cli =
+            Cli::try_parse_from(["wakezilla", "tui", "--api-url", "http://192.168.1.200:3000"])
+                .expect("tui subcommand parses with api override");
+
+        match cli.command {
+            Commands::Tui(args) => assert_eq!(args.api_url, "http://192.168.1.200:3000"),
+            other => panic!("expected Tui command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_setup_subcommand_with_flags() {
+        let cli = Cli::try_parse_from(["wakezilla", "setup", "--mode", "proxy", "--port", "3000"])
+            .expect("setup subcommand parses");
+
+        match cli.command {
+            Commands::Setup(args) => {
+                assert_eq!(args.mode.as_deref(), Some("proxy"));
+                assert_eq!(args.port, Some(3000));
+            }
+            other => panic!("expected Setup command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_setup_subcommand_without_flags() {
+        let cli = Cli::try_parse_from(["wakezilla", "setup"]).expect("bare setup parses");
+        match cli.command {
+            Commands::Setup(args) => {
+                assert!(args.mode.is_none());
+                assert!(args.port.is_none());
+            }
+            other => panic!("expected Setup command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_service_subcommand_with_action_and_mode() {
+        use setup::ServiceAction;
+        let cli = Cli::try_parse_from(["wakezilla", "service", "stop", "--mode", "client"])
+            .expect("service subcommand parses");
+
+        match cli.command {
+            Commands::Service(args) => {
+                assert_eq!(args.action, ServiceAction::Stop);
+                assert_eq!(args.mode.as_deref(), Some("client"));
+            }
+            other => panic!("expected Service command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_service_subcommand_without_mode() {
+        use setup::ServiceAction;
+        let cli = Cli::try_parse_from(["wakezilla", "service", "restart"])
+            .expect("bare service action parses");
+        match cli.command {
+            Commands::Service(args) => {
+                assert_eq!(args.action, ServiceAction::Restart);
+                assert!(args.mode.is_none());
+            }
+            other => panic!("expected Service command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_service_subcommand_without_action() {
+        let result = Cli::try_parse_from(["wakezilla", "service"]);
+        assert!(result.is_err(), "service requires an action argument");
+    }
+
+    #[test]
+    fn cli_accepts_service_logs_with_follow_and_lines() {
+        use setup::ServiceAction;
+        let cli = Cli::try_parse_from([
+            "wakezilla",
+            "service",
+            "logs",
+            "--follow",
+            "--lines",
+            "100",
+            "--mode",
+            "proxy",
+        ])
+        .expect("service logs parses");
+
+        match cli.command {
+            Commands::Service(args) => {
+                assert_eq!(args.action, ServiceAction::Logs);
+                assert!(args.follow);
+                assert_eq!(args.lines, Some(100));
+                assert_eq!(args.mode.as_deref(), Some("proxy"));
+            }
+            other => panic!("expected Service command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_service_status() {
+        use setup::ServiceAction;
+        let cli =
+            Cli::try_parse_from(["wakezilla", "service", "status"]).expect("service status parses");
+        match cli.command {
+            Commands::Service(args) => {
+                assert_eq!(args.action, ServiceAction::Status);
+                assert!(!args.follow);
+                assert!(args.lines.is_none());
+            }
+            other => panic!("expected Service command, got {other:?}"),
+        }
     }
 }
