@@ -18,6 +18,7 @@ if [ ! -f "${checksums_file}" ]; then
 fi
 
 linux_tar="wakezilla-${version}-x86_64-unknown-linux-gnu.tar.gz"
+linux_arm64_tar="wakezilla-${version}-aarch64-unknown-linux-gnu.tar.gz"
 darwin_x64_tar="wakezilla-${version}-x86_64-apple-darwin.tar.gz"
 darwin_arm64_tar="wakezilla-${version}-aarch64-apple-darwin.tar.gz"
 
@@ -27,10 +28,12 @@ lookup_sha() {
 }
 
 linux_sha="$(lookup_sha "${linux_tar}")"
+linux_arm64_sha="$(lookup_sha "${linux_arm64_tar}")"
 darwin_x64_sha="$(lookup_sha "${darwin_x64_tar}")"
 darwin_arm64_sha="$(lookup_sha "${darwin_arm64_tar}")"
 
 test -n "${linux_sha}"
+test -n "${linux_arm64_sha}"
 test -n "${darwin_x64_sha}"
 test -n "${darwin_arm64_sha}"
 
@@ -51,8 +54,13 @@ class Wakezilla < Formula
   end
 
   on_linux do
-    url "https://github.com/${owner}/${repo}/releases/download/v${version}/${linux_tar}"
-    sha256 "${linux_sha}"
+    if Hardware::CPU.arm?
+      url "https://github.com/${owner}/${repo}/releases/download/v${version}/${linux_arm64_tar}"
+      sha256 "${linux_arm64_sha}"
+    else
+      url "https://github.com/${owner}/${repo}/releases/download/v${version}/${linux_tar}"
+      sha256 "${linux_sha}"
+    end
   end
 
   def install
