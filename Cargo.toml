@@ -51,7 +51,7 @@ ipnetwork = "0.20.0"
 pnet = "0.34.0"
 dns-lookup = "2.0.4"
 futures-util = "0.3"
-reqwest = { version = "0.12.23", features = ["json"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
 ratatui = "0.29"
 crossterm = "0.28"
 validator = { version = "0.20.0", features = ["derive"] }
