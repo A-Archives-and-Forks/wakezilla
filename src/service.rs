@@ -427,8 +427,8 @@ pub fn logs(mode: Mode, follow: bool, lines: u32) -> Result<()> {
         let path = macos_stderr_log(mode);
         if !std::path::Path::new(&path).exists() {
             anyhow::bail!(
-                "no log file at {path}. Re-run `sudo wakezilla setup` to enable log capture \
-                 (existing installs predate stdout/stderr redirection)."
+                "no log file at {path} yet. The service may not have started or \
+                 produced any output."
             );
         }
         let n = lines.to_string();

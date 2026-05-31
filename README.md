@@ -153,10 +153,8 @@ docker run -d \
    selected automatically.
 
    `logs` reads from journald on Linux and from the daemon's redirected log file
-   on macOS (`/Library/Logs/wakezilla/`). Log capture on macOS requires the
-   redirect added to the launchd plist — if you installed before this was added,
-   re-run `sudo wakezilla setup` once to enable it. Log streaming is not
-   captured for the Windows service.
+   on macOS (`/Library/Logs/wakezilla/`). Log streaming is not captured for the
+   Windows service.
 
 
 ## Usage
