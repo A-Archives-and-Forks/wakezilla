@@ -131,6 +131,12 @@ docker run -d \
    enables the service, then validates that the service is reachable after
    install. Pass `--mode <proxy|client>` and `--port <PORT>` to skip the prompts.
 
+   If a configuration or service already exists, `setup` shows a summary of the
+   current config (and installed services) and asks for confirmation before
+   overwriting. Existing settings for the *other* server are preserved — only
+   the target server's port is updated. Pass `-y`/`--yes` to skip the
+   confirmation for non-interactive use.
+
 2. **Control an installed service** (requires `sudo`/admin privileges):
    ```bash
     sudo wakezilla service start

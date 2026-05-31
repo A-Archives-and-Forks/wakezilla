@@ -17,6 +17,10 @@ pub struct SetupArgs {
     /// Pre-select the port; skips the TUI prompt if combined with --mode.
     #[arg(long, help_heading = "Setup Options")]
     pub port: Option<u16>,
+
+    /// Skip the overwrite confirmation prompt (for non-interactive use).
+    #[arg(long, short = 'y', help_heading = "Setup Options")]
+    pub yes: bool,
 }
 
 /// Action for the `service` subcommand.
@@ -52,12 +56,23 @@ pub fn build_config(mode: Mode, port: u16) -> Config {
 
 /// Write the config file, install the service, and validate it.
 /// Returns the config path on success.
+///
+/// If a config file already exists, its other settings (e.g. the other server's
+/// port) are preserved; only the target mode's port is updated.
 pub fn apply(mode: Mode, port: u16) -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe().context("failed to resolve current executable path")?;
     let exe = exe.to_string_lossy().to_string();
 
-    let cfg = build_config(mode, port);
     let path = config::config_path();
+    let mut cfg = if path.exists() {
+        Config::load_from(&path).unwrap_or_else(|_| build_config(mode, port))
+    } else {
+        build_config(mode, port)
+    };
+    match mode {
+        Mode::Proxy => cfg.server.proxy_port = port,
+        Mode::Client => cfg.server.client_port = port,
+    }
     cfg.save_to(&path)
         .with_context(|| format!("failed to write config to {}", path.display()))?;
 
@@ -67,7 +82,60 @@ pub fn apply(mode: Mode, port: u16) -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// Summarize any existing Wakezilla configuration/services on this host.
+/// Returns `None` if nothing is installed and no config file exists.
+fn existing_summary() -> Option<String> {
+    let installed = service::installed_modes();
+    let path = config::config_path();
+    let cfg_exists = path.exists();
+    if installed.is_empty() && !cfg_exists {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    if cfg_exists {
+        if let Ok(cfg) = Config::load_from(&path) {
+            lines.push(format!(
+                "  config: {} (proxy_port={}, client_port={})",
+                path.display(),
+                cfg.server.proxy_port,
+                cfg.server.client_port
+            ));
+        } else {
+            lines.push(format!("  config: {}", path.display()));
+        }
+    }
+    if !installed.is_empty() {
+        let names: Vec<&str> = installed.iter().map(|m| m.subcommand()).collect();
+        lines.push(format!("  installed services: {}", names.join(", ")));
+    }
+    Some(lines.join("\n"))
+}
+
+/// Prompt the operator to confirm overwriting an existing configuration.
+/// Returns `Ok(true)` when there is nothing to overwrite or the user confirms.
+fn confirm_overwrite() -> Result<bool> {
+    let Some(summary) = existing_summary() else {
+        return Ok(true);
+    };
+
+    println!("An existing Wakezilla configuration was detected:");
+    println!("{summary}");
+    print!("Overwrite / reconfigure? [y/N]: ");
+    std::io::stdout().flush().ok();
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("failed to read confirmation")?;
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 use std::io;
+use std::io::Write;
 use std::time::Duration;
 
 use crossterm::{
@@ -95,10 +163,16 @@ pub fn run(args: SetupArgs) -> Result<()> {
         std::process::exit(1);
     }
 
+    let skip_confirm = args.yes;
+
     // Headless path: both flags provided.
     if let (Some(mode_str), Some(port)) = (&args.mode, args.port) {
         let mode = Mode::from_str_opt(mode_str)
             .with_context(|| format!("invalid --mode '{mode_str}' (use 'proxy' or 'client')"))?;
+        if !skip_confirm && !confirm_overwrite()? {
+            println!("Aborted; no changes made.");
+            return Ok(());
+        }
         let path = apply(mode, port)?;
         println!(
             "Configured {} on port {port}. Config written to {}.",
@@ -109,6 +183,10 @@ pub fn run(args: SetupArgs) -> Result<()> {
     }
 
     let (mode, port) = run_wizard(args)?;
+    if !skip_confirm && !confirm_overwrite()? {
+        println!("Aborted; no changes made.");
+        return Ok(());
+    }
     let path = apply(mode, port)?;
     println!(
         "Configured {} on port {port}. Config written to {}.",
