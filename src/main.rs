@@ -39,7 +39,7 @@ pub enum Commands {
     Tui(TuiArgs),
     /// Configure this host to auto-start a Wakezilla server as a system service
     Setup(SetupArgs),
-    /// Start, stop, or restart an installed Wakezilla service
+    /// Control an installed Wakezilla service (start/stop/restart/status/logs)
     Service(ServiceArgs),
 }
 
@@ -331,5 +331,46 @@ mod cli_tests {
     fn cli_rejects_service_subcommand_without_action() {
         let result = Cli::try_parse_from(["wakezilla", "service"]);
         assert!(result.is_err(), "service requires an action argument");
+    }
+
+    #[test]
+    fn cli_accepts_service_logs_with_follow_and_lines() {
+        use setup::ServiceAction;
+        let cli = Cli::try_parse_from([
+            "wakezilla",
+            "service",
+            "logs",
+            "--follow",
+            "--lines",
+            "100",
+            "--mode",
+            "proxy",
+        ])
+        .expect("service logs parses");
+
+        match cli.command {
+            Commands::Service(args) => {
+                assert_eq!(args.action, ServiceAction::Logs);
+                assert!(args.follow);
+                assert_eq!(args.lines, Some(100));
+                assert_eq!(args.mode.as_deref(), Some("proxy"));
+            }
+            other => panic!("expected Service command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_service_status() {
+        use setup::ServiceAction;
+        let cli =
+            Cli::try_parse_from(["wakezilla", "service", "status"]).expect("service status parses");
+        match cli.command {
+            Commands::Service(args) => {
+                assert_eq!(args.action, ServiceAction::Status);
+                assert!(!args.follow);
+                assert!(args.lines.is_none());
+            }
+            other => panic!("expected Service command, got {other:?}"),
+        }
     }
 }

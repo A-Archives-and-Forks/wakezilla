@@ -142,12 +142,21 @@ docker run -d \
     sudo wakezilla service start
     sudo wakezilla service stop
     sudo wakezilla service restart
+    sudo wakezilla service status            # is it running?
+    sudo wakezilla service logs              # status + recent logs
+    sudo wakezilla service logs -f -n 100    # follow, last 100 lines
    ```
 
-   Starts, stops, or restarts a service previously installed with `setup`. If
-   both the proxy and client are installed, an interactive picker asks which to
-   act on; pass `--mode <proxy|client>` to skip the prompt. If only one is
-   installed, it is selected automatically.
+   Controls a service previously installed with `setup`. If both the proxy and
+   client are installed, an interactive picker asks which to act on; pass
+   `--mode <proxy|client>` to skip the prompt. If only one is installed, it is
+   selected automatically.
+
+   `logs` reads from journald on Linux and from the daemon's redirected log file
+   on macOS (`/Library/Logs/wakezilla/`). Log capture on macOS requires the
+   redirect added to the launchd plist — if you installed before this was added,
+   re-run `sudo wakezilla setup` once to enable it. Log streaming is not
+   captured for the Windows service.
 
 
 ## Usage

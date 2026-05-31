@@ -83,6 +83,19 @@ pub fn generate_systemd_unit(mode: Mode, exe: &str) -> String {
     )
 }
 
+/// Directory where the macOS LaunchDaemon writes its stdout/stderr logs.
+pub const MACOS_LOG_DIR: &str = "/Library/Logs/wakezilla";
+
+/// Path the daemon's stdout is redirected to (macOS).
+fn macos_stdout_log(mode: Mode) -> String {
+    format!("{MACOS_LOG_DIR}/{}.out.log", mode.launchd_label())
+}
+
+/// Path the daemon's stderr is redirected to (macOS). Tracing logs go here.
+fn macos_stderr_log(mode: Mode) -> String {
+    format!("{MACOS_LOG_DIR}/{}.err.log", mode.launchd_label())
+}
+
 /// Render a launchd LaunchDaemon plist.
 // Platform-conditional: used by the systemd (Linux) / launchd (macOS) / Windows install paths; some are cfg'd out per-OS.
 #[allow(dead_code)]
@@ -103,11 +116,17 @@ pub fn generate_launchd_plist(mode: Mode, exe: &str) -> String {
          \t<true/>\n\
          \t<key>KeepAlive</key>\n\
          \t<true/>\n\
+         \t<key>StandardOutPath</key>\n\
+         \t<string>{out}</string>\n\
+         \t<key>StandardErrorPath</key>\n\
+         \t<string>{err}</string>\n\
          </dict>\n\
          </plist>\n",
         label = mode.launchd_label(),
         exe = exe,
         sub = mode.subcommand(),
+        out = macos_stdout_log(mode),
+        err = macos_stderr_log(mode),
     )
 }
 
@@ -178,6 +197,9 @@ pub fn install(mode: Mode, exe: &str) -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
+        // Ensure the log directory exists so launchd can redirect stdout/stderr.
+        std::fs::create_dir_all(MACOS_LOG_DIR)
+            .with_context(|| format!("creating log dir {MACOS_LOG_DIR}"))?;
         let plist = generate_launchd_plist(mode, exe);
         let path = format!("/Library/LaunchDaemons/{}.plist", mode.launchd_label());
         std::fs::write(&path, plist).with_context(|| format!("writing {path}"))?;
@@ -233,6 +255,18 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
 #[allow(dead_code)]
 fn run_ignore_err(cmd: &str, args: &[&str]) {
     let _ = Command::new(cmd).args(args).status();
+}
+
+/// Run a command inheriting the terminal's stdio (for streaming logs). Returns an
+/// error only if the command could not be spawned; a non-zero exit (e.g. Ctrl-C
+/// out of a `tail -f` / `journalctl -f`) is treated as a normal end of streaming.
+#[allow(dead_code)]
+fn run_inherit(cmd: &str, args: &[&str]) -> Result<()> {
+    Command::new(cmd)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run {cmd}"))?;
+    Ok(())
 }
 
 /// Path to the on-disk service descriptor (systemd unit / launchd plist).
@@ -337,5 +371,87 @@ pub fn restart(mode: Mode) -> Result<()> {
     {
         let _ = mode;
         Err(anyhow!("service control not supported on this OS"))
+    }
+}
+
+/// Whether the service for `mode` is currently running.
+pub fn is_running(mode: Mode) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("systemctl")
+            .args(["is-active", "--quiet", mode.service_name()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let label = format!("system/{}", mode.launchd_label());
+        Command::new("launchctl")
+            .args(["print", &label])
+            .output()
+            .map(|o| {
+                o.status.success() && String::from_utf8_lossy(&o.stdout).contains("state = running")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("sc")
+            .args(["query", mode.service_name()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("RUNNING"))
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = mode;
+        false
+    }
+}
+
+/// Stream the service's logs to the terminal. `lines` is the tail length;
+/// `follow` keeps streaming new output until interrupted.
+pub fn logs(mode: Mode, follow: bool, lines: u32) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let n = lines.to_string();
+        let mut args = vec!["-u", mode.service_name(), "-n", &n];
+        if follow {
+            args.push("-f");
+        }
+        run_inherit("journalctl", &args)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let path = macos_stderr_log(mode);
+        if !std::path::Path::new(&path).exists() {
+            anyhow::bail!(
+                "no log file at {path}. Re-run `sudo wakezilla setup` to enable log capture \
+                 (existing installs predate stdout/stderr redirection)."
+            );
+        }
+        let n = lines.to_string();
+        let mut args = vec!["-n", &n];
+        if follow {
+            args.push("-f");
+        }
+        args.push(&path);
+        run_inherit("tail", &args)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (follow, lines);
+        println!(
+            "Log streaming is not captured for the Windows service ({}). \
+             Check the Windows Event Viewer.",
+            mode.subcommand()
+        );
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (mode, follow, lines);
+        Err(anyhow!("log viewing not supported on this OS"))
     }
 }

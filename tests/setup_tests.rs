@@ -30,6 +30,9 @@ fn launchd_plist_contains_label_exe_and_subcommand() {
     assert!(plist.contains("/usr/local/bin/wakezilla"));
     assert!(plist.contains("client-server"));
     assert!(plist.contains("<key>RunAtLoad</key>"));
+    assert!(plist.contains("<key>StandardErrorPath</key>"));
+    assert!(plist.contains("<key>StandardOutPath</key>"));
+    assert!(plist.contains("/Library/Logs/wakezilla/dev.wakezilla.client.err.log"));
 }
 
 #[test]

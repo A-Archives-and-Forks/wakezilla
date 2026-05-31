@@ -29,6 +29,10 @@ pub enum ServiceAction {
     Start,
     Stop,
     Restart,
+    /// Report whether the service is running.
+    Status,
+    /// Show the service's logs (prints status first).
+    Logs,
 }
 
 /// CLI arguments for the `service` subcommand.
@@ -42,6 +46,14 @@ pub struct ServiceArgs {
     /// Target server ("proxy" or "client"); skips the TUI prompt.
     #[arg(long, help_heading = "Service Options")]
     pub mode: Option<String>,
+
+    /// For `logs`: keep streaming new output until interrupted.
+    #[arg(long, short = 'f', help_heading = "Service Options")]
+    pub follow: bool,
+
+    /// For `logs`: number of trailing lines to show (default 50).
+    #[arg(long, short = 'n', help_heading = "Service Options")]
+    pub lines: Option<u32>,
 }
 
 /// Build a Config with the chosen port placed in the correct field for `mode`.
@@ -385,9 +397,9 @@ fn mode_span(label: &str, selected: bool) -> Span<'static> {
     Span::styled(text, style)
 }
 
-/// Entry point for the `service` subcommand: start/stop/restart an installed service.
-/// Requires elevation. Resolves the target mode from `--mode`, a single install, or a
-/// TUI picker when both proxy and client are installed.
+/// Entry point for the `service` subcommand: start/stop/restart/status/logs of an
+/// installed service. Requires elevation. Resolves the target mode from `--mode`, a
+/// single install, or a TUI picker when both proxy and client are installed.
 pub fn run_service(args: ServiceArgs) -> Result<()> {
     if !service::is_elevated() {
         eprintln!(
@@ -423,18 +435,37 @@ pub fn run_service(args: ServiceArgs) -> Result<()> {
     };
 
     match args.action {
-        ServiceAction::Start => service::start(mode).context("failed to start service")?,
-        ServiceAction::Stop => service::stop(mode).context("failed to stop service")?,
-        ServiceAction::Restart => service::restart(mode).context("failed to restart service")?,
+        ServiceAction::Start => {
+            service::start(mode).context("failed to start service")?;
+            println!("{} service started.", mode.subcommand());
+        }
+        ServiceAction::Stop => {
+            service::stop(mode).context("failed to stop service")?;
+            println!("{} service stopped.", mode.subcommand());
+        }
+        ServiceAction::Restart => {
+            service::restart(mode).context("failed to restart service")?;
+            println!("{} service restarted.", mode.subcommand());
+        }
+        ServiceAction::Status => print_status(mode),
+        ServiceAction::Logs => {
+            print_status(mode);
+            println!("--- logs ---");
+            service::logs(mode, args.follow, args.lines.unwrap_or(50))
+                .context("failed to show logs")?;
+        }
     }
-
-    let verb = match args.action {
-        ServiceAction::Start => "started",
-        ServiceAction::Stop => "stopped",
-        ServiceAction::Restart => "restarted",
-    };
-    println!("{} service {verb}.", mode.subcommand());
     Ok(())
+}
+
+/// Print whether the service for `mode` is currently running.
+fn print_status(mode: Mode) {
+    let state = if service::is_running(mode) {
+        "running"
+    } else {
+        "stopped"
+    };
+    println!("{} service: {state}", mode.subcommand());
 }
 
 /// Interactive picker to choose one mode from the installed set (Left/Right, Enter).
