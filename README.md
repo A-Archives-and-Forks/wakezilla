@@ -118,6 +118,22 @@ docker run -d \
    You can check the health of the client server by visiting:
    http://<client-ip>:3001/health
 
+### Run the terminal UI (TUI)
+
+Manage your machines from the terminal — no browser required. Point the TUI at
+a running proxy server:
+
+```bash
+ wakezilla tui --api-url http://192.168.1.200:3000
+```
+
+`--api-url` defaults to `http://127.0.0.1:3000`, so it can be omitted when the
+proxy server runs on the same host:
+
+```bash
+ wakezilla tui
+```
+
 ### Set up auto-start (system service)
 
 1. **Run the interactive setup wizard** (requires `sudo`/admin privileges):
@@ -166,6 +182,29 @@ Access the web interface at `http://<server-ip>:3000` to:
 - View network scan results
 - Send WOL packets manually
 - Configure automatic shutdown settings
+
+### Terminal UI (TUI)
+
+Prefer the terminal? Run `wakezilla tui --api-url http://<server-ip>:3000` to
+browse your machines, watch their online/offline status, and act on them without
+leaving the shell.
+
+![Wakezilla TUI demo](https://vhs.charm.sh/vhs-2RN0TE9RlTeQaDowRdIAZ8.gif)
+
+The left pane lists every registered machine with a live **ON**/**OFF** status;
+the right pane shows the details and port forwards of the selected machine.
+
+Key bindings:
+
+| Key     | Action                                  |
+|---------|-----------------------------------------|
+| `j` / `↓` | Move selection down                   |
+| `k` / `↑` | Move selection up                     |
+| `r`     | Refresh the machine list and statuses   |
+| `w`     | Send a Wake-on-LAN packet to the machine |
+| `t`     | Turn off the machine                    |
+| `d`     | Delete the machine (asks to confirm)    |
+| `q` / `Esc` | Quit                                |
 
 ### Adding Machines
 1. Navigate to the web interface
