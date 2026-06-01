@@ -399,8 +399,13 @@ load_install_helpers() {
 }
 
 test_detect_target_linux_x86_64() {
-  target=$(WAKEZILLA_UNAME_S=Linux WAKEZILLA_UNAME_M=x86_64 detect_target)
+  target=$(WAKEZILLA_UNAME_S=Linux WAKEZILLA_UNAME_M=x86_64 WAKEZILLA_LIBC=gnu detect_target)
   assert_eq "x86_64-unknown-linux-gnu" "$target" "linux x86_64 target"
+}
+
+test_detect_target_linux_x86_64_musl() {
+  target=$(WAKEZILLA_UNAME_S=Linux WAKEZILLA_UNAME_M=x86_64 WAKEZILLA_LIBC=musl detect_target)
+  assert_eq "x86_64-unknown-linux-musl" "$target" "linux x86_64 musl target"
 }
 
 test_detect_target_macos_x86_64() {
@@ -418,11 +423,21 @@ test_detect_target_override() {
   assert_eq "custom-target" "$target" "target override"
 }
 
-test_detect_target_unsupported_linux_arm64() {
-  if output=$(WAKEZILLA_UNAME_S=Linux WAKEZILLA_UNAME_M=aarch64 detect_target 2>&1); then
-    fail "unsupported linux arm64 target: expected failure, got '$output'"
+test_detect_target_linux_arm64() {
+  target=$(WAKEZILLA_UNAME_S=Linux WAKEZILLA_UNAME_M=aarch64 WAKEZILLA_LIBC=gnu detect_target)
+  assert_eq "aarch64-unknown-linux-gnu" "$target" "linux arm64 target"
+}
+
+test_detect_target_linux_arm64_musl() {
+  target=$(WAKEZILLA_UNAME_S=Linux WAKEZILLA_UNAME_M=aarch64 WAKEZILLA_LIBC=musl detect_target)
+  assert_eq "aarch64-unknown-linux-musl" "$target" "linux arm64 musl target"
+}
+
+test_detect_target_unsupported_platform() {
+  if output=$(WAKEZILLA_UNAME_S=FreeBSD WAKEZILLA_UNAME_M=x86_64 detect_target 2>&1); then
+    fail "unsupported platform target: expected failure, got '$output'"
   else
-    assert_contains "$output" "unsupported platform" "unsupported linux arm64"
+    assert_contains "$output" "unsupported platform" "unsupported platform"
   fi
 }
 
@@ -499,10 +514,13 @@ test_resolve_bin_dir_requires_home_for_default() {
 
 load_install_helpers
 test_detect_target_linux_x86_64
+test_detect_target_linux_x86_64_musl
 test_detect_target_macos_x86_64
 test_detect_target_macos_arm64
 test_detect_target_override
-test_detect_target_unsupported_linux_arm64
+test_detect_target_linux_arm64
+test_detect_target_linux_arm64_musl
+test_detect_target_unsupported_platform
 if test_install_argument_helpers_defined; then
   test_parse_args_positional_version
   test_parse_args_rejects_two_versions
