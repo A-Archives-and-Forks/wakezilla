@@ -37,15 +37,25 @@ const DEFAULT_DB_PATH: &str = "machines.json";
 
 fn machines_db_path() -> PathBuf {
     // First check for environment variable override
-    if let Ok(path) = std::env::var("WAKEZILLA__STORAGE__MACHINES_DB_PATH") {
-        return PathBuf::from(path);
-    }
+    let path = if let Ok(path) = std::env::var("WAKEZILLA__STORAGE__MACHINES_DB_PATH") {
+        PathBuf::from(path)
+    } else {
+        // Use current working directory as default (not executable directory)
+        // This ensures the file is saved/loaded from where the user runs the command
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(DEFAULT_DB_PATH)
+    };
 
-    // Use current working directory as default (not executable directory)
-    // This ensures the file is saved/loaded from where the user runs the command
-    env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(DEFAULT_DB_PATH)
+    // Always resolve to an absolute path so logs show the full location instead
+    // of a bare "machines.json" relative to the (often unclear) working dir.
+    if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -182,9 +192,9 @@ pub fn load_machines_from_path<P: AsRef<Path>>(path: P) -> Result<Vec<Machine>> 
         serde_json::from_str(&data).with_context(|| "Failed to parse machines database")?;
 
     info!(
-        "Successfully loaded {} machines from database at {:?}",
+        "Successfully loaded {} machines from database at {}",
         machines.len(),
-        path_ref
+        path_ref.display()
     );
     Ok(machines)
 }

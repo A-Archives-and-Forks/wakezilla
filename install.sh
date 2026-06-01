@@ -31,10 +31,11 @@ Options:
 Environment variables:
   VERSION         Version to install, without leading v (example: 0.1.49)
   BIN_DIR         Binary installation directory
-  PREFIX          Installation prefix used when BIN_DIR is unset (default: $HOME/.local)
+  PREFIX          Installation prefix used when BIN_DIR is unset (default: $HOME/.local, or /usr/local when run as root)
   TARGET          Override target triple (example: x86_64-unknown-linux-gnu)
   REPO            GitHub repository (default: guibeira/wakezilla)
   GITHUB_TOKEN    Token for authenticated GitHub API requests
+  WAKEZILLA_SUDO_SYMLINK  yes|no to skip the prompt for the /usr/local/bin symlink
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/guibeira/wakezilla/main/install.sh | sh
@@ -114,10 +115,15 @@ parse_args() {
 }
 
 resolve_bin_dir() {
+  euid="${WAKEZILLA_EUID:-$(id -u 2>/dev/null || printf '')}"
   if [ -n "${BIN_DIR:-}" ]; then
     printf '%s\n' "$BIN_DIR"
   elif [ -n "${PREFIX:-}" ]; then
     printf '%s/bin\n' "$PREFIX"
+  elif [ "$euid" = "0" ]; then
+    # Running as root (e.g. curl ... | sudo sh): install into a system path on
+    # sudo's secure_path so `sudo wakezilla` works without extra setup.
+    printf '/usr/local/bin\n'
   elif [ -n "${HOME:-}" ]; then
     printf '%s/.local/bin\n' "$HOME"
   else
@@ -390,6 +396,72 @@ binary_runs() {
   "$bin_dir/$BIN_NAME" --version >/dev/null 2>&1
 }
 
+# Directories on sudo's default secure_path. A binary in one of these is
+# reachable by `sudo <bin>` without extra setup.
+SECURE_PATH_DIRS="/usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin"
+
+bin_dir_on_secure_path() {
+  for secure_dir in $SECURE_PATH_DIRS; do
+    [ "$1" = "$secure_dir" ] && return 0
+  done
+  return 1
+}
+
+# A user-level install lands outside sudo's secure_path, so `sudo wakezilla
+# setup` fails with "command not found". Offer to symlink the binary into
+# /usr/local/bin (the one secure_path dir conventionally meant for local
+# installs). The install itself stays sudo-free; only this opt-in step uses it.
+offer_sudo_symlink() {
+  symlink_bin_dir="$1"
+  symlink_link_dir="/usr/local/bin"
+  symlink_link_path="$symlink_link_dir/$BIN_NAME"
+  symlink_src="$symlink_bin_dir/$BIN_NAME"
+
+  # Root installs already land on secure_path; nothing to link.
+  euid="${WAKEZILLA_EUID:-$(id -u 2>/dev/null || printf '')}"
+  [ "$euid" = "0" ] && return 0
+
+  # Binary is already reachable by sudo.
+  bin_dir_on_secure_path "$symlink_bin_dir" && return 0
+
+  # Without sudo we cannot write into the system path.
+  command -v sudo >/dev/null 2>&1 || return 0
+
+  # Already linked where we want it.
+  if [ -L "$symlink_link_path" ] && \
+     [ "$(readlink "$symlink_link_path" 2>/dev/null)" = "$symlink_src" ]; then
+    return 0
+  fi
+
+  decision="${WAKEZILLA_SUDO_SYMLINK:-ask}"
+  if [ "$decision" = "ask" ]; then
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+      {
+        printf '\nTo run privileged commands like '\''sudo %s setup'\'' the binary must be on\n' "$BIN_NAME"
+        printf 'sudo'\''s PATH. Link %s -> %s now? (needs sudo) [y/N] ' "$symlink_link_path" "$symlink_src"
+      } > /dev/tty
+      read symlink_answer < /dev/tty || symlink_answer=
+      case "$symlink_answer" in
+        y|Y|yes|YES|Yes) decision=yes ;;
+        *) decision=no ;;
+      esac
+    else
+      decision=no
+    fi
+  fi
+
+  if [ "$decision" != "yes" ]; then
+    info "to run privileged commands, use: sudo env \"PATH=\$PATH\" $BIN_NAME ... (or: sudo $symlink_src ...)"
+    return 0
+  fi
+
+  if sudo ln -sf "$symlink_src" "$symlink_link_path"; then
+    info "linked $symlink_link_path -> $symlink_src ('sudo $BIN_NAME' now works)"
+  else
+    warn "failed to create $symlink_link_path; run privileged commands with: sudo $symlink_src ..."
+  fi
+}
+
 if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -463,3 +535,4 @@ info "resolved $BIN_NAME v$release_version"
 info "asset: $INSTALLED_ASSET_URL"
 info "install dir: $bin_dir"
 path_guidance "$bin_dir"
+offer_sudo_symlink "$bin_dir"
