@@ -31,7 +31,7 @@ Options:
 Environment variables:
   VERSION         Version to install, without leading v (example: 0.1.49)
   BIN_DIR         Binary installation directory
-  PREFIX          Installation prefix used when BIN_DIR is unset (default: $HOME/.local)
+  PREFIX          Installation prefix used when BIN_DIR is unset (default: $HOME/.local, or /usr/local when run as root)
   TARGET          Override target triple (example: x86_64-unknown-linux-gnu)
   REPO            GitHub repository (default: guibeira/wakezilla)
   GITHUB_TOKEN    Token for authenticated GitHub API requests
@@ -114,10 +114,15 @@ parse_args() {
 }
 
 resolve_bin_dir() {
+  euid="${WAKEZILLA_EUID:-$(id -u 2>/dev/null || printf '')}"
   if [ -n "${BIN_DIR:-}" ]; then
     printf '%s\n' "$BIN_DIR"
   elif [ -n "${PREFIX:-}" ]; then
     printf '%s/bin\n' "$PREFIX"
+  elif [ "$euid" = "0" ]; then
+    # Running as root (e.g. curl ... | sudo sh): install into a system path on
+    # sudo's secure_path so `sudo wakezilla` works without extra setup.
+    printf '/usr/local/bin\n'
   elif [ -n "${HOME:-}" ]; then
     printf '%s/.local/bin\n' "$HOME"
   else

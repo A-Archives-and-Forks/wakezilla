@@ -486,11 +486,40 @@ test_parse_args_rejects_two_versions() {
 test_resolve_bin_dir_default() {
   bin_dir=$(
     HOME=/tmp/wakezilla-home
+    WAKEZILLA_EUID=1000
     unset BIN_DIR || true
     unset PREFIX || true
     resolve_bin_dir
   )
   assert_eq "/tmp/wakezilla-home/.local/bin" "$bin_dir" "default bin dir"
+}
+
+test_resolve_bin_dir_root_default() {
+  bin_dir=$(
+    HOME=/root
+    WAKEZILLA_EUID=0
+    unset BIN_DIR || true
+    unset PREFIX || true
+    resolve_bin_dir
+  )
+  assert_eq "/usr/local/bin" "$bin_dir" "root default bin dir"
+}
+
+test_resolve_bin_dir_root_respects_overrides() {
+  bin_dir=$(
+    WAKEZILLA_EUID=0
+    BIN_DIR=/custom/bin
+    resolve_bin_dir
+  )
+  assert_eq "/custom/bin" "$bin_dir" "root BIN_DIR override"
+
+  bin_dir=$(
+    WAKEZILLA_EUID=0
+    unset BIN_DIR || true
+    PREFIX=/opt/wakezilla
+    resolve_bin_dir
+  )
+  assert_eq "/opt/wakezilla/bin" "$bin_dir" "root PREFIX override"
 }
 
 test_resolve_bin_dir_prefix() {
@@ -513,6 +542,7 @@ test_resolve_bin_dir_override() {
 
 test_resolve_bin_dir_requires_home_for_default() {
   if output=$(
+    WAKEZILLA_EUID=1000
     unset BIN_DIR || true
     unset PREFIX || true
     unset HOME || true
@@ -539,6 +569,8 @@ if test_install_argument_helpers_defined; then
   test_parse_args_positional_version
   test_parse_args_rejects_two_versions
   test_resolve_bin_dir_default
+  test_resolve_bin_dir_root_default
+  test_resolve_bin_dir_root_respects_overrides
   test_resolve_bin_dir_prefix
   test_resolve_bin_dir_override
   test_resolve_bin_dir_requires_home_for_default
