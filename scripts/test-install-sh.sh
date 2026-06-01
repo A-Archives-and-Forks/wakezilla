@@ -441,6 +441,18 @@ test_detect_target_unsupported_platform() {
   fi
 }
 
+test_musl_fallback_target_gnu() {
+  assert_command_exists musl_fallback_target "musl fallback helper" || return 0
+  assert_eq "aarch64-unknown-linux-musl" "$(musl_fallback_target aarch64-unknown-linux-gnu)" "aarch64 gnu musl fallback"
+  assert_eq "x86_64-unknown-linux-musl" "$(musl_fallback_target x86_64-unknown-linux-gnu)" "x86_64 gnu musl fallback"
+}
+
+test_musl_fallback_target_none() {
+  assert_command_exists musl_fallback_target "musl fallback helper" || return 0
+  assert_eq "" "$(musl_fallback_target aarch64-unknown-linux-musl)" "musl target has no fallback"
+  assert_eq "" "$(musl_fallback_target aarch64-apple-darwin)" "darwin target has no fallback"
+}
+
 test_install_argument_helpers_defined() {
   missing=0
   assert_command_exists parse_args "parse args helper" || missing=1
@@ -521,6 +533,8 @@ test_detect_target_override
 test_detect_target_linux_arm64
 test_detect_target_linux_arm64_musl
 test_detect_target_unsupported_platform
+test_musl_fallback_target_gnu
+test_musl_fallback_target_none
 if test_install_argument_helpers_defined; then
   test_parse_args_positional_version
   test_parse_args_rejects_two_versions

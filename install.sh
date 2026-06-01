@@ -354,6 +354,42 @@ path_guidance() {
   esac
 }
 
+musl_fallback_target() {
+  case "$1" in
+    x86_64-unknown-linux-gnu) printf 'x86_64-unknown-linux-musl\n' ;;
+    aarch64-unknown-linux-gnu) printf 'aarch64-unknown-linux-musl\n' ;;
+    *) printf '' ;;
+  esac
+}
+
+# Download, verify and install the asset for a target using the already-fetched
+# release JSON. Sets INSTALLED_ASSET_URL on success. Returns 2 when the target
+# has no published asset so the caller can decide how to handle it.
+download_and_install_target() {
+  install_target="$1"
+  install_asset_url=$(printf '%s' "$json" | asset_url_from_json "$BIN_NAME" "$release_version" "$install_target")
+
+  if [ -z "$install_asset_url" ] || [ "$install_asset_url" = "null" ]; then
+    return 2
+  fi
+
+  install_asset_name=$(basename "$install_asset_url")
+  install_archive="$tmpdir/$install_asset_name"
+
+  download_file "$install_asset_url" "$install_archive" "$install_asset_name"
+  download_file "$(checksum_url_for_release "$release_version")" "$checksums" "SHA256SUMS"
+  verify_checksum "$install_archive" "$checksums" "$install_asset_name"
+
+  install_bin_file=$(extract_binary "$install_archive" "$tmpdir/extract-$install_target" "$BIN_NAME")
+  install_bin "$install_bin_file" "$bin_dir/$BIN_NAME" || err "install" "failed to install binary to $bin_dir/$BIN_NAME"
+
+  INSTALLED_ASSET_URL="$install_asset_url"
+}
+
+binary_runs() {
+  "$bin_dir/$BIN_NAME" --version >/dev/null 2>&1
+}
+
 if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -367,20 +403,7 @@ info "installing $BIN_NAME for $target"
 json=$(fetch_release_json "${VERSION:-}") || err "download" "failed to fetch release metadata from GitHub"
 
 release_version=$(printf '%s' "$json" | release_version_from_json)
-asset_url=$(printf '%s' "$json" | asset_url_from_json "$BIN_NAME" "$release_version" "$target")
 
-if [ -z "$asset_url" ] || [ "$asset_url" = "null" ]; then
-  {
-    printf '%s %s does not include a prebuilt binary for %s.\n' "$BIN_NAME" "v$release_version" "$target"
-    printf '\nAvailable targets:\n'
-    printf '%s' "$json" | available_targets_from_json "$BIN_NAME" | while IFS= read -r available_target; do
-      [ -n "$available_target" ] && printf ' - %s\n' "$available_target"
-    done
-  } >&2
-  err "download" "no release asset found for target: $target"
-fi
-
-asset_name=$(basename "$asset_url")
 tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t wakezilla-install)
 cleanup() {
   rm -rf "$tmpdir"
@@ -392,16 +415,35 @@ cleanup_and_exit() {
 trap cleanup EXIT
 trap cleanup_and_exit INT TERM
 
-archive="$tmpdir/$asset_name"
 checksums="$tmpdir/SHA256SUMS"
 
-download_file "$asset_url" "$archive" "$asset_name"
-download_file "$(checksum_url_for_release "$release_version")" "$checksums" "SHA256SUMS"
-verify_checksum "$archive" "$checksums" "$asset_name"
-
 mkdir -p "$bin_dir" || err "install" "failed to create install directory: $bin_dir"
-bin_file=$(extract_binary "$archive" "$tmpdir/extract" "$BIN_NAME")
-install_bin "$bin_file" "$bin_dir/$BIN_NAME" || err "install" "failed to install binary to $bin_dir/$BIN_NAME"
+
+if ! download_and_install_target "$target"; then
+  {
+    printf '%s %s does not include a prebuilt binary for %s.\n' "$BIN_NAME" "v$release_version" "$target"
+    printf '\nAvailable targets:\n'
+    printf '%s' "$json" | available_targets_from_json "$BIN_NAME" | while IFS= read -r available_target; do
+      [ -n "$available_target" ] && printf ' - %s\n' "$available_target"
+    done
+  } >&2
+  err "download" "no release asset found for target: $target"
+fi
+
+# A gnu (glibc) binary built on a newer toolchain can fail to run on hosts with
+# an older glibc -- a common Raspberry Pi case. Fall back to the static musl
+# build, which carries no libc version requirement.
+if ! binary_runs; then
+  fallback_target=$(musl_fallback_target "$target")
+  if [ -n "$fallback_target" ] && [ "$fallback_target" != "$target" ]; then
+    warn "$BIN_NAME for $target installed but failed to run (likely an incompatible libc); retrying with $fallback_target"
+    if download_and_install_target "$fallback_target"; then
+      target="$fallback_target"
+    else
+      warn "no $fallback_target asset available for v$release_version; keeping the $target build"
+    fi
+  fi
+fi
 
 set +e
 version_output=$("$bin_dir/$BIN_NAME" --version 2>/dev/null)
@@ -418,6 +460,6 @@ else
 fi
 
 info "resolved $BIN_NAME v$release_version"
-info "asset: $asset_url"
+info "asset: $INSTALLED_ASSET_URL"
 info "install dir: $bin_dir"
 path_guidance "$bin_dir"
