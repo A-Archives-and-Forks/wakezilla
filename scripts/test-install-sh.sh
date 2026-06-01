@@ -453,6 +453,38 @@ test_musl_fallback_target_none() {
   assert_eq "" "$(musl_fallback_target aarch64-apple-darwin)" "darwin target has no fallback"
 }
 
+test_bin_dir_on_secure_path() {
+  assert_command_exists bin_dir_on_secure_path "secure path helper" || return 0
+  if bin_dir_on_secure_path /usr/local/bin; then
+    :
+  else
+    fail "secure path: expected /usr/local/bin to be on secure_path"
+  fi
+  if bin_dir_on_secure_path /home/pi/.local/bin; then
+    fail "secure path: expected ~/.local/bin to be off secure_path"
+  fi
+}
+
+test_offer_sudo_symlink_skips_when_disabled() {
+  assert_command_exists offer_sudo_symlink "sudo symlink helper" || return 0
+  # decision=no must never invoke sudo; it should print the manual hint and
+  # return cleanly even when the binary is off secure_path.
+  output=$(WAKEZILLA_EUID=1000 WAKEZILLA_SUDO_SYMLINK=no offer_sudo_symlink /tmp/wakezilla-bin 2>&1)
+  assert_contains "$output" "sudo env" "sudo symlink disabled hint"
+}
+
+test_offer_sudo_symlink_noop_for_root() {
+  assert_command_exists offer_sudo_symlink "sudo symlink helper" || return 0
+  output=$(WAKEZILLA_EUID=0 WAKEZILLA_SUDO_SYMLINK=no offer_sudo_symlink /tmp/wakezilla-bin 2>&1)
+  assert_eq "" "$output" "root sudo symlink noop"
+}
+
+test_offer_sudo_symlink_noop_on_secure_path() {
+  assert_command_exists offer_sudo_symlink "sudo symlink helper" || return 0
+  output=$(WAKEZILLA_EUID=1000 WAKEZILLA_SUDO_SYMLINK=yes offer_sudo_symlink /usr/local/bin 2>&1)
+  assert_eq "" "$output" "secure path sudo symlink noop"
+}
+
 test_install_argument_helpers_defined() {
   missing=0
   assert_command_exists parse_args "parse args helper" || missing=1
@@ -565,6 +597,10 @@ test_detect_target_linux_arm64_musl
 test_detect_target_unsupported_platform
 test_musl_fallback_target_gnu
 test_musl_fallback_target_none
+test_bin_dir_on_secure_path
+test_offer_sudo_symlink_skips_when_disabled
+test_offer_sudo_symlink_noop_for_root
+test_offer_sudo_symlink_noop_on_secure_path
 if test_install_argument_helpers_defined; then
   test_parse_args_positional_version
   test_parse_args_rejects_two_versions
