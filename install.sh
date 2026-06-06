@@ -407,6 +407,19 @@ bin_dir_on_secure_path() {
   return 1
 }
 
+prompt_sudo_symlink() {
+  {
+    printf '\nTo run privileged commands like '\''sudo %s setup'\'' the binary must be on\n' "$BIN_NAME"
+    printf 'sudo'\''s PATH. Link %s -> %s now? (needs sudo) [y/N] ' "$symlink_link_path" "$symlink_src"
+  } 2>/dev/null > /dev/tty || return 1
+
+  IFS= read -r symlink_answer 2>/dev/null < /dev/tty || symlink_answer=
+  case "$symlink_answer" in
+    y|Y|yes|YES|Yes) decision=yes ;;
+    *) decision=no ;;
+  esac
+}
+
 # A user-level install lands outside sudo's secure_path, so `sudo wakezilla
 # setup` fails with "command not found". Offer to symlink the binary into
 # /usr/local/bin (the one secure_path dir conventionally meant for local
@@ -435,17 +448,7 @@ offer_sudo_symlink() {
 
   decision="${WAKEZILLA_SUDO_SYMLINK:-ask}"
   if [ "$decision" = "ask" ]; then
-    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-      {
-        printf '\nTo run privileged commands like '\''sudo %s setup'\'' the binary must be on\n' "$BIN_NAME"
-        printf 'sudo'\''s PATH. Link %s -> %s now? (needs sudo) [y/N] ' "$symlink_link_path" "$symlink_src"
-      } > /dev/tty
-      read symlink_answer < /dev/tty || symlink_answer=
-      case "$symlink_answer" in
-        y|Y|yes|YES|Yes) decision=yes ;;
-        *) decision=no ;;
-      esac
-    else
+    if ! prompt_sudo_symlink; then
       decision=no
     fi
   fi

@@ -467,10 +467,26 @@ test_bin_dir_on_secure_path() {
 
 test_offer_sudo_symlink_skips_when_disabled() {
   assert_command_exists offer_sudo_symlink "sudo symlink helper" || return 0
+  temp_dir=$(mktemp -d)
+  mkdir -p "$temp_dir/bin"
+  cat > "$temp_dir/bin/sudo" <<'SH'
+#!/usr/bin/env sh
+printf 'sudo should not be invoked\n' >&2
+exit 1
+SH
+  chmod +x "$temp_dir/bin/sudo"
+  old_path="$PATH"
+  PATH="$temp_dir/bin:$PATH"
+
   # decision=no must never invoke sudo; it should print the manual hint and
   # return cleanly even when the binary is off secure_path.
   output=$(WAKEZILLA_EUID=1000 WAKEZILLA_SUDO_SYMLINK=no offer_sudo_symlink /tmp/wakezilla-bin 2>&1)
+  PATH="$old_path"
+  export PATH
+  rm -rf "$temp_dir"
+
   assert_contains "$output" "sudo env" "sudo symlink disabled hint"
+  assert_not_contains "$output" "sudo should not be invoked" "sudo symlink disabled does not run sudo"
 }
 
 test_offer_sudo_symlink_noop_for_root() {
