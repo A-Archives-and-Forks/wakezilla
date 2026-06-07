@@ -384,10 +384,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('r') => app.refresh().await,
         KeyCode::Char('w') => app.wake_selected().await,
         KeyCode::Char('t') => app.turn_off_selected().await,
-        KeyCode::Char('d') => {
-            if app.selected_machine().is_some() {
-                app.confirm_delete = true;
-            }
+        KeyCode::Char('d') if app.selected_machine().is_some() => {
+            app.confirm_delete = true;
         }
         _ => {}
     }
