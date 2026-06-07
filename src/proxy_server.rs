@@ -94,7 +94,13 @@ async fn spa_fallback(req: Request<Body>) -> Response<Body> {
 
 pub async fn start(config: crate::config::Config) -> Result<()> {
     let port = config.server.proxy_port;
-    let initial_machines = web::load_machines().unwrap_or_default();
+    let initial_machines = match web::load_machines() {
+        Ok(machines) => machines,
+        Err(err) => {
+            error!("Failed to load machines from storage: {err}");
+            Vec::new()
+        }
+    };
 
     let state = AppState {
         machines: Arc::new(RwLock::new(initial_machines.clone())),
