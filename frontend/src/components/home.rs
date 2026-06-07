@@ -76,7 +76,7 @@ pub fn HomePage() -> impl IntoView {
 
     view! {
         <Header set_machine=set_machine registred_machines=registred_machines />
-        <Show when=move || { !registred_machines.get().is_empty() } fallback=|| view! {}>
+        <Show when=move || { !registred_machines.get().is_empty() } fallback=|| {}>
             <RegisteredMachines
                 machines=registred_machines
                 status_machine=status_machine

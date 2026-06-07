@@ -183,19 +183,15 @@ pub async fn is_machine_online(mac: &str) -> bool {
     let mac = encode_path_segment(mac);
     let response = Request::get(&format!("{}/machines/{}/is-on", API_BASE.as_str(), mac))
         .send()
-        .await
-        .map_err(|e| e.to_string());
+        .await;
 
-    if response.is_err() {
-        console_log(&format!(
-            "Error checking if machine is online: {}",
-            response.err().unwrap()
-        ));
-        return false;
-    }
-    let response = response.unwrap();
-    match response.status() {
-        200 => true,
-        _ => false,
-    }
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            console_log(&format!("Error checking if machine is online: {err}"));
+            return false;
+        }
+    };
+
+    response.status() == 200
 }

@@ -94,7 +94,13 @@ async fn spa_fallback(req: Request<Body>) -> Response<Body> {
 
 pub async fn start(config: crate::config::Config) -> Result<()> {
     let port = config.server.proxy_port;
-    let initial_machines = web::load_machines().unwrap_or_default();
+    let initial_machines = match web::load_machines() {
+        Ok(machines) => machines,
+        Err(err) => {
+            error!("Failed to load machines from storage: {err}");
+            Vec::new()
+        }
+    };
 
     let state = AppState {
         machines: Arc::new(RwLock::new(initial_machines.clone())),
@@ -177,35 +183,39 @@ async fn is_machine_on_api(
     State(state): State<AppState>,
     Path(mac): Path<String>,
 ) -> impl IntoResponse {
-    let machines = state.machines.read().await;
-    if let Some(machine) = machines.iter().find(|m| m.mac == mac) {
-        let url = format!(
-            "http://{}:{}/health",
-            machine.ip,
-            machine.turn_off_port.unwrap_or(3001)
-        );
-        let response = reqwest::get(&url).await;
-        match response {
-            Ok(res) => {
-                if res.status() == 200 {
-                    Ok((
-                        axum::http::StatusCode::OK,
-                        Json(serde_json::json!({ "is_on": true })),
-                    ))
-                } else {
-                    Ok((
-                        axum::http::StatusCode::OK,
-                        Json(serde_json::json!({ "is_on": false })),
-                    ))
-                }
-            }
-            Err(e) => {
-                info!("Network error for machine {}: {}", machine.name, e);
-                Err(axum::http::StatusCode::NOT_FOUND)
+    let Some((url, machine_name)) = ({
+        let machines = state.machines.read().await;
+
+        machines.iter().find(|m| m.mac == mac).map(|machine| {
+            let url = format!(
+                "http://{}:{}/health",
+                machine.ip,
+                machine.turn_off_port.unwrap_or(3001)
+            );
+            (url, machine.name.clone())
+        })
+    }) else {
+        return Err(axum::http::StatusCode::NOT_FOUND);
+    };
+
+    match reqwest::get(&url).await {
+        Ok(res) => {
+            if res.status() == 200 {
+                Ok((
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({ "is_on": true })),
+                ))
+            } else {
+                Ok((
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({ "is_on": false })),
+                ))
             }
         }
-    } else {
-        Err(axum::http::StatusCode::NOT_FOUND)
+        Err(e) => {
+            info!("Network error for machine {}: {}", machine_name, e);
+            Err(axum::http::StatusCode::NOT_FOUND)
+        }
     }
 }
 
@@ -499,8 +509,9 @@ async fn execute_wake(state: &AppState, mac_input: &str) -> (axum::http::StatusC
 
     let port = state.config.wol.default_port;
     let count = state.config.wol.default_packet_count;
+    let broadcast = state.config.get_default_broadcast_addr();
 
-    match crate::wol::send_packets(&parsed_mac, port, count, &state.config).await {
+    match crate::wol::send_packets(&parsed_mac, broadcast, port, count, &state.config).await {
         Ok(_) => (
             axum::http::StatusCode::OK,
             format!("Sent WOL packet to {}", mac_input),

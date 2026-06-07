@@ -24,6 +24,32 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            frontend
+
+      - name: Install Clippy
+        run: rustup component add clippy
+
+      - name: Prepare frontend assets for backend lint
+        run: |
+          mkdir -p target/frontend-dist
+          printf '<!doctype html><html><head><title>wakezilla</title></head><body></body></html>\n' > target/frontend-dist/index.html
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   install-script:
     name: install script
     runs-on: ubuntu-latest

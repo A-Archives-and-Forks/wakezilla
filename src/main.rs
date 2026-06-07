@@ -195,57 +195,51 @@ fn log_config(config: &config::Config) {
     );
 }
 
+fn send_broadcast_addr(args: &SendArgs, config: &config::Config) -> Ipv4Addr {
+    args.broadcast
+        .unwrap_or_else(|| config.get_default_broadcast_addr())
+}
+
 #[instrument(name = "handle_send_command", skip(args, config))]
 async fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<()> {
     info!("Processing WOL send command");
 
     let mac = wol::parse_mac(&args.mac).context("Failed to parse MAC address")?;
-    let bcast = config.get_default_broadcast_addr();
+    let bcast = send_broadcast_addr(&args, config);
 
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            let result = handle.block_on(async {
-                wol::send_packets(&mac, args.port, args.count, config)
-                    .await
-                    .context("Failed to send WOL packets")?;
+    wol::send_packets(&mac, bcast, args.port, args.count, config)
+        .await
+        .context("Failed to send WOL packets")?;
 
-                info!(
-                    "Sent WOL magic packet to {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} via {}:{}",
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], bcast, args.port
-                );
+    info!(
+        "Sent WOL magic packet to {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} via {}:{}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], bcast, args.port
+    );
 
-                // ---- Optional post-WOL reachability check ----
-                if let Some(ip) = args.check_ip {
-                    info!("Performing post-WOL reachability check for {}", ip);
-                    if !wol::check_host(
-                        ip,
-                        args.check_tcp_port,
-                        args.wait_secs,
-                        args.interval_ms,
-                        args.connect_timeout_ms,
-                        config,
-                    )
-                    .await
-                    {
-                        anyhow::bail!(
-                            "Host {}:{} did not become reachable within {} seconds",
-                            ip,
-                            args.check_tcp_port,
-                            args.wait_secs
-                        );
-                    }
-                    info!("Host {}:{} is now reachable", ip, args.check_tcp_port);
-                }
-
-                Ok(())
-            });
-            match result {
-                Ok(_) => Ok(()),
-                Err(e) => Err(e),
-            }
+    // ---- Optional post-WOL reachability check ----
+    if let Some(ip) = args.check_ip {
+        info!("Performing post-WOL reachability check for {}", ip);
+        if !wol::check_host(
+            ip,
+            args.check_tcp_port,
+            args.wait_secs,
+            args.interval_ms,
+            args.connect_timeout_ms,
+            config,
+        )
+        .await
+        {
+            anyhow::bail!(
+                "Host {}:{} did not become reachable within {} seconds",
+                ip,
+                args.check_tcp_port,
+                args.wait_secs
+            );
         }
-        Err(_) => Err(anyhow::anyhow!("No runtime context available")),
+        info!("Host {}:{} is now reachable", ip, args.check_tcp_port);
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -373,6 +367,29 @@ mod cli_tests {
                 assert!(args.lines.is_none());
             }
             other => panic!("expected Service command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_broadcast_prefers_cli_override() {
+        let cli = Cli::try_parse_from([
+            "wakezilla",
+            "send",
+            "AA:BB:CC:DD:EE:FF",
+            "--broadcast",
+            "192.168.1.255",
+        ])
+        .expect("send subcommand parses with broadcast override");
+
+        match cli.command {
+            Commands::Send(args) => {
+                let config = config::Config::default();
+                assert_eq!(
+                    send_broadcast_addr(&args, &config),
+                    Ipv4Addr::new(192, 168, 1, 255)
+                );
+            }
+            other => panic!("expected Send command, got {other:?}"),
         }
     }
 }

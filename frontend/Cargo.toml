@@ -22,14 +22,3 @@ wakezilla-common = { path = "../common" }
 
 # Explicitly add newer versions of problematic dependencies
 libc = "0.2"
-
-[profile.release]
-opt-level = 'z'
-lto = true
-codegen-units = 1
-
-[profile.wasm-release]
-inherits = "release"
-opt-level = 'z'
-lto = true
-codegen-units = 1
