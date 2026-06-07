@@ -11,3 +11,6 @@ pub mod web;
 pub mod wol;
 
 pub use api_models::*;
+
+#[cfg(test)]
+pub(crate) mod test_support;

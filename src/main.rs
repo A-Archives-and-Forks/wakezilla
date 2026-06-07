@@ -12,6 +12,8 @@ mod scanner;
 mod service;
 mod setup;
 mod system;
+#[cfg(test)]
+mod test_support;
 mod tui;
 mod web;
 mod wol;

@@ -535,7 +535,6 @@ mod tests {
         response::IntoResponse,
         Json,
     };
-    use once_cell::sync::Lazy;
     use std::collections::HashMap;
     use std::io::ErrorKind;
     use std::net::Ipv4Addr;
@@ -544,8 +543,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::{watch, Mutex as AsyncMutex, RwLock};
-
-    static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
 
     struct EnvGuard {
         key: &'static str,
@@ -651,7 +648,9 @@ mod tests {
     // across the awaited handler call, so the sync guard intentionally spans the await point.
     #[allow(clippy::await_holding_lock)]
     async fn add_machine_api_persists_new_entry() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp_dir = tempdir().expect("failed to create temp dir");
         let file_path = tmp_dir.path().join("machines.json");
         let _guard = EnvGuard::set_path("WAKEZILLA__STORAGE__MACHINES_DB_PATH", &file_path);
@@ -782,7 +781,9 @@ mod tests {
     // across the awaited handler call, so the sync guard intentionally spans the await point.
     #[allow(clippy::await_holding_lock)]
     async fn update_machine_api_applies_changes() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp_dir = tempdir().expect("failed to create temp dir");
         let file_path = tmp_dir.path().join("machines.json");
         let _guard = EnvGuard::set_path("WAKEZILLA__STORAGE__MACHINES_DB_PATH", &file_path);
@@ -824,7 +825,9 @@ mod tests {
     // across the awaited handler call, so the sync guard intentionally spans the await point.
     #[allow(clippy::await_holding_lock)]
     async fn delete_machine_api_stops_proxy_and_removes_machine() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp_dir = tempdir().expect("failed to create temp dir");
         let file_path = tmp_dir.path().join("machines.json");
         let _guard = EnvGuard::set_path("WAKEZILLA__STORAGE__MACHINES_DB_PATH", &file_path);

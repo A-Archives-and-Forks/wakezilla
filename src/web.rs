@@ -271,11 +271,8 @@ pub fn restart_global_monitor(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
     use std::net::Ipv4Addr;
     use tempfile::{tempdir, NamedTempFile};
-
-    static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
 
     struct EnvGuard {
         key: &'static str,
@@ -350,7 +347,9 @@ mod tests {
 
     #[test]
     fn save_machines_writes_using_configured_path() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp_dir = tempdir().expect("failed to create temp dir");
         let file_path = tmp_dir.path().join("machines.json");
         let _guard = EnvGuard::set_path("WAKEZILLA__STORAGE__MACHINES_DB_PATH", &file_path);
