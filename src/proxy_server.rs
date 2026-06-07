@@ -177,35 +177,39 @@ async fn is_machine_on_api(
     State(state): State<AppState>,
     Path(mac): Path<String>,
 ) -> impl IntoResponse {
-    let machines = state.machines.read().await;
-    if let Some(machine) = machines.iter().find(|m| m.mac == mac) {
-        let url = format!(
-            "http://{}:{}/health",
-            machine.ip,
-            machine.turn_off_port.unwrap_or(3001)
-        );
-        let response = reqwest::get(&url).await;
-        match response {
-            Ok(res) => {
-                if res.status() == 200 {
-                    Ok((
-                        axum::http::StatusCode::OK,
-                        Json(serde_json::json!({ "is_on": true })),
-                    ))
-                } else {
-                    Ok((
-                        axum::http::StatusCode::OK,
-                        Json(serde_json::json!({ "is_on": false })),
-                    ))
-                }
-            }
-            Err(e) => {
-                info!("Network error for machine {}: {}", machine.name, e);
-                Err(axum::http::StatusCode::NOT_FOUND)
+    let Some((url, machine_name)) = ({
+        let machines = state.machines.read().await;
+
+        machines.iter().find(|m| m.mac == mac).map(|machine| {
+            let url = format!(
+                "http://{}:{}/health",
+                machine.ip,
+                machine.turn_off_port.unwrap_or(3001)
+            );
+            (url, machine.name.clone())
+        })
+    }) else {
+        return Err(axum::http::StatusCode::NOT_FOUND);
+    };
+
+    match reqwest::get(&url).await {
+        Ok(res) => {
+            if res.status() == 200 {
+                Ok((
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({ "is_on": true })),
+                ))
+            } else {
+                Ok((
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({ "is_on": false })),
+                ))
             }
         }
-    } else {
-        Err(axum::http::StatusCode::NOT_FOUND)
+        Err(e) => {
+            info!("Network error for machine {}: {}", machine_name, e);
+            Err(axum::http::StatusCode::NOT_FOUND)
+        }
     }
 }
 
