@@ -15,6 +15,7 @@ mod system;
 #[cfg(test)]
 mod test_support;
 mod tui;
+mod update;
 mod web;
 mod wol;
 
@@ -25,6 +26,10 @@ use setup::{ServiceArgs, SetupArgs};
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 pub struct Cli {
+    /// Skip the automatic startup check for a newer Wakezilla release.
+    #[arg(long, global = true, help_heading = "Global Options")]
+    no_update_check: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -43,6 +48,16 @@ pub enum Commands {
     Setup(SetupArgs),
     /// Control an installed Wakezilla service (start/stop/restart/status/logs)
     Service(ServiceArgs),
+    /// Download and install a Wakezilla release
+    Update(UpdateArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command()]
+pub struct UpdateArgs {
+    /// Version to install, without leading `v`. Defaults to the latest release.
+    #[arg(long, help_heading = "Update Options")]
+    version: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -129,6 +144,12 @@ async fn main() -> Result<()> {
 
     init_tracing();
 
+    if should_check_for_updates(&cli) {
+        if let Err(e) = update::warn_if_update_available(env!("CARGO_PKG_VERSION")).await {
+            tracing::warn!("Update check failed: {e}");
+        }
+    }
+
     match cli.command {
         Commands::Tui(args) => {
             tui::run(tui::TuiConfig {
@@ -169,9 +190,23 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Commands::Update(args) => {
+            update::run_update(update::UpdateRequest {
+                version: args.version,
+            })
+            .await?;
+        }
     }
 
     Ok(())
+}
+
+fn should_check_for_updates(cli: &Cli) -> bool {
+    if cli.no_update_check {
+        return false;
+    }
+
+    !matches!(cli.command, Commands::Setup(_) | Commands::Update(_))
 }
 
 fn init_tracing() {
@@ -254,6 +289,51 @@ mod cli_tests {
             Commands::Tui(args) => assert_eq!(args.api_url, "http://127.0.0.1:3000"),
             other => panic!("expected Tui command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_accepts_global_no_update_check_before_subcommand() {
+        let cli = Cli::try_parse_from(["wakezilla", "--no-update-check", "proxy-server"])
+            .expect("global no-update-check parses");
+
+        assert!(cli.no_update_check);
+    }
+
+    #[test]
+    fn cli_accepts_update_without_version() {
+        let cli = Cli::try_parse_from(["wakezilla", "update"]).expect("update parses");
+
+        match cli.command {
+            Commands::Update(args) => assert!(args.version.is_none()),
+            other => panic!("expected Update command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_update_with_version() {
+        let cli = Cli::try_parse_from(["wakezilla", "update", "--version", "0.2.3"])
+            .expect("update version parses");
+
+        match cli.command {
+            Commands::Update(args) => assert_eq!(args.version.as_deref(), Some("0.2.3")),
+            other => panic!("expected Update command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn startup_update_check_is_skipped_for_setup_update_and_flag() {
+        let setup_cli = Cli::try_parse_from(["wakezilla", "setup"]).expect("setup parses");
+        assert!(!should_check_for_updates(&setup_cli));
+
+        let update_cli = Cli::try_parse_from(["wakezilla", "update"]).expect("update parses");
+        assert!(!should_check_for_updates(&update_cli));
+
+        let no_check_cli = Cli::try_parse_from(["wakezilla", "--no-update-check", "proxy-server"])
+            .expect("proxy parses");
+        assert!(!should_check_for_updates(&no_check_cli));
+
+        let proxy_cli = Cli::try_parse_from(["wakezilla", "proxy-server"]).expect("proxy parses");
+        assert!(should_check_for_updates(&proxy_cli));
     }
 
     #[test]

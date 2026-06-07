@@ -98,6 +98,32 @@ docker run -d \
    ```bash
    wakezilla --version
    ```
+
+### Update Wakezilla
+
+Install the latest GitHub Release for your platform:
+
+```bash
+wakezilla update
+```
+
+To install a specific version, pass it without the leading `v`:
+
+```bash
+wakezilla update --version 0.2.3
+```
+
+Wakezilla checks for newer releases when the binary starts and prints a warning
+when one is available. Use `--no-update-check` for offline or scripted runs:
+
+```bash
+wakezilla --no-update-check proxy-server
+```
+
+If Wakezilla was installed into a system directory such as `/usr/local/bin`, the
+update may require elevated privileges. A failed update leaves the existing
+binary untouched.
+
 ### Run proxy server 
 
 1. **Run the Server**:
@@ -152,6 +178,10 @@ proxy server runs on the same host:
    overwriting. Existing settings for the *other* server are preserved — only
    the target server's port is updated. Pass `-y`/`--yes` to skip the
    confirmation for non-interactive use.
+
+   Services installed by `setup` run with `--no-update-check`, so background
+   services do not make startup network requests. Run `wakezilla update`
+   manually when you want to upgrade the installed binary.
 
 2. **Control an installed service** (requires `sudo`/admin privileges):
    ```bash

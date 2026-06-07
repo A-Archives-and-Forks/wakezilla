@@ -16,9 +16,21 @@ fn mode_exposes_subcommand_and_service_name() {
 }
 
 #[test]
+fn service_program_args_disable_update_checks() {
+    assert_eq!(
+        service::service_program_args(Mode::Proxy),
+        ["--no-update-check", "proxy-server"]
+    );
+    assert_eq!(
+        service::service_program_args(Mode::Client),
+        ["--no-update-check", "client-server"]
+    );
+}
+
+#[test]
 fn systemd_unit_contains_exec_start_with_exe_and_subcommand() {
     let unit = service::generate_systemd_unit(Mode::Proxy, "/usr/local/bin/wakezilla");
-    assert!(unit.contains("ExecStart=/usr/local/bin/wakezilla proxy-server"));
+    assert!(unit.contains("ExecStart=/usr/local/bin/wakezilla --no-update-check proxy-server"));
     assert!(unit.contains("[Service]"));
     assert!(unit.contains("WantedBy=multi-user.target"));
 }
@@ -28,7 +40,8 @@ fn launchd_plist_contains_label_exe_and_subcommand() {
     let plist = service::generate_launchd_plist(Mode::Client, "/usr/local/bin/wakezilla");
     assert!(plist.contains("dev.wakezilla.client"));
     assert!(plist.contains("/usr/local/bin/wakezilla"));
-    assert!(plist.contains("client-server"));
+    assert!(plist.contains("<string>--no-update-check</string>"));
+    assert!(plist.contains("<string>client-server</string>"));
     assert!(plist.contains("<key>RunAtLoad</key>"));
     assert!(plist.contains("<key>StandardErrorPath</key>"));
     assert!(plist.contains("<key>StandardOutPath</key>"));
