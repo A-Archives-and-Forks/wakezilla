@@ -195,14 +195,19 @@ fn log_config(config: &config::Config) {
     );
 }
 
+fn send_broadcast_addr(args: &SendArgs, config: &config::Config) -> Ipv4Addr {
+    args.broadcast
+        .unwrap_or_else(|| config.get_default_broadcast_addr())
+}
+
 #[instrument(name = "handle_send_command", skip(args, config))]
 async fn handle_send_command(args: SendArgs, config: &config::Config) -> Result<()> {
     info!("Processing WOL send command");
 
     let mac = wol::parse_mac(&args.mac).context("Failed to parse MAC address")?;
-    let bcast = config.get_default_broadcast_addr();
+    let bcast = send_broadcast_addr(&args, config);
 
-    wol::send_packets(&mac, args.port, args.count, config)
+    wol::send_packets(&mac, bcast, args.port, args.count, config)
         .await
         .context("Failed to send WOL packets")?;
 
@@ -362,6 +367,29 @@ mod cli_tests {
                 assert!(args.lines.is_none());
             }
             other => panic!("expected Service command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_broadcast_prefers_cli_override() {
+        let cli = Cli::try_parse_from([
+            "wakezilla",
+            "send",
+            "AA:BB:CC:DD:EE:FF",
+            "--broadcast",
+            "192.168.1.255",
+        ])
+        .expect("send subcommand parses with broadcast override");
+
+        match cli.command {
+            Commands::Send(args) => {
+                let config = config::Config::default();
+                assert_eq!(
+                    send_broadcast_addr(&args, &config),
+                    Ipv4Addr::new(192, 168, 1, 255)
+                );
+            }
+            other => panic!("expected Send command, got {other:?}"),
         }
     }
 }

@@ -9,11 +9,11 @@ use tracing::{debug, info, instrument, warn};
 #[instrument(name = "send_wol_packets", skip(mac, config))]
 pub async fn send_packets(
     mac: &[u8; 6],
+    broadcast: Ipv4Addr,
     port: u16,
     count: u32,
     config: &crate::config::Config,
 ) -> Result<()> {
-    let bcast = config.get_default_broadcast_addr();
     let packet = build_magic_packet(mac);
     debug!(
         "Built WOL magic packet for MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -27,8 +27,8 @@ pub async fn send_packets(
     sock.set_broadcast(true)
         .context("Failed to enable broadcast on socket")?;
 
-    let addr = SocketAddrV4::new(bcast, port);
-    info!("Sending {} WOL packets to {}:{}", count, bcast, port);
+    let addr = SocketAddrV4::new(broadcast, port);
+    info!("Sending {} WOL packets to {}:{}", count, broadcast, port);
 
     for i in 0..count {
         debug!("Sending WOL packet {}/{}", i + 1, count);
@@ -40,7 +40,7 @@ pub async fn send_packets(
 
     info!(
         "Successfully sent {} WOL packets to {}:{}",
-        count, bcast, port
+        count, broadcast, port
     );
     Ok(())
 }

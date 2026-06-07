@@ -503,8 +503,9 @@ async fn execute_wake(state: &AppState, mac_input: &str) -> (axum::http::StatusC
 
     let port = state.config.wol.default_port;
     let count = state.config.wol.default_packet_count;
+    let broadcast = state.config.get_default_broadcast_addr();
 
-    match crate::wol::send_packets(&parsed_mac, port, count, &state.config).await {
+    match crate::wol::send_packets(&parsed_mac, broadcast, port, count, &state.config).await {
         Ok(_) => (
             axum::http::StatusCode::OK,
             format!("Sent WOL packet to {}", mac_input),

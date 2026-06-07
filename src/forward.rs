@@ -209,8 +209,10 @@ impl TurnOffLimiter {
 
                             let wol_port = config_clone.wol.default_port;
                             let wol_count = config_clone.wol.default_packet_count;
+                            let wol_broadcast = config_clone.get_default_broadcast_addr();
                             if let Err(e) = crate::wol::send_packets(
                                 &mac,
+                                wol_broadcast,
                                 wol_port,
                                 wol_count,
                                 &config_clone,
