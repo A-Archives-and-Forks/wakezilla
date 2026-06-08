@@ -59,10 +59,16 @@ impl Mode {
     }
 }
 
+/// Arguments passed to a Wakezilla process managed by the OS service layer.
+pub fn service_program_args(mode: Mode) -> [&'static str; 2] {
+    ["--no-update-check", mode.subcommand()]
+}
+
 /// Render a systemd unit file. `exe` is the absolute path to the wakezilla binary.
 // Platform-conditional: used by the systemd (Linux) / launchd (macOS) / Windows install paths; some are cfg'd out per-OS.
 #[allow(dead_code)]
 pub fn generate_systemd_unit(mode: Mode, exe: &str) -> String {
+    let [no_update_check, sub] = service_program_args(mode);
     format!(
         "[Unit]\n\
          Description=Wakezilla {desc}\n\
@@ -71,7 +77,7 @@ pub fn generate_systemd_unit(mode: Mode, exe: &str) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={exe} {sub}\n\
+         ExecStart={exe} {no_update_check} {sub}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
@@ -79,7 +85,8 @@ pub fn generate_systemd_unit(mode: Mode, exe: &str) -> String {
          WantedBy=multi-user.target\n",
         desc = mode.subcommand(),
         exe = exe,
-        sub = mode.subcommand(),
+        no_update_check = no_update_check,
+        sub = sub,
     )
 }
 
@@ -100,6 +107,7 @@ fn macos_stderr_log(mode: Mode) -> String {
 // Platform-conditional: used by the systemd (Linux) / launchd (macOS) / Windows install paths; some are cfg'd out per-OS.
 #[allow(dead_code)]
 pub fn generate_launchd_plist(mode: Mode, exe: &str) -> String {
+    let [no_update_check, sub] = service_program_args(mode);
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -110,6 +118,7 @@ pub fn generate_launchd_plist(mode: Mode, exe: &str) -> String {
          \t<key>ProgramArguments</key>\n\
          \t<array>\n\
          \t\t<string>{exe}</string>\n\
+         \t\t<string>{no_update_check}</string>\n\
          \t\t<string>{sub}</string>\n\
          \t</array>\n\
          \t<key>RunAtLoad</key>\n\
@@ -124,7 +133,8 @@ pub fn generate_launchd_plist(mode: Mode, exe: &str) -> String {
          </plist>\n",
         label = mode.launchd_label(),
         exe = exe,
-        sub = mode.subcommand(),
+        no_update_check = no_update_check,
+        sub = sub,
         out = macos_stdout_log(mode),
         err = macos_stderr_log(mode),
     )
@@ -215,7 +225,8 @@ pub fn install(mode: Mode, exe: &str) -> Result<()> {
         // error "service already exists" on a re-run.
         run_ignore_err("sc", &["stop", mode.service_name()]);
         run_ignore_err("sc", &["delete", mode.service_name()]);
-        let bin_path = format!("\"{exe}\" {}", mode.subcommand());
+        let [no_update_check, sub] = service_program_args(mode);
+        let bin_path = format!("\"{exe}\" {no_update_check} {sub}");
         run(
             "sc",
             &[

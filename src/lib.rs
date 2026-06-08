@@ -7,6 +7,7 @@ pub mod scanner;
 pub mod service;
 pub mod setup;
 pub mod system;
+pub mod update;
 pub mod web;
 pub mod wol;
 
