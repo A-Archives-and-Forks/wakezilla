@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::debug;
 
 const MAX_RECORDS_PER_SERVICE: usize = 1000;
 const DEFAULT_HISTORY_PATH: &str = "access_history.json";
@@ -81,7 +81,7 @@ impl AccessLog {
         let data = serde_json::to_string(self).context("Failed to serialize access history")?;
         fs::write(&path, data)
             .with_context(|| format!("Failed to write access history to {}", path.display()))?;
-        info!("Saved access history to {}", path.display());
+        debug!("Saved access history to {}", path.display());
         Ok(())
     }
 }

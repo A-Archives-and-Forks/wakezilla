@@ -121,9 +121,11 @@ pub async fn start(config: crate::config::Config) -> Result<()> {
             interval.tick().await; // consume the immediate first tick
             loop {
                 interval.tick().await;
-                let log = flush_state.access_log.read().await;
-                if let Err(e) = log.save() {
-                    error!("Failed to flush access history: {e}");
+                let snapshot = flush_state.access_log.read().await.clone();
+                match tokio::task::spawn_blocking(move || snapshot.save()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => error!("Failed to flush access history: {e}"),
+                    Err(e) => error!("Access history flush task panicked: {e}"),
                 }
             }
         });

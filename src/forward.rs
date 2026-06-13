@@ -155,8 +155,8 @@ impl TurnOffLimiter {
         mut rx: watch::Receiver<bool>,
         config: Arc<Config>,
         access_log: Arc<RwLock<AccessLog>>,
-        service_key: String,
     ) -> Result<()> {
+        let service_key = crate::access_log::service_key(&machine.mac, local_port);
         let listen_addr = format!("0.0.0.0:{}", local_port);
         let listener = TcpListener::bind(&listen_addr)
             .await
@@ -311,7 +311,6 @@ impl TurnOffLimiter {
         limiter: Arc<TurnOffLimiter>,
         config: Arc<Config>,
         access_log: Arc<RwLock<AccessLog>>,
-        service_key: String,
     ) -> Result<()> {
         // Initialize machine configuration if turn-off is enabled
         if machine.can_be_turned_off {
@@ -335,7 +334,7 @@ impl TurnOffLimiter {
         }
 
         limiter
-            .proxy_internal(local_port, remote_addr, machine, rx, config, access_log, service_key)
+            .proxy_internal(local_port, remote_addr, machine, rx, config, access_log)
             .await
     }
 }
