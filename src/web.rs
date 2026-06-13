@@ -30,6 +30,7 @@ where
     Ipv4Addr::from_str(&s).map_err(serde::de::Error::custom)
 }
 
+use crate::access_log::AccessLog;
 use crate::config::Config;
 use crate::forward;
 
@@ -112,6 +113,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub turn_off_limiter: Arc<forward::TurnOffLimiter>,
     pub monitor_handle: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    pub access_log: Arc<RwLock<AccessLog>>,
 }
 
 pub fn api_port_forward_to_internal(pf: &wakezilla_common::PortForward) -> PortForward {

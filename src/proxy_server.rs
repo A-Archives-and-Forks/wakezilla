@@ -108,6 +108,7 @@ pub async fn start(config: crate::config::Config) -> Result<()> {
         config: Arc::new(config),
         turn_off_limiter: Arc::new(forward::TurnOffLimiter::new()),
         monitor_handle: Arc::new(std::sync::Mutex::new(None)),
+        access_log: Arc::new(RwLock::new(crate::access_log::AccessLog::load())),
     };
 
     // Start global monitor
@@ -585,6 +586,7 @@ mod tests {
             config: Arc::new(crate::config::Config::default()),
             turn_off_limiter: Arc::new(forward::TurnOffLimiter::new()),
             monitor_handle: Arc::new(std::sync::Mutex::new(None)),
+            access_log: Arc::new(RwLock::new(crate::access_log::AccessLog::new())),
         };
         web::start_global_monitor(&state);
         state
