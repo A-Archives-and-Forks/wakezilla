@@ -102,13 +102,16 @@ pub async fn start(config: crate::config::Config) -> Result<()> {
         }
     };
 
+    let max_access_records = config.storage.max_access_records;
     let state = AppState {
         machines: Arc::new(RwLock::new(initial_machines.clone())),
         proxies: Arc::new(RwLock::new(HashMap::new())),
         config: Arc::new(config),
         turn_off_limiter: Arc::new(forward::TurnOffLimiter::new()),
         monitor_handle: Arc::new(std::sync::Mutex::new(None)),
-        access_log: Arc::new(RwLock::new(crate::access_log::AccessLog::load())),
+        access_log: Arc::new(RwLock::new(crate::access_log::AccessLog::load(
+            max_access_records,
+        ))),
     };
 
     // Start global monitor
@@ -639,13 +642,17 @@ mod tests {
     }
 
     fn state_with_machines(machines: Vec<Machine>) -> AppState {
+        let config = crate::config::Config::default();
+        let max_access_records = config.storage.max_access_records;
         let state = AppState {
             machines: Arc::new(RwLock::new(machines)),
             proxies: Arc::new(RwLock::new(HashMap::new())),
-            config: Arc::new(crate::config::Config::default()),
+            config: Arc::new(config),
             turn_off_limiter: Arc::new(forward::TurnOffLimiter::new()),
             monitor_handle: Arc::new(std::sync::Mutex::new(None)),
-            access_log: Arc::new(RwLock::new(crate::access_log::AccessLog::new())),
+            access_log: Arc::new(RwLock::new(crate::access_log::AccessLog::new(
+                max_access_records,
+            ))),
         };
         web::start_global_monitor(&state);
         state

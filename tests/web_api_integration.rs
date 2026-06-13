@@ -47,7 +47,7 @@ fn setup_state(temp_dir: &TempDir) -> (AppState, EnvVarGuard) {
         config: Arc::new(config),
         turn_off_limiter: Arc::new(TurnOffLimiter::new()),
         monitor_handle: Arc::new(std::sync::Mutex::new(None)),
-        access_log: Arc::new(RwLock::new(wakezilla::access_log::AccessLog::new())),
+        access_log: Arc::new(RwLock::new(wakezilla::access_log::AccessLog::new(2000))),
     };
 
     (state, guard)

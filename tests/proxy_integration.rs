@@ -83,7 +83,7 @@ async fn proxy_forwards_tcp_traffic_and_can_shutdown() {
 
     let limiter = Arc::new(TurnOffLimiter::new());
     let config = Arc::new(Config::default());
-    let access_log = Arc::new(RwLock::new(AccessLog::default()));
+    let access_log = Arc::new(RwLock::new(AccessLog::new(2000)));
     let proxy_task = tokio::spawn(forward::TurnOffLimiter::proxy(
         local_port,
         remote_addr,

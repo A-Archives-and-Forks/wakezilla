@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
-const MAX_RECORDS_PER_SERVICE: usize = 1000;
+const DEFAULT_MAX_RECORDS_PER_SERVICE: usize = 2000;
 const DEFAULT_HISTORY_PATH: &str = "access_history.json";
 
 pub fn service_key(mac: &str, local_port: u16) -> String {
@@ -39,21 +39,31 @@ pub fn access_log_path() -> PathBuf {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessLog {
     #[serde(flatten)]
     inner: HashMap<String, VecDeque<i64>>,
+    #[serde(skip)]
+    max_records: usize,
 }
 
 impl AccessLog {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(max_records: usize) -> Self {
+        Self {
+            inner: HashMap::new(),
+            max_records,
+        }
     }
 
     pub fn record(&mut self, key: &str, ts: i64) {
+        let cap = if self.max_records == 0 {
+            DEFAULT_MAX_RECORDS_PER_SERVICE
+        } else {
+            self.max_records
+        };
         let buf = self.inner.entry(key.to_string()).or_default();
         buf.push_back(ts);
-        while buf.len() > MAX_RECORDS_PER_SERVICE {
+        while buf.len() > cap {
             buf.pop_front();
         }
     }
@@ -65,15 +75,17 @@ impl AccessLog {
             .unwrap_or_default()
     }
 
-    pub fn load() -> Self {
+    pub fn load(max_records: usize) -> Self {
         let path = access_log_path();
-        match fs::read_to_string(&path) {
+        let mut log = match fs::read_to_string(&path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
                 tracing::warn!("Failed to parse access history at {}: {e}", path.display());
-                Self::new()
+                Self::new(max_records)
             }),
-            Err(_) => Self::new(),
-        }
+            Err(_) => Self::new(max_records),
+        };
+        log.max_records = max_records;
+        log
     }
 
     pub fn save(&self) -> Result<()> {
@@ -92,7 +104,7 @@ mod tests {
 
     #[test]
     fn record_appends_timestamps() {
-        let mut log = AccessLog::new();
+        let mut log = AccessLog::new(2000);
         log.record("aa-80", 1);
         log.record("aa-80", 2);
         assert_eq!(log.get("aa-80"), vec![1, 2]);
@@ -100,7 +112,7 @@ mod tests {
 
     #[test]
     fn record_caps_at_1000_dropping_oldest() {
-        let mut log = AccessLog::new();
+        let mut log = AccessLog::new(1000);
         for i in 0..1100 {
             log.record("aa-80", i);
         }
@@ -111,8 +123,19 @@ mod tests {
     }
 
     #[test]
+    fn record_respects_configured_cap() {
+        let mut log = AccessLog::new(3);
+        for i in 0..10 {
+            log.record("k", i);
+        }
+        let got = log.get("k");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got, vec![7, 8, 9]);
+    }
+
+    #[test]
     fn get_missing_key_is_empty() {
-        let log = AccessLog::new();
+        let log = AccessLog::new(2000);
         assert!(log.get("nope").is_empty());
     }
 
