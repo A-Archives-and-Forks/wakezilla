@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
-const DEFAULT_MAX_RECORDS_PER_SERVICE: usize = 2000;
 const DEFAULT_HISTORY_PATH: &str = "access_history.json";
 
 pub fn service_key(mac: &str, local_port: u16) -> String {
@@ -56,14 +55,12 @@ impl AccessLog {
     }
 
     pub fn record(&mut self, key: &str, ts: i64) {
-        let cap = if self.max_records == 0 {
-            DEFAULT_MAX_RECORDS_PER_SERVICE
-        } else {
-            self.max_records
-        };
+        if self.max_records == 0 {
+            return;
+        }
         let buf = self.inner.entry(key.to_string()).or_default();
         buf.push_back(ts);
-        while buf.len() > cap {
+        while buf.len() > self.max_records {
             buf.pop_front();
         }
     }
@@ -137,6 +134,14 @@ mod tests {
     fn get_missing_key_is_empty() {
         let log = AccessLog::new(2000);
         assert!(log.get("nope").is_empty());
+    }
+
+    #[test]
+    fn record_disabled_when_cap_zero() {
+        let mut log = AccessLog::new(0);
+        log.record("k", 1);
+        log.record("k", 2);
+        assert!(log.get("k").is_empty());
     }
 
     #[test]
