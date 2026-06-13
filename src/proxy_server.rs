@@ -142,6 +142,10 @@ pub fn api_routes(state: AppState) -> Router {
             get(show_machines_api).post(add_machine_api),
         )
         .route("/api/machines/:mac", get(get_machine_details_api))
+        .route(
+            "/api/machines/:mac/access-history",
+            get(get_access_history_api),
+        )
         .route("/api/machines/:mac", put(update_machine_api))
         .route(
             "/api/machines/:mac/remote-turn-off",
@@ -326,6 +330,44 @@ async fn get_machine_details_api(
             Json(serde_json::json!({ "error": "Machine not found" })),
         ))
     }
+}
+
+async fn get_access_history_api(
+    State(state): State<AppState>,
+    Path(mac): Path<String>,
+) -> Result<Json<wakezilla_common::AccessHistory>, (axum::http::StatusCode, Json<serde_json::Value>)>
+{
+    let machines = state.machines.read().await;
+    let machine = machines.iter().find(|m| m.mac == mac).cloned();
+    drop(machines);
+
+    let Some(machine) = machine else {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Machine not found" })),
+        ));
+    };
+
+    let log = state.access_log.read().await;
+    let services = machine
+        .port_forwards
+        .iter()
+        .map(|pf| {
+            let key = crate::access_log::service_key(&machine.mac, pf.local_port);
+            wakezilla_common::ServiceAccessHistory {
+                name: if pf.name.trim().is_empty() {
+                    None
+                } else {
+                    Some(pf.name.clone())
+                },
+                local_port: pf.local_port,
+                target_port: pf.target_port,
+                timestamps: log.get(&key),
+            }
+        })
+        .collect();
+
+    Ok(Json(wakezilla_common::AccessHistory { services }))
 }
 
 async fn update_machine_api(

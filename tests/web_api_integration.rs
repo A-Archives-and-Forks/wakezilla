@@ -67,6 +67,49 @@ fn sample_machine() -> InternalMachine {
 }
 
 #[tokio::test]
+async fn access_history_returns_service_entries() {
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let (state, _guard) = setup_state(&temp_dir);
+
+    let mut machine = sample_machine();
+    machine.port_forwards = vec![wakezilla::web::PortForward {
+        name: "konga".to_string(),
+        local_port: 1234,
+        target_port: 80,
+    }];
+    state.machines.write().await.push(machine.clone());
+
+    {
+        let key = wakezilla::access_log::service_key(&machine.mac, 1234);
+        let mut log = state.access_log.write().await;
+        log.record(&key, 1000);
+        log.record(&key, 2000);
+    }
+
+    let app = build_router(state.clone()).merge(api_routes(state.clone()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/machines/AA:BB:CC:DD:EE:FF/access-history")
+                .method("GET")
+                .body(Body::empty())
+                .expect("failed to build request"),
+        )
+        .await
+        .expect("handler failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed: wakezilla::AccessHistory = serde_json::from_slice(
+        &response.into_body().collect().await.expect("collect").to_bytes(),
+    )
+    .expect("valid access history json");
+    assert_eq!(parsed.services.len(), 1);
+    assert_eq!(parsed.services[0].name.as_deref(), Some("konga"));
+    assert_eq!(parsed.services[0].local_port, 1234);
+    assert_eq!(parsed.services[0].timestamps, vec![1000, 2000]);
+}
+
+#[tokio::test]
 async fn add_machine_accepts_null_port_forward_name() {
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let (state, _guard) = setup_state(&temp_dir);
