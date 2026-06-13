@@ -114,6 +114,21 @@ pub async fn start(config: crate::config::Config) -> Result<()> {
     // Start global monitor
     web::start_global_monitor(&state);
 
+    {
+        let flush_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                interval.tick().await;
+                let log = flush_state.access_log.read().await;
+                if let Err(e) = log.save() {
+                    error!("Failed to flush access history: {e}");
+                }
+            }
+        });
+    }
+
     for machine in &initial_machines {
         web::start_proxy_if_configured(machine, &state);
     }
