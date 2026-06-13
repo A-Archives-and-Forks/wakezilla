@@ -11,10 +11,10 @@ use web_sys::SubmitEvent;
 use crate::api::{get_details_machine, turn_off_machine, wake_machine};
 use crate::models::{Machine, PortForward, UpdateMachinePayload};
 
-use wasm_bindgen::prelude::*;
-use chrono::{DateTime, TimeZone, Utc};
 use crate::api::get_access_history;
 use crate::models::AccessHistory;
+use chrono::{DateTime, TimeZone, Utc};
+use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(inline_js = r#"
 export function render_usage_chart(canvas_id, labels_json, datasets_json) {
@@ -49,7 +49,10 @@ fn bucket_by_day(history: &AccessHistory) -> (Vec<String>, Vec<serde_json::Value
     use std::collections::{BTreeSet, HashMap};
 
     let day_of = |ts: i64| -> String {
-        let dt: DateTime<Utc> = Utc.timestamp_millis_opt(ts).single().unwrap_or_else(Utc::now);
+        let dt: DateTime<Utc> = Utc
+            .timestamp_millis_opt(ts)
+            .single()
+            .unwrap_or_else(Utc::now);
         dt.format("%Y-%m-%d").to_string()
     };
 
@@ -74,7 +77,10 @@ fn bucket_by_day(history: &AccessHistory) -> (Vec<String>, Vec<serde_json::Value
     let datasets: Vec<serde_json::Value> = per_service
         .into_iter()
         .map(|(label, counts)| {
-            let data: Vec<u32> = labels.iter().map(|d| *counts.get(d).unwrap_or(&0)).collect();
+            let data: Vec<u32> = labels
+                .iter()
+                .map(|d| *counts.get(d).unwrap_or(&0))
+                .collect();
             serde_json::json!({ "label": label, "data": data })
         })
         .collect();

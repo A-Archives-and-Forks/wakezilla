@@ -100,7 +100,12 @@ async fn access_history_returns_service_entries() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let parsed: wakezilla::AccessHistory = serde_json::from_slice(
-        &response.into_body().collect().await.expect("collect").to_bytes(),
+        &response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect")
+            .to_bytes(),
     )
     .expect("valid access history json");
     assert_eq!(parsed.services.len(), 1);
