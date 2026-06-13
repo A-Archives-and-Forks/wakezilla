@@ -44,19 +44,21 @@ extern "C" {
     fn render_usage_chart(canvas_id: &str, labels_json: &str, datasets_json: &str);
 }
 
-// Returns (sorted day labels "YYYY-MM-DD", per-service datasets as JSON values with counts aligned to labels)
-fn bucket_by_day(history: &AccessHistory) -> (Vec<String>, Vec<serde_json::Value>) {
+// Buckets timestamps using the given chrono format (e.g. "%Y-%m-%d" for day,
+// "%Y-%m-%d %H:00" for hour). Returns (sorted bucket labels, per-service datasets
+// as JSON values with counts aligned to labels).
+fn bucket_history(history: &AccessHistory, fmt: &str) -> (Vec<String>, Vec<serde_json::Value>) {
     use std::collections::{BTreeSet, HashMap};
 
-    let day_of = |ts: i64| -> String {
+    let bucket_of = |ts: i64| -> String {
         let dt: DateTime<Utc> = Utc
             .timestamp_millis_opt(ts)
             .single()
             .unwrap_or_else(Utc::now);
-        dt.format("%Y-%m-%d").to_string()
+        dt.format(fmt).to_string()
     };
 
-    let mut all_days: BTreeSet<String> = BTreeSet::new();
+    let mut all_buckets: BTreeSet<String> = BTreeSet::new();
     let mut per_service: Vec<(String, HashMap<String, u32>)> = Vec::new();
 
     for svc in &history.services {
@@ -66,14 +68,14 @@ fn bucket_by_day(history: &AccessHistory) -> (Vec<String>, Vec<serde_json::Value
             .unwrap_or_else(|| format!("port {}", svc.local_port));
         let mut counts: HashMap<String, u32> = HashMap::new();
         for &ts in &svc.timestamps {
-            let day = day_of(ts);
-            all_days.insert(day.clone());
-            *counts.entry(day).or_insert(0) += 1;
+            let bucket = bucket_of(ts);
+            all_buckets.insert(bucket.clone());
+            *counts.entry(bucket).or_insert(0) += 1;
         }
         per_service.push((label, counts));
     }
 
-    let labels: Vec<String> = all_days.into_iter().collect();
+    let labels: Vec<String> = all_buckets.into_iter().collect();
     let datasets: Vec<serde_json::Value> = per_service
         .into_iter()
         .map(|(label, counts)| {
@@ -115,9 +117,17 @@ pub fn MachineDetailPage() -> impl IntoView {
         });
     });
 
+    // false = bucket by day, true = bucket by hour
+    let (by_hour, set_by_hour) = signal(false);
+
     Effect::new(move || {
         if let Some(history) = access_history.get() {
-            let (labels, datasets) = bucket_by_day(&history);
+            let fmt = if by_hour.get() {
+                "%Y-%m-%d %H:00"
+            } else {
+                "%Y-%m-%d"
+            };
+            let (labels, datasets) = bucket_history(&history, fmt);
             let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".into());
             let datasets_json = serde_json::to_string(&datasets).unwrap_or_else(|_| "[]".into());
             render_usage_chart("usage-chart", &labels_json, &datasets_json);
@@ -686,8 +696,28 @@ pub fn MachineDetailPage() -> impl IntoView {
             <div class="card">
                 <header class="card-header">
                     <h3 class="card-title">"Access history"</h3>
-                    <p class="card-subtitle">"Connections per service, by day."</p>
+                    <p class="card-subtitle">"Connections per service over time."</p>
                 </header>
+                <div class="actions-row">
+                    <button
+                        type="button"
+                        class=move || {
+                            if by_hour.get() { "btn btn-soft btn-sm" } else { "btn btn-primary btn-sm" }
+                        }
+                        on:click=move |_| set_by_hour.set(false)
+                    >
+                        "By day"
+                    </button>
+                    <button
+                        type="button"
+                        class=move || {
+                            if by_hour.get() { "btn btn-primary btn-sm" } else { "btn btn-soft btn-sm" }
+                        }
+                        on:click=move |_| set_by_hour.set(true)
+                    >
+                        "By hour"
+                    </button>
+                </div>
                 <canvas id="usage-chart"></canvas>
             </div>
 
