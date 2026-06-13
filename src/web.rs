@@ -224,6 +224,8 @@ pub fn start_proxy_if_configured(machine: &Machine, state: &AppState) {
 
         let proxies_clone = state.proxies.clone();
         let limiter_clone = state.turn_off_limiter.clone();
+        let access_log_clone = state.access_log.clone();
+        let svc_key = crate::access_log::service_key(&machine.mac, pf.local_port);
         tokio::spawn(async move {
             let mut proxies = proxies_clone.write().await;
             proxies.insert(proxy_key.clone(), tx);
@@ -238,6 +240,8 @@ pub fn start_proxy_if_configured(machine: &Machine, state: &AppState) {
                 rx,
                 limiter_clone,
                 config_clone,
+                access_log_clone,
+                svc_key,
             )
             .await
             {
