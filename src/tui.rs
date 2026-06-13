@@ -21,7 +21,9 @@ use ratatui::{
 };
 use reqwest::{Client, Response};
 use serde::Deserialize;
-use wakezilla_common::{DeleteMachinePayload, Machine};
+use wakezilla_common::{AccessHistory, DeleteMachinePayload, Machine};
+
+use crate::access_log::now_millis;
 
 const BASE: ratatui::style::Color = ratatui::style::Color::Rgb(30, 30, 46);
 const TEXT: ratatui::style::Color = ratatui::style::Color::Rgb(205, 214, 244);
@@ -76,6 +78,19 @@ impl ApiClient {
         json_response(response)
             .await
             .context("failed to decode /api/machines response")
+    }
+
+    async fn access_history(&self, mac: &str) -> Result<AccessHistory> {
+        let response = self
+            .http
+            .get(self.url(&format!("/api/machines/{mac}/access-history")))
+            .send()
+            .await
+            .with_context(|| format!("failed to request access history for {mac}"))?;
+
+        json_response(response)
+            .await
+            .with_context(|| format!("failed to decode access history for {mac}"))
     }
 
     async fn is_machine_on(&self, mac: &str) -> Result<bool> {
@@ -191,6 +206,7 @@ struct App {
     client: ApiClient,
     machines: Vec<Machine>,
     statuses: HashMap<String, Option<bool>>,
+    access_history: Option<AccessHistory>,
     selected: usize,
     loading: bool,
     should_quit: bool,
@@ -205,6 +221,7 @@ impl App {
             client,
             machines: Vec::new(),
             statuses: HashMap::new(),
+            access_history: None,
             selected: 0,
             loading: true,
             should_quit: false,
@@ -248,6 +265,14 @@ impl App {
             .filter(|message| message.created_at.elapsed() < Duration::from_secs(5))
     }
 
+    async fn load_selected_history(&mut self) {
+        let Some(mac) = self.selected_machine().map(|machine| machine.mac.clone()) else {
+            self.access_history = None;
+            return;
+        };
+        self.access_history = self.client.access_history(&mac).await.ok();
+    }
+
     async fn refresh(&mut self) {
         self.loading = true;
         match self.client.list_machines().await {
@@ -257,6 +282,7 @@ impl App {
                     self.selected = self.machines.len().saturating_sub(1);
                 }
                 self.statuses = self.client.statuses_for(&self.machines).await;
+                self.load_selected_history().await;
                 self.loading = false;
                 self.last_refresh = Instant::now();
                 self.set_message("Loaded machines", MessageLevel::Success);
@@ -379,8 +405,14 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('j') | KeyCode::Down => app.next(),
-        KeyCode::Char('k') | KeyCode::Up => app.previous(),
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.next();
+            app.load_selected_history().await;
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.previous();
+            app.load_selected_history().await;
+        }
         KeyCode::Char('r') => app.refresh().await,
         KeyCode::Char('w') => app.wake_selected().await,
         KeyCode::Char('t') => app.turn_off_selected().await,
@@ -573,6 +605,13 @@ fn render_machine_detail(frame: &mut Frame, area: Rect, app: &App) {
     ];
     lines.extend(forwards);
 
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Access history (last 14 days)",
+        Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
+    )));
+    lines.extend(access_history_lines(app.access_history.as_ref()));
+
     let detail = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::default()
             .borders(Borders::ALL)
@@ -586,6 +625,92 @@ fn render_machine_detail(frame: &mut Frame, area: Rect, app: &App) {
 
 fn label_style() -> Style {
     Style::default().fg(BLUE).add_modifier(Modifier::BOLD)
+}
+
+fn access_history_lines(history: Option<&AccessHistory>) -> Vec<Line<'static>> {
+    let Some(history) = history else {
+        return vec![Line::from(Span::styled(
+            "No data",
+            Style::default().fg(SUBTEXT),
+        ))];
+    };
+
+    if history.services.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No access records",
+            Style::default().fg(SUBTEXT),
+        ))];
+    }
+
+    let mut lines = Vec::new();
+    for svc in &history.services {
+        let name = svc.name.clone().unwrap_or_else(|| "unnamed".to_string());
+        let total = svc.timestamps.len();
+        let last = svc
+            .timestamps
+            .iter()
+            .max()
+            .map(|&ts| relative_time(ts))
+            .unwrap_or_else(|| "never".to_string());
+
+        lines.push(Line::from(vec![
+            Span::styled(name, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(format!("{total}×"), Style::default().fg(GREEN)),
+            Span::raw("  "),
+            Span::styled(format!("last {last}"), Style::default().fg(SUBTEXT)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", sparkline(&svc.timestamps, 14)),
+            Style::default().fg(BLUE),
+        )));
+    }
+    lines
+}
+
+fn relative_time(ts_millis: i64) -> String {
+    let diff = (now_millis() - ts_millis).max(0) / 1000;
+    if diff < 60 {
+        format!("{diff}s ago")
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86_400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86_400)
+    }
+}
+
+// Day-bucketed counts as unicode bars; today is the rightmost cell.
+fn sparkline(timestamps: &[i64], days: usize) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    const MS_PER_DAY: i64 = 86_400_000;
+
+    let today = now_millis() / MS_PER_DAY;
+    let mut counts = vec![0u32; days];
+    for &ts in timestamps {
+        let offset = today - (ts / MS_PER_DAY);
+        if offset >= 0 && (offset as usize) < days {
+            counts[days - 1 - offset as usize] += 1;
+        }
+    }
+
+    let max = counts.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return "·".repeat(days);
+    }
+
+    counts
+        .iter()
+        .map(|&c| {
+            if c == 0 {
+                ' '
+            } else {
+                let idx = ((c as usize * (BARS.len() - 1)) / max as usize).min(BARS.len() - 1);
+                BARS[idx]
+            }
+        })
+        .collect()
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
