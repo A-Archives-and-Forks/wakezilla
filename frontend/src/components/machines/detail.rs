@@ -107,13 +107,18 @@ pub fn MachineDetailPage() -> impl IntoView {
     });
 
     let (access_history, set_access_history) = signal::<Option<AccessHistory>>(None);
+    let (history_refresh, set_history_refresh) = signal(0u32);
+    let (history_loading, set_history_loading) = signal(false);
 
     Effect::new(move || {
         let mac_val = mac();
+        history_refresh.get(); // re-run when the refresh button is pressed
+        set_history_loading.set(true);
         leptos::task::spawn_local(async move {
             if let Ok(h) = get_access_history(&mac_val).await {
                 set_access_history.set(Some(h));
             }
+            set_history_loading.set(false);
         });
     });
 
@@ -716,6 +721,14 @@ pub fn MachineDetailPage() -> impl IntoView {
                         on:click=move |_| set_by_hour.set(true)
                     >
                         "By hour"
+                    </button>
+                    <button
+                        type="button"
+                        class="btn btn-soft btn-sm"
+                        disabled=move || history_loading.get()
+                        on:click=move |_| set_history_refresh.update(|n| *n += 1)
+                    >
+                        {move || if history_loading.get() { "Refreshing..." } else { "Refresh" }}
                     </button>
                 </div>
                 <canvas id="usage-chart"></canvas>
