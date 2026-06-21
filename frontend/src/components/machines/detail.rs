@@ -13,7 +13,7 @@ use crate::models::{Machine, PortForward, UpdateMachinePayload};
 
 use crate::api::get_access_history;
 use crate::models::AccessHistory;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(inline_js = r#"
@@ -44,10 +44,32 @@ extern "C" {
     fn render_usage_chart(canvas_id: &str, labels_json: &str, datasets_json: &str);
 }
 
-// Buckets timestamps using the given chrono format (e.g. "%Y-%m-%d" for day,
-// "%Y-%m-%d %H:00" for hour). Returns (sorted bucket labels, per-service datasets
-// as JSON values with counts aligned to labels).
-fn bucket_history(history: &AccessHistory, fmt: &str) -> (Vec<String>, Vec<serde_json::Value>) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccessHistoryBucket {
+    Day,
+    Hour,
+    Week,
+}
+
+impl AccessHistoryBucket {
+    fn label(self, dt: DateTime<Utc>) -> String {
+        match self {
+            Self::Day => dt.format("%Y-%m-%d").to_string(),
+            Self::Hour => dt.format("%Y-%m-%d %H:00").to_string(),
+            Self::Week => {
+                let week = dt.iso_week();
+                format!("{}-W{:02}", week.year(), week.week())
+            }
+        }
+    }
+}
+
+// Buckets timestamps by the selected period. Returns (sorted bucket labels,
+// per-service datasets as JSON values with counts aligned to labels).
+fn bucket_history(
+    history: &AccessHistory,
+    bucket: AccessHistoryBucket,
+) -> (Vec<String>, Vec<serde_json::Value>) {
     use std::collections::{BTreeSet, HashMap};
 
     let bucket_of = |ts: i64| -> String {
@@ -55,7 +77,7 @@ fn bucket_history(history: &AccessHistory, fmt: &str) -> (Vec<String>, Vec<serde
             .timestamp_millis_opt(ts)
             .single()
             .unwrap_or_else(Utc::now);
-        dt.format(fmt).to_string()
+        bucket.label(dt)
     };
 
     let mut all_buckets: BTreeSet<String> = BTreeSet::new();
@@ -122,17 +144,11 @@ pub fn MachineDetailPage() -> impl IntoView {
         });
     });
 
-    // false = bucket by day, true = bucket by hour
-    let (by_hour, set_by_hour) = signal(false);
+    let (history_bucket, set_history_bucket) = signal(AccessHistoryBucket::Day);
 
     Effect::new(move || {
         if let Some(history) = access_history.get() {
-            let fmt = if by_hour.get() {
-                "%Y-%m-%d %H:00"
-            } else {
-                "%Y-%m-%d"
-            };
-            let (labels, datasets) = bucket_history(&history, fmt);
+            let (labels, datasets) = bucket_history(&history, history_bucket.get());
             let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".into());
             let datasets_json = serde_json::to_string(&datasets).unwrap_or_else(|_| "[]".into());
             render_usage_chart("usage-chart", &labels_json, &datasets_json);
@@ -707,18 +723,27 @@ pub fn MachineDetailPage() -> impl IntoView {
                     <button
                         type="button"
                         class=move || {
-                            if by_hour.get() { "btn btn-soft btn-sm" } else { "btn btn-primary btn-sm" }
+                            if history_bucket.get() == AccessHistoryBucket::Day { "btn btn-primary btn-sm" } else { "btn btn-soft btn-sm" }
                         }
-                        on:click=move |_| set_by_hour.set(false)
+                        on:click=move |_| set_history_bucket.set(AccessHistoryBucket::Day)
                     >
                         "By day"
                     </button>
                     <button
                         type="button"
                         class=move || {
-                            if by_hour.get() { "btn btn-primary btn-sm" } else { "btn btn-soft btn-sm" }
+                            if history_bucket.get() == AccessHistoryBucket::Week { "btn btn-primary btn-sm" } else { "btn btn-soft btn-sm" }
                         }
-                        on:click=move |_| set_by_hour.set(true)
+                        on:click=move |_| set_history_bucket.set(AccessHistoryBucket::Week)
+                    >
+                        "By week"
+                    </button>
+                    <button
+                        type="button"
+                        class=move || {
+                            if history_bucket.get() == AccessHistoryBucket::Hour { "btn btn-primary btn-sm" } else { "btn btn-soft btn-sm" }
+                        }
+                        on:click=move |_| set_history_bucket.set(AccessHistoryBucket::Hour)
                     >
                         "By hour"
                     </button>
@@ -746,5 +771,36 @@ pub fn MachineDetailPage() -> impl IntoView {
                 </pre>
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ServiceAccessHistory;
+
+    fn millis(year: i32, month: u32, day: u32) -> i64 {
+        Utc.with_ymd_and_hms(year, month, day, 0, 0, 0)
+            .single()
+            .expect("valid test date")
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn bucket_history_groups_by_iso_week() {
+        let history = AccessHistory {
+            services: vec![ServiceAccessHistory {
+                name: Some("ssh".into()),
+                local_port: 2222,
+                target_port: 22,
+                timestamps: vec![millis(2024, 1, 1), millis(2024, 1, 7), millis(2024, 1, 8)],
+            }],
+        };
+
+        let (labels, datasets) = bucket_history(&history, AccessHistoryBucket::Week);
+
+        assert_eq!(labels, vec!["2024-W01", "2024-W02"]);
+        assert_eq!(datasets[0]["label"], serde_json::json!("ssh"));
+        assert_eq!(datasets[0]["data"], serde_json::json!([2, 1]));
     }
 }
