@@ -10,7 +10,7 @@ use crate::models::{Machine, PortForward};
 #[component]
 pub fn HomePage() -> impl IntoView {
     let default_machine = Machine {
-        turn_off_port: Some(3000),
+        turn_off_port: Some(3001),
         port_forwards: vec![PortForward {
             name: None,
             local_port: 0,
