@@ -338,7 +338,7 @@ pub fn managed_modes() -> [Mode; 2] {
 /// This intentionally leaves Wakezilla config, data, and logs in place.
 pub fn uninstall(mode: Mode) -> Result<()> {
     #[cfg(target_os = "linux")]
-    let service_result = {
+    let service_result: Result<()> = {
         run_ignore_err("systemctl", &["stop", mode.service_name()]);
         run_ignore_err("systemctl", &["disable", mode.service_name()]);
         remove_file_if_exists(&descriptor_path(mode))?;
