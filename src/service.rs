@@ -1,8 +1,11 @@
 //! OS-native system service installation for the `setup` subcommand.
 
 use anyhow::{anyhow, Context, Result};
+#[cfg(target_os = "windows")]
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 #[cfg(target_os = "windows")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -97,6 +100,19 @@ pub fn firewall_rule_name(mode: Mode) -> &'static str {
         Mode::Proxy => "Wakezilla Proxy Server",
         Mode::Client => "Wakezilla Client Server",
     }
+}
+
+/// Log file name used by OS service processes when stdout/stderr are not
+/// captured by the platform service manager.
+#[allow(dead_code)]
+pub fn service_log_file_name(mode: Mode) -> String {
+    format!("{}.log", mode.service_name())
+}
+
+/// OS-standard path for Wakezilla service log files.
+#[allow(dead_code)]
+pub fn service_log_path(mode: Mode) -> PathBuf {
+    crate::config::data_path(&service_log_file_name(mode))
 }
 
 /// Create or update the OS firewall rule needed for remote access to the service.
@@ -813,17 +829,55 @@ pub fn logs(mode: Mode, follow: bool, lines: u32) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = (follow, lines);
-        println!(
-            "Log streaming is not captured for the Windows service ({}). \
-             Check the Windows Event Viewer.",
-            mode.subcommand()
-        );
+        let path = service_log_path(mode);
+        if !path.exists() {
+            anyhow::bail!(
+                "no log file at {} yet. The service may not have started or \
+                 produced any output.",
+                path.display()
+            );
+        }
+        print_last_log_lines(&path, lines)?;
+        if follow {
+            follow_log_file(&path)?;
+        }
         Ok(())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (mode, follow, lines);
         Err(anyhow!("log viewing not supported on this OS"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn print_last_log_lines(path: &Path, line_count: u32) -> Result<()> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let lines: Vec<&str> = contents.lines().collect();
+    let start = lines.len().saturating_sub(line_count as usize);
+    for line in &lines[start..] {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn follow_log_file(path: &Path) -> Result<()> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    file.seek(SeekFrom::End(0))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+
+    loop {
+        let mut chunk = String::new();
+        let bytes = file
+            .read_to_string(&mut chunk)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if bytes > 0 {
+            print!("{chunk}");
+            std::io::stdout().flush().ok();
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 }

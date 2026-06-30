@@ -246,9 +246,9 @@ proxy server runs on the same host:
    `--mode <proxy|client>` to skip the prompt. If only one is installed, it is
    selected automatically.
 
-   `logs` reads from journald on Linux and from the daemon's redirected log file
-   on macOS (`/Library/Logs/wakezilla/`). Log streaming is not captured for the
-   Windows service; use Windows Event Viewer for service logs.
+   `logs` reads from journald on Linux, from the daemon's redirected log file
+   on macOS (`/Library/Logs/wakezilla/`), and from
+   `%ProgramData%\wakezilla\wakezilla-<mode>.log` on Windows.
 
 3. **Remove auto-start services** (requires `sudo`/admin privileges):
    Linux/macOS:

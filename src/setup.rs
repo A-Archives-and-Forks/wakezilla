@@ -468,6 +468,11 @@ pub fn run_service(args: ServiceArgs) -> Result<()> {
         std::process::exit(1);
     }
 
+    #[cfg(target_os = "windows")]
+    if args.action == ServiceAction::Logs && args.mode.is_none() {
+        return run_windows_logs_for_installed_services(args.follow, args.lines.unwrap_or(50));
+    }
+
     let mode = match &args.mode {
         Some(mode_str) => {
             let mode = Mode::from_str_opt(mode_str).with_context(|| {
@@ -512,6 +517,34 @@ pub fn run_service(args: ServiceArgs) -> Result<()> {
             println!("--- logs ---");
             service::logs(mode, args.follow, args.lines.unwrap_or(50))
                 .context("failed to show logs")?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_logs_for_installed_services(follow: bool, lines: u32) -> Result<()> {
+    let installed = service::installed_modes();
+    match installed.as_slice() {
+        [] => anyhow::bail!("No Wakezilla service is installed. Run `wakezilla setup` first."),
+        [mode] => {
+            print_status(*mode);
+            println!("--- logs ---");
+            service::logs(*mode, follow, lines).context("failed to show logs")?;
+        }
+        modes if follow => {
+            let names: Vec<&str> = modes.iter().map(|m| m.subcommand()).collect();
+            anyhow::bail!(
+                "Multiple Wakezilla services are installed ({}). Use `--mode <proxy|client>` with `--follow`.",
+                names.join(", ")
+            );
+        }
+        modes => {
+            for mode in modes {
+                print_status(*mode);
+                println!("--- {} logs ---", mode.subcommand());
+                service::logs(*mode, false, lines).context("failed to show logs")?;
+            }
         }
     }
     Ok(())

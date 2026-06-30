@@ -57,6 +57,18 @@ fn firewall_rule_names_are_stable_per_mode() {
 }
 
 #[test]
+fn service_log_file_names_are_stable_per_mode() {
+    assert_eq!(
+        service::service_log_file_name(Mode::Proxy),
+        "wakezilla-proxy.log"
+    );
+    assert_eq!(
+        service::service_log_file_name(Mode::Client),
+        "wakezilla-client.log"
+    );
+}
+
+#[test]
 fn systemd_unit_contains_exec_start_with_exe_and_subcommand() {
     let unit = service::generate_systemd_unit(Mode::Proxy, "/usr/local/bin/wakezilla");
     assert!(unit.contains("ExecStart=/usr/local/bin/wakezilla --no-update-check proxy-server"));
