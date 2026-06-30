@@ -250,6 +250,24 @@ proxy server runs on the same host:
    on macOS (`/Library/Logs/wakezilla/`). Log streaming is not captured for the
    Windows service; use Windows Event Viewer for service logs.
 
+3. **Remove auto-start services** (requires `sudo`/admin privileges):
+   Linux/macOS:
+
+   ```bash
+   sudo wakezilla uninstall
+   ```
+
+   Windows PowerShell (run as Administrator):
+
+   ```powershell
+   wakezilla uninstall
+   ```
+
+   Removes all Wakezilla services installed by `setup` (`proxy-server` and
+   `client-server` when present). On Windows, it also removes the Windows
+   Firewall rules created by setup. Configuration files, data files, and logs
+   are left in place.
+
 
 ## Usage
 

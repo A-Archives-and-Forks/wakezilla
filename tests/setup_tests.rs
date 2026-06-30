@@ -16,6 +16,11 @@ fn mode_exposes_subcommand_and_service_name() {
 }
 
 #[test]
+fn managed_modes_include_proxy_and_client() {
+    assert_eq!(service::managed_modes(), [Mode::Proxy, Mode::Client]);
+}
+
+#[test]
 fn service_program_args_disable_update_checks() {
     assert_eq!(
         service::service_program_args(Mode::Proxy),

@@ -141,6 +141,25 @@ pub fn configure_firewall(mode: Mode, exe: &str, port: u16) -> Result<()> {
     }
 }
 
+/// Remove the OS firewall rule managed by Wakezilla setup.
+pub fn remove_firewall(mode: Mode) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let rule_name = firewall_rule_name(mode);
+        let name_arg = format!("name={rule_name}");
+
+        run_ignore_err(
+            "netsh",
+            &["advfirewall", "firewall", "delete", "rule", &name_arg],
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = mode;
+    }
+    Ok(())
+}
+
 /// Render a systemd unit file. `exe` is the absolute path to the wakezilla binary.
 // Platform-conditional: used by the systemd (Linux) / launchd (macOS) / Windows install paths; some are cfg'd out per-OS.
 #[allow(dead_code)]
@@ -309,6 +328,63 @@ pub fn install(mode: Mode, exe: &str) -> Result<()> {
     }
 }
 
+/// Modes that can be installed and removed by the setup/uninstall workflow.
+pub fn managed_modes() -> [Mode; 2] {
+    [Mode::Proxy, Mode::Client]
+}
+
+/// Remove the system service/autostart configuration for one Wakezilla mode.
+///
+/// This intentionally leaves Wakezilla config, data, and logs in place.
+pub fn uninstall(mode: Mode) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let service_result = {
+        run_ignore_err("systemctl", &["stop", mode.service_name()]);
+        run_ignore_err("systemctl", &["disable", mode.service_name()]);
+        remove_file_if_exists(&descriptor_path(mode))?;
+        run("systemctl", &["daemon-reload"])?;
+        run_ignore_err("systemctl", &["reset-failed", mode.service_name()]);
+        Ok(())
+    };
+    #[cfg(target_os = "macos")]
+    let service_result = {
+        let path = descriptor_path(mode);
+        run_ignore_err("launchctl", &["unload", &path]);
+        remove_file_if_exists(&path)
+    };
+    #[cfg(target_os = "windows")]
+    let service_result = uninstall_windows_service(mode);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let service_result = Err(anyhow!("service uninstall not supported on this OS"));
+
+    let firewall_result = remove_firewall(mode);
+    service_result?;
+    firewall_result?;
+    Ok(())
+}
+
+/// Remove all Wakezilla services installed by setup.
+pub fn uninstall_all() -> Result<Vec<Mode>> {
+    let mut removed = Vec::new();
+    for mode in managed_modes() {
+        let was_installed = is_installed(mode);
+        uninstall(mode).with_context(|| format!("failed to uninstall {}", mode.subcommand()))?;
+        if was_installed {
+            removed.push(mode);
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_file_if_exists(path: &str) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("removing {path}")),
+    }
+}
+
 /// Run a command, returning an error if it exits non-zero.
 #[allow(dead_code)]
 fn run(cmd: &str, args: &[&str]) -> Result<()> {
@@ -371,7 +447,7 @@ pub fn is_installed(mode: Mode) -> bool {
 
 /// The set of modes currently installed as services on this host.
 pub fn installed_modes() -> Vec<Mode> {
-    [Mode::Proxy, Mode::Client]
+    managed_modes()
         .into_iter()
         .filter(|m| is_installed(*m))
         .collect()
@@ -535,6 +611,15 @@ fn install_windows_service(mode: Mode, exe: &str) -> Result<()> {
         ))
         .ok();
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_windows_service(mode: Mode) -> Result<()> {
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let service_manager =
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    delete_windows_service_if_exists(&service_manager, mode)
 }
 
 #[cfg(target_os = "windows")]

@@ -70,6 +70,12 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Commands::Uninstall => {
+            if let Err(e) = setup::run_uninstall() {
+                error!("Uninstall error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Commands::Service(args) => {
             if let Err(e) = setup::run_service(args) {
                 error!("Service error: {}", e);

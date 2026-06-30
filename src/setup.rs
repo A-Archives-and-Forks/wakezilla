@@ -225,6 +225,29 @@ pub fn run(args: SetupArgs) -> Result<()> {
     Ok(())
 }
 
+/// Entry point for the `uninstall` subcommand. Removes Wakezilla services and
+/// autostart hooks created by `setup`, but preserves config and data files.
+pub fn run_uninstall() -> Result<()> {
+    if !service::is_elevated() {
+        eprintln!(
+            "wakezilla uninstall must run with administrator privileges.\n\
+             Re-run with: sudo wakezilla uninstall   (Linux/macOS)  or  an elevated shell (Windows)."
+        );
+        std::process::exit(1);
+    }
+
+    let removed = service::uninstall_all().context("failed to uninstall Wakezilla services")?;
+    if removed.is_empty() {
+        println!("No Wakezilla service was installed.");
+    } else {
+        for mode in removed {
+            println!("Removed {} service.", mode.subcommand());
+        }
+    }
+    println!("Wakezilla configuration, data, and logs were left in place.");
+    Ok(())
+}
+
 #[derive(PartialEq)]
 enum Step {
     ModeSelect,

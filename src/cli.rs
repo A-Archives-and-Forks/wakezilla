@@ -121,6 +121,8 @@ pub enum Commands {
     Tui(TuiArgs),
     /// Configure this host to auto-start a Wakezilla server as a system service
     Setup(SetupArgs),
+    /// Remove Wakezilla services installed by setup
+    Uninstall,
     /// Control an installed Wakezilla service (start/stop/restart/status/logs)
     Service(ServiceArgs),
     /// Download and install a Wakezilla release
@@ -137,7 +139,10 @@ pub fn should_check_for_updates(cli: &Cli) -> bool {
 
     !matches!(
         cli.command,
-        Commands::Setup(_) | Commands::Update(_) | Commands::WindowsService(_)
+        Commands::Setup(_)
+            | Commands::Uninstall
+            | Commands::Update(_)
+            | Commands::WindowsService(_)
     )
 }
 
@@ -250,6 +255,10 @@ mod cli_tests {
         let setup_cli = Cli::try_parse_from(["wakezilla", "setup"]).expect("setup parses");
         assert!(!should_check_for_updates(&setup_cli));
 
+        let uninstall_cli =
+            Cli::try_parse_from(["wakezilla", "uninstall"]).expect("uninstall parses");
+        assert!(!should_check_for_updates(&uninstall_cli));
+
         let update_cli = Cli::try_parse_from(["wakezilla", "update"]).expect("update parses");
         assert!(!should_check_for_updates(&update_cli));
 
@@ -296,6 +305,16 @@ mod cli_tests {
                 assert!(args.port.is_none());
             }
             other => panic!("expected Setup command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_uninstall_subcommand() {
+        let cli = Cli::try_parse_from(["wakezilla", "uninstall"]).expect("uninstall parses");
+
+        match cli.command {
+            Commands::Uninstall => {}
+            other => panic!("expected Uninstall command, got {other:?}"),
         }
     }
 
