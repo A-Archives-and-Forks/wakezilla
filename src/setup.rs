@@ -63,6 +63,12 @@ pub fn build_config(mode: Mode, port: u16) -> Config {
         Mode::Proxy => cfg.server.proxy_port = port,
         Mode::Client => cfg.server.client_port = port,
     }
+    cfg.storage.machines_db_path = config::data_path(config::DEFAULT_MACHINES_DB_PATH)
+        .to_string_lossy()
+        .into_owned();
+    cfg.storage.access_history_path = config::data_path(config::DEFAULT_ACCESS_HISTORY_PATH)
+        .to_string_lossy()
+        .into_owned();
     cfg
 }
 
@@ -84,6 +90,16 @@ pub fn apply(mode: Mode, port: u16) -> Result<std::path::PathBuf> {
     match mode {
         Mode::Proxy => cfg.server.proxy_port = port,
         Mode::Client => cfg.server.client_port = port,
+    }
+    if cfg.storage.machines_db_path == config::DEFAULT_MACHINES_DB_PATH {
+        cfg.storage.machines_db_path = config::data_path(config::DEFAULT_MACHINES_DB_PATH)
+            .to_string_lossy()
+            .into_owned();
+    }
+    if cfg.storage.access_history_path == config::DEFAULT_ACCESS_HISTORY_PATH {
+        cfg.storage.access_history_path = config::data_path(config::DEFAULT_ACCESS_HISTORY_PATH)
+            .to_string_lossy()
+            .into_owned();
     }
     cfg.save_to(&path)
         .with_context(|| format!("failed to write config to {}", path.display()))?;

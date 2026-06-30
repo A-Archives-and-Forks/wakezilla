@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
-const DEFAULT_HISTORY_PATH: &str = "access_history.json";
+use crate::config::{Config, DEFAULT_ACCESS_HISTORY_PATH};
 
 pub fn service_key(mac: &str, local_port: u16) -> String {
     format!("{}-{}", mac, local_port)
@@ -27,7 +27,7 @@ pub fn access_log_path() -> PathBuf {
     } else {
         env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join(DEFAULT_HISTORY_PATH)
+            .join(DEFAULT_ACCESS_HISTORY_PATH)
     };
     if path.is_absolute() {
         path
@@ -44,13 +44,21 @@ pub struct AccessLog {
     inner: HashMap<String, VecDeque<i64>>,
     #[serde(skip)]
     max_records: usize,
+    #[serde(skip)]
+    path: Option<PathBuf>,
 }
 
 impl AccessLog {
+    #[allow(dead_code)]
     pub fn new(max_records: usize) -> Self {
+        Self::new_with_path(max_records, None)
+    }
+
+    fn new_with_path(max_records: usize, path: Option<PathBuf>) -> Self {
         Self {
             inner: HashMap::new(),
             max_records,
+            path,
         }
     }
 
@@ -72,26 +80,56 @@ impl AccessLog {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
     pub fn load(max_records: usize) -> Self {
         let path = access_log_path();
+        Self::load_from_path(max_records, path)
+    }
+
+    pub fn load_with_config(max_records: usize, config: &Config) -> Self {
+        let path = absolute_path(&config.storage.access_history_path);
+        Self::load_from_path(max_records, path)
+    }
+
+    pub fn load_from_path(max_records: usize, path: PathBuf) -> Self {
         let mut log = match fs::read_to_string(&path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
                 tracing::warn!("Failed to parse access history at {}: {e}", path.display());
-                Self::new(max_records)
+                Self::new_with_path(max_records, Some(path.clone()))
             }),
-            Err(_) => Self::new(max_records),
+            Err(_) => Self::new_with_path(max_records, Some(path.clone())),
         };
         log.max_records = max_records;
+        log.path = Some(path);
         log
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = access_log_path();
+        let path = self.path.clone().unwrap_or_else(access_log_path);
         let data = serde_json::to_string(self).context("Failed to serialize access history")?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create access history directory {}",
+                    parent.display()
+                )
+            })?;
+        }
         fs::write(&path, data)
             .with_context(|| format!("Failed to write access history to {}", path.display()))?;
         debug!("Saved access history to {}", path.display());
         Ok(())
+    }
+}
+
+fn absolute_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     }
 }
 

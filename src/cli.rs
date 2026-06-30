@@ -90,6 +90,13 @@ pub struct ClientServerArgs {
     pub port: u16,
 }
 
+#[derive(Parser, Debug)]
+#[command(hide = true)]
+pub struct WindowsServiceArgs {
+    /// Service mode to run: proxy or client.
+    pub mode: String,
+}
+
 /// Simple Wake-on-LAN sender + post-WOL reachability check.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -118,6 +125,9 @@ pub enum Commands {
     Service(ServiceArgs),
     /// Download and install a Wakezilla release
     Update(UpdateArgs),
+    /// Internal Windows Service Manager entrypoint.
+    #[command(name = "windows-service", hide = true)]
+    WindowsService(WindowsServiceArgs),
 }
 
 pub fn should_check_for_updates(cli: &Cli) -> bool {
@@ -125,7 +135,10 @@ pub fn should_check_for_updates(cli: &Cli) -> bool {
         return false;
     }
 
-    !matches!(cli.command, Commands::Setup(_) | Commands::Update(_))
+    !matches!(
+        cli.command,
+        Commands::Setup(_) | Commands::Update(_) | Commands::WindowsService(_)
+    )
 }
 
 fn send_broadcast_addr(args: &SendArgs, config: &config::Config) -> Ipv4Addr {
@@ -215,6 +228,20 @@ mod cli_tests {
         match cli.command {
             Commands::Update(args) => assert_eq!(args.version.as_deref(), Some("0.2.3")),
             other => panic!("expected Update command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_hidden_windows_service_entrypoint() {
+        let cli =
+            Cli::try_parse_from(["wakezilla", "--no-update-check", "windows-service", "proxy"])
+                .expect("windows service entrypoint parses");
+
+        assert!(cli.no_update_check);
+        assert!(!should_check_for_updates(&cli));
+        match cli.command {
+            Commands::WindowsService(args) => assert_eq!(args.mode, "proxy"),
+            other => panic!("expected WindowsService command, got {other:?}"),
         }
     }
 

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{error, info, instrument};
 
@@ -81,6 +81,11 @@ async fn main() -> Result<()> {
                 version: args.version,
             })
             .await?;
+        }
+        Commands::WindowsService(args) => {
+            let mode = service::Mode::from_str_opt(&args.mode)
+                .with_context(|| format!("invalid Windows service mode: {}", args.mode))?;
+            service::run_windows_service(mode)?;
         }
     }
 

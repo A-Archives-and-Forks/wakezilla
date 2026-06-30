@@ -93,8 +93,15 @@ async fn spa_fallback(req: Request<Body>) -> Response<Body> {
 }
 
 pub async fn start(config: crate::config::Config) -> Result<()> {
+    start_with_shutdown(config, shutdown_signal()).await
+}
+
+pub async fn start_with_shutdown(
+    config: crate::config::Config,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     let port = config.server.proxy_port;
-    let initial_machines = match web::load_machines() {
+    let initial_machines = match web::load_machines_with_config(&config) {
         Ok(machines) => machines,
         Err(err) => {
             error!("Failed to load machines from storage: {err}");
@@ -103,15 +110,14 @@ pub async fn start(config: crate::config::Config) -> Result<()> {
     };
 
     let max_access_records = config.storage.max_access_records;
+    let access_log = crate::access_log::AccessLog::load_with_config(max_access_records, &config);
     let state = AppState {
         machines: Arc::new(RwLock::new(initial_machines.clone())),
         proxies: Arc::new(RwLock::new(HashMap::new())),
         config: Arc::new(config),
         turn_off_limiter: Arc::new(forward::TurnOffLimiter::new()),
         monitor_handle: Arc::new(std::sync::Mutex::new(None)),
-        access_log: Arc::new(RwLock::new(crate::access_log::AccessLog::load(
-            max_access_records,
-        ))),
+        access_log: Arc::new(RwLock::new(access_log)),
     };
 
     // Start global monitor
@@ -149,7 +155,7 @@ pub async fn start(config: crate::config::Config) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await?;
 
     // Persist access history on shutdown so the last interval isn't lost.
@@ -346,7 +352,7 @@ async fn add_machine_api(
     web::start_proxy_if_configured(&new_machine, &state);
     machines.push(new_machine);
 
-    if let Err(e) = web::save_machines(&machines) {
+    if let Err(e) = web::save_machines_with_config(&machines, &state.config) {
         error!("Error saving machines: {}", e);
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -469,7 +475,7 @@ async fn update_machine_api(
     };
 
     machines.push(new_machine.clone());
-    if let Err(e) = web::save_machines(&machines) {
+    if let Err(e) = web::save_machines_with_config(&machines, &state.config) {
         error!("Error saving machines: {}", e);
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -529,7 +535,7 @@ async fn delete_machine_api(
 
     machines.retain(|m| m.mac != payload.mac);
 
-    if let Err(e) = web::save_machines(&machines) {
+    if let Err(e) = web::save_machines_with_config(&machines, &state.config) {
         error!("Error saving machines: {}", e);
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,

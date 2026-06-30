@@ -23,7 +23,33 @@
 
 ## Installation
 
-### Install with script
+### Install on Windows
+
+Run in PowerShell:
+
+```powershell
+irm https://wakezilla.dev/install.ps1 | iex
+```
+
+To pin a version:
+
+```powershell
+iex "& { $(irm https://wakezilla.dev/install.ps1) } -Version 0.2.4"
+```
+
+By default this installs `wakezilla.exe` to
+`%LOCALAPPDATA%\Programs\wakezilla\bin` and adds that directory to your user
+PATH. Open a new terminal after installation. Override the destination with
+`-InstallDir`:
+
+```powershell
+iex "& { $(irm https://wakezilla.dev/install.ps1) } -InstallDir $env:USERPROFILE\bin"
+```
+
+The Windows installer downloads prebuilt binaries from GitHub Releases and
+validates them against `SHA256SUMS`.
+
+### Install on Linux/macOS with script
 
 ```bash
 curl -fsSL https://wakezilla.dev/install.sh | sh
@@ -163,8 +189,16 @@ proxy server runs on the same host:
 ### Set up auto-start (system service)
 
 1. **Run the interactive setup wizard** (requires `sudo`/admin privileges):
+   Linux/macOS:
+
    ```bash
-    sudo wakezilla setup
+   sudo wakezilla setup
+   ```
+
+   Windows PowerShell (run as Administrator):
+
+   ```powershell
+   wakezilla setup
    ```
 
    This interactively configures the host to auto-start the proxy or client
@@ -184,13 +218,25 @@ proxy server runs on the same host:
    manually when you want to upgrade the installed binary.
 
 2. **Control an installed service** (requires `sudo`/admin privileges):
+   Linux/macOS:
+
    ```bash
-    sudo wakezilla service start
-    sudo wakezilla service stop
-    sudo wakezilla service restart
-    sudo wakezilla service status            # is it running?
-    sudo wakezilla service logs              # status + recent logs
-    sudo wakezilla service logs -f -n 100    # follow, last 100 lines
+   sudo wakezilla service start
+   sudo wakezilla service stop
+   sudo wakezilla service restart
+   sudo wakezilla service status            # is it running?
+   sudo wakezilla service logs              # status + recent logs
+   sudo wakezilla service logs -f -n 100    # follow, last 100 lines
+   ```
+
+   Windows PowerShell (run as Administrator):
+
+   ```powershell
+   wakezilla service start
+   wakezilla service stop
+   wakezilla service restart
+   wakezilla service status
+   wakezilla service logs
    ```
 
    Controls a service previously installed with `setup`. If both the proxy and
@@ -200,7 +246,7 @@ proxy server runs on the same host:
 
    `logs` reads from journald on Linux and from the daemon's redirected log file
    on macOS (`/Library/Logs/wakezilla/`). Log streaming is not captured for the
-   Windows service.
+   Windows service; use Windows Event Viewer for service logs.
 
 
 ## Usage
@@ -329,7 +375,12 @@ this will initialize the backend in watch mode on port 3000
    - Verify the machine is reachable after WOL
    - Ensure no firewall is blocking the connection
 
-3. **Automatic shutdown not working**:
+3. **Network scanner not finding devices**:
+   - Run Wakezilla with administrator privileges on Windows, or `sudo` on Linux/macOS
+   - Check Windows Defender Firewall or third-party firewall rules
+   - Verify the selected network interface is the LAN interface you expect
+
+4. **Automatic shutdown not working**:
    - Verify the turn-off port is configured correctly
    - Ensure the client is running on the target machine
    - Check that the client can receive HTTP requests from the server

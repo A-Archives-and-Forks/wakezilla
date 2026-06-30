@@ -31,32 +31,33 @@ where
 }
 
 use crate::access_log::AccessLog;
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::forward;
 
-const DEFAULT_DB_PATH: &str = "machines.json";
-
-fn machines_db_path() -> PathBuf {
-    // First check for environment variable override
-    let path = if let Ok(path) = std::env::var("WAKEZILLA__STORAGE__MACHINES_DB_PATH") {
-        PathBuf::from(path)
-    } else {
-        // Use current working directory as default (not executable directory)
-        // This ensures the file is saved/loaded from where the user runs the command
-        env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(DEFAULT_DB_PATH)
-    };
-
-    // Always resolve to an absolute path so logs show the full location instead
-    // of a bare "machines.json" relative to the (often unclear) working dir.
+fn absolute_storage_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
     if path.is_absolute() {
-        path
+        path.to_path_buf()
     } else {
         env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     }
+}
+
+#[allow(dead_code)]
+fn machines_db_path() -> PathBuf {
+    let path = std::env::var("WAKEZILLA__STORAGE__MACHINES_DB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(config::DEFAULT_MACHINES_DB_PATH));
+
+    // Always resolve to an absolute path so logs show the full location instead
+    // of a bare "machines.json" relative to the (often unclear) working dir.
+    absolute_storage_path(path)
+}
+
+fn machines_db_path_from_config(config: &Config) -> PathBuf {
+    absolute_storage_path(&config.storage.machines_db_path)
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -176,8 +177,13 @@ pub fn api_machine_to_internal(api: &wakezilla_common::Machine) -> Result<Machin
 }
 
 /// Load machines using the configured database path
+#[allow(dead_code)]
 pub fn load_machines() -> Result<Vec<Machine>> {
     load_machines_from_path(machines_db_path())
+}
+
+pub fn load_machines_with_config(config: &Config) -> Result<Vec<Machine>> {
+    load_machines_from_path(machines_db_path_from_config(config))
 }
 
 /// Load machines from a specific path
@@ -201,11 +207,23 @@ pub fn load_machines_from_path<P: AsRef<Path>>(path: P) -> Result<Vec<Machine>> 
     Ok(machines)
 }
 
+#[allow(dead_code)]
 pub fn save_machines(machines: &[Machine]) -> Result<()> {
+    save_machines_to_path(machines, machines_db_path())
+}
+
+pub fn save_machines_with_config(machines: &[Machine], config: &Config) -> Result<()> {
+    save_machines_to_path(machines, machines_db_path_from_config(config))
+}
+
+fn save_machines_to_path(machines: &[Machine], path: PathBuf) -> Result<()> {
     tracing::debug!("Saving machines {:?}", machines);
     let data =
         serde_json::to_string_pretty(machines).context("Failed to serialize machines data")?;
-    let path = machines_db_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create storage directory {}", parent.display()))?;
+    }
     info!("Saving machines database to {}", path.display());
     fs::write(&path, data)
         .with_context(|| format!("Failed to write machines database to {}", path.display()))

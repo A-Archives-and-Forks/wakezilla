@@ -28,6 +28,18 @@ fn service_program_args_disable_update_checks() {
 }
 
 #[test]
+fn windows_service_program_args_use_hidden_entrypoint() {
+    assert_eq!(
+        service::windows_service_program_args(Mode::Proxy),
+        ["--no-update-check", "windows-service", "proxy"]
+    );
+    assert_eq!(
+        service::windows_service_program_args(Mode::Client),
+        ["--no-update-check", "windows-service", "client"]
+    );
+}
+
+#[test]
 fn systemd_unit_contains_exec_start_with_exe_and_subcommand() {
     let unit = service::generate_systemd_unit(Mode::Proxy, "/usr/local/bin/wakezilla");
     assert!(unit.contains("ExecStart=/usr/local/bin/wakezilla --no-update-check proxy-server"));
