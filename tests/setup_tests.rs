@@ -40,6 +40,18 @@ fn windows_service_program_args_use_hidden_entrypoint() {
 }
 
 #[test]
+fn firewall_rule_names_are_stable_per_mode() {
+    assert_eq!(
+        service::firewall_rule_name(Mode::Proxy),
+        "Wakezilla Proxy Server"
+    );
+    assert_eq!(
+        service::firewall_rule_name(Mode::Client),
+        "Wakezilla Client Server"
+    );
+}
+
+#[test]
 fn systemd_unit_contains_exec_start_with_exe_and_subcommand() {
     let unit = service::generate_systemd_unit(Mode::Proxy, "/usr/local/bin/wakezilla");
     assert!(unit.contains("ExecStart=/usr/local/bin/wakezilla --no-update-check proxy-server"));

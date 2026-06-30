@@ -205,7 +205,9 @@ proxy server runs on the same host:
    server as a system service (systemd on Linux, launchd on macOS, or the
    Windows Service Manager). It writes an OS-standard config file, installs and
    enables the service, then validates that the service is reachable after
-   install. Pass `--mode <proxy|client>` and `--port <PORT>` to skip the prompts.
+   install. On Windows, it also creates or updates an inbound Windows Firewall
+   rule for the configured TCP port. Pass `--mode <proxy|client>` and
+   `--port <PORT>` to skip the prompts.
 
    If a configuration or service already exists, `setup` shows a summary of the
    current config (and installed services) and asks for confirmation before

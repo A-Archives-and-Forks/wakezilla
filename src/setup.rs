@@ -105,6 +105,7 @@ pub fn apply(mode: Mode, port: u16) -> Result<std::path::PathBuf> {
         .with_context(|| format!("failed to write config to {}", path.display()))?;
 
     service::install(mode, &exe).context("failed to install system service")?;
+    service::configure_firewall(mode, &exe, port).context("failed to configure firewall rule")?;
     service::validate(port, 10).context("service installed but did not become reachable")?;
 
     Ok(path)

@@ -90,6 +90,57 @@ pub fn windows_service_program_args(mode: Mode) -> [&'static str; 3] {
     ["--no-update-check", "windows-service", mode.service_arg()]
 }
 
+/// Windows Firewall rule name used for the inbound service port.
+#[allow(dead_code)]
+pub fn firewall_rule_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Proxy => "Wakezilla Proxy Server",
+        Mode::Client => "Wakezilla Client Server",
+    }
+}
+
+/// Create or update the OS firewall rule needed for remote access to the service.
+///
+/// On Windows this installs an inbound TCP allow rule for the configured port
+/// and executable. Other platforms currently do not need setup-managed firewall
+/// configuration, so this is a no-op.
+pub fn configure_firewall(mode: Mode, exe: &str, port: u16) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let rule_name = firewall_rule_name(mode);
+        let name_arg = format!("name={rule_name}");
+        let program_arg = format!("program={exe}");
+        let port_arg = format!("localport={port}");
+
+        run_ignore_err(
+            "netsh",
+            &["advfirewall", "firewall", "delete", "rule", &name_arg],
+        );
+        run(
+            "netsh",
+            &[
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &name_arg,
+                "dir=in",
+                "action=allow",
+                &program_arg,
+                "enable=yes",
+                "profile=any",
+                "protocol=TCP",
+                &port_arg,
+            ],
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (mode, exe, port);
+        Ok(())
+    }
+}
+
 /// Render a systemd unit file. `exe` is the absolute path to the wakezilla binary.
 // Platform-conditional: used by the systemd (Linux) / launchd (macOS) / Windows install paths; some are cfg'd out per-OS.
 #[allow(dead_code)]
