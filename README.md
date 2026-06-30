@@ -376,8 +376,10 @@ this will initialize the backend in watch mode on port 3000
    - Ensure no firewall is blocking the connection
 
 3. **Network scanner not finding devices**:
-   - Run Wakezilla with administrator privileges on Windows, or `sudo` on Linux/macOS
-   - Check Windows Defender Firewall or third-party firewall rules
+   - Windows release builds do not currently include ARP network scanning because
+     the upstream `pnet` Windows backend requires the external Npcap/WinPcap
+     `Packet.lib` SDK at link time
+   - On Linux/macOS, run Wakezilla with `sudo` if raw socket permissions are denied
    - Verify the selected network interface is the LAN interface you expect
 
 4. **Automatic shutdown not working**:

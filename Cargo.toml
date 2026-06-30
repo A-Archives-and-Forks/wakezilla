@@ -54,7 +54,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-futures = { version = "0.2", features = ["tokio"] }
 ipnetwork = "0.20.0"
-pnet = "0.34.0"
 dns-lookup = "2.0.4"
 futures-util = "0.3"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
@@ -79,6 +78,9 @@ tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.1"
+
+[target.'cfg(not(windows))'.dependencies]
+pnet = "0.34.0"
 
 [dev-dependencies]
 http-body-util = "0.1"
