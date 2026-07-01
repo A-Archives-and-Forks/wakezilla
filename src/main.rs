@@ -18,6 +18,7 @@ mod setup;
 mod system;
 #[cfg(test)]
 mod test_support;
+mod tray;
 mod tui;
 mod update;
 mod web;
@@ -45,6 +46,9 @@ async fn main() -> Result<()> {
                 api_base_url: args.api_url,
             })
             .await?;
+        }
+        Commands::Tray(_) => {
+            tray::run()?;
         }
         Commands::Send(args) => {
             let config = config::Config::load();
