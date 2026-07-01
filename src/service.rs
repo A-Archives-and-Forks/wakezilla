@@ -2,6 +2,8 @@
 
 use anyhow::{anyhow, Context, Result};
 #[cfg(target_os = "windows")]
+use std::collections::VecDeque;
+#[cfg(target_os = "windows")]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 #[cfg(target_os = "windows")]
@@ -9,6 +11,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 
 /// Which Wakezilla server the service runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,16 +168,24 @@ pub fn remove_firewall(mode: Mode) -> Result<()> {
         let rule_name = firewall_rule_name(mode);
         let name_arg = format!("name={rule_name}");
 
-        run_ignore_err(
+        let output = run_output(
             "netsh",
             &["advfirewall", "firewall", "delete", "rule", &name_arg],
+        )?;
+        if output.status.success() || netsh_rule_not_found(&output) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "netsh failed to remove firewall rule '{}': {}",
+            rule_name,
+            command_output_text(&output)
         );
     }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = mode;
+        Ok(())
     }
-    Ok(())
 }
 
 /// Render a systemd unit file. `exe` is the absolute path to the wakezilla binary.
@@ -421,6 +433,35 @@ fn run_ignore_err(cmd: &str, args: &[&str]) {
     let _ = Command::new(cmd).args(args).status();
 }
 
+/// Run a command and capture stdout/stderr for callers that need to distinguish
+/// expected non-zero exits from real failures.
+#[cfg(target_os = "windows")]
+fn run_output(cmd: &str, args: &[&str]) -> Result<std::process::Output> {
+    Command::new(cmd)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run {cmd}"))
+}
+
+#[cfg(target_os = "windows")]
+fn command_output_text(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = format!("{stdout}{stderr}");
+    let text = text.trim();
+    if text.is_empty() {
+        output.status.to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn netsh_rule_not_found(output: &std::process::Output) -> bool {
+    let text = command_output_text(output).to_ascii_lowercase();
+    text.contains("no rules match") || text.contains("nenhuma regra")
+}
+
 /// Run a command inheriting the terminal's stdio (for streaming logs). Returns an
 /// error only if the command could not be spawned; a non-zero exit (e.g. Ctrl-C
 /// out of a `tail -f` / `journalctl -f`) is treated as a normal end of streaming.
@@ -526,10 +567,7 @@ pub fn restart(mode: Mode) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        if is_running(mode) {
-            let _ = stop(mode);
-            std::thread::sleep(Duration::from_secs(1));
-        }
+        stop_windows_service_for_restart(mode, Duration::from_secs(15))?;
         start(mode)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -627,6 +665,37 @@ fn install_windows_service(mode: Mode, exe: &str) -> Result<()> {
         ))
         .ok();
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_service_for_restart(mode: Mode, timeout: Duration) -> Result<()> {
+    use windows_service::service::{ServiceAccess, ServiceState};
+
+    let service = open_windows_service(mode, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)?;
+    let status = service.query_status()?;
+    if status.current_state == ServiceState::Stopped {
+        return Ok(());
+    }
+    if status.current_state != ServiceState::StopPending {
+        service.stop()?;
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = service.query_status()?;
+        if status.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "{} service did not stop within {:?}; current state: {:?}",
+                mode.subcommand(),
+                timeout,
+                status.current_state
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -852,14 +921,51 @@ pub fn logs(mode: Mode, follow: bool, lines: u32) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn print_last_log_lines(path: &Path, line_count: u32) -> Result<()> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    if line_count == 0 {
+        return Ok(());
+    }
+
+    let tail = read_tail_for_lines(path, line_count)?;
+    let contents = String::from_utf8_lossy(&tail);
     let lines: Vec<&str> = contents.lines().collect();
     let start = lines.len().saturating_sub(line_count as usize);
     for line in &lines[start..] {
         println!("{line}");
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn read_tail_for_lines(path: &Path, line_count: u32) -> Result<Vec<u8>> {
+    const CHUNK_SIZE: u64 = 8192;
+
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut remaining = file
+        .seek(SeekFrom::End(0))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+    let mut newline_count = 0usize;
+    let mut chunks = VecDeque::new();
+
+    while remaining > 0 && newline_count <= line_count as usize {
+        let read_len = remaining.min(CHUNK_SIZE);
+        remaining -= read_len;
+        file.seek(SeekFrom::Start(remaining))
+            .with_context(|| format!("failed to seek {}", path.display()))?;
+
+        let mut chunk = vec![0; read_len as usize];
+        file.read_exact(&mut chunk)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
+        chunks.push_front(chunk);
+    }
+
+    let total_len = chunks.iter().map(Vec::len).sum();
+    let mut tail = Vec::with_capacity(total_len);
+    for chunk in chunks {
+        tail.extend(chunk);
+    }
+    Ok(tail)
 }
 
 #[cfg(target_os = "windows")]

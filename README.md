@@ -25,6 +25,9 @@
 
 ### Install on Windows
 
+The PowerShell installer currently supports x64 Windows only and requires
+`tar` to be available in PowerShell.
+
 Run in PowerShell:
 
 ```powershell
