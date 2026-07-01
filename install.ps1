@@ -11,6 +11,7 @@ $ProgressPreference = "SilentlyContinue"
 
 $BinName = "wakezilla"
 $ExeName = "wakezilla.exe"
+$WakezillaServiceNames = @("wakezilla-proxy", "wakezilla-client")
 
 function Write-Info {
     param([string]$Message)
@@ -243,6 +244,53 @@ function Expand-WakezillaArchive {
     $binary.FullName
 }
 
+function Restart-WakezillaServicesAfterInstall {
+    param([string[]]$ServiceNames)
+
+    foreach ($serviceName in $ServiceNames) {
+        try {
+            Write-Info "starting Windows service $serviceName..."
+            Start-Service -Name $serviceName -ErrorAction Stop
+        }
+        catch {
+            Write-Warn "installed $BinName, but failed to restart Windows service '$serviceName': $($_.Exception.Message)"
+        }
+    }
+}
+
+function Stop-WakezillaServicesForInstall {
+    param([string[]]$ServiceNames = $WakezillaServiceNames)
+
+    $restartServices = @()
+    foreach ($serviceName in $ServiceNames) {
+        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if (-not $service) {
+            continue
+        }
+
+        $wasRunning = $service.Status -eq "Running"
+        if ($service.Status -ne "Stopped") {
+            try {
+                Write-Info "stopping Windows service $serviceName before updating $ExeName..."
+                Stop-Service -Name $serviceName -Force -ErrorAction Stop
+                $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(30))
+            }
+            catch {
+                if ($restartServices.Count -gt 0) {
+                    Restart-WakezillaServicesAfterInstall -ServiceNames $restartServices
+                }
+                Stop-Install "service_stop" "failed to stop Windows service '$serviceName' before updating $ExeName. Re-run the installer from an elevated PowerShell, or stop Wakezilla services manually and retry. Details: $($_.Exception.Message)"
+            }
+        }
+
+        if ($wasRunning) {
+            $restartServices += $serviceName
+        }
+    }
+
+    $restartServices
+}
+
 function Install-WakezillaBinary {
     param(
         [string]$Source,
@@ -257,8 +305,17 @@ function Install-WakezillaBinary {
         Remove-Item -Force $temporary
     }
 
-    Copy-Item -Force $Source $temporary
-    Move-Item -Force $temporary $destination
+    try {
+        Copy-Item -Force $Source $temporary
+        Move-Item -Force $temporary $destination
+    }
+    catch {
+        if (Test-Path $temporary) {
+            Remove-Item -Force $temporary -ErrorAction SilentlyContinue
+        }
+        Stop-Install "install" "failed to replace $destination. Stop any running Wakezilla service or process and retry from an elevated PowerShell. Details: $($_.Exception.Message)"
+    }
+
     $destination
 }
 
@@ -309,6 +366,7 @@ function Invoke-WakezillaInstall {
         Remove-Item -Recurse -Force $tmpDir
     }
     New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    $servicesToRestart = @()
 
     try {
         $assetName = [System.IO.Path]::GetFileName(([System.Uri]$assetUrl).LocalPath)
@@ -323,6 +381,7 @@ function Invoke-WakezillaInstall {
         Assert-Checksum -File $archive -ChecksumsText $checksumsText -AssetName $assetName
 
         $binary = Expand-WakezillaArchive -Archive $archive -OutDir (Join-Path $tmpDir "extract")
+        $servicesToRestart = @(Stop-WakezillaServicesForInstall)
         $installed = Install-WakezillaBinary -Source $binary -DestinationDir $binDir
 
         if (-not $NoPath) {
@@ -353,6 +412,9 @@ function Invoke-WakezillaInstall {
         }
     }
     finally {
+        if ($servicesToRestart.Count -gt 0) {
+            Restart-WakezillaServicesAfterInstall -ServiceNames $servicesToRestart
+        }
         if (Test-Path $tmpDir) {
             Remove-Item -Recurse -Force $tmpDir
         }
