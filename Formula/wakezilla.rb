@@ -1,25 +1,25 @@
 class Wakezilla < Formula
   desc "Wake-on-LAN proxy server written in Rust"
   homepage "https://github.com/guibeira/wakezilla"
-  version "0.2.5"
+  version "0.2.6"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/guibeira/wakezilla/releases/download/v0.2.5/wakezilla-0.2.5-aarch64-apple-darwin.tar.gz"
-      sha256 "a8396ff1a8c17094bfeea0203fb5ac02320e95b01e61f86f6ab6f9dd1fca143d"
+      url "https://github.com/guibeira/wakezilla/releases/download/v0.2.6/wakezilla-0.2.6-aarch64-apple-darwin.tar.gz"
+      sha256 "b93a89407b7956923f07ed0c0f21101fb7efb3b1991b60080092af0b5f7756a2"
     else
-      url "https://github.com/guibeira/wakezilla/releases/download/v0.2.5/wakezilla-0.2.5-x86_64-apple-darwin.tar.gz"
-      sha256 "797f981a16e44851ecb27d489e40b588a76dde8d7fb88bfbf85e76a07d8faae3"
+      url "https://github.com/guibeira/wakezilla/releases/download/v0.2.6/wakezilla-0.2.6-x86_64-apple-darwin.tar.gz"
+      sha256 "59d523ccb6bf2628023b0293342c50c7099d1df07218f619db5967cbe28a540f"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/guibeira/wakezilla/releases/download/v0.2.5/wakezilla-0.2.5-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "89778f534ba7fbadc715c6651e8b1d33fd468c5e6c1059273edf5d4a50ede4ad"
+      url "https://github.com/guibeira/wakezilla/releases/download/v0.2.6/wakezilla-0.2.6-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "a615bfb0877aaa4dd10a990e6aea6bc1b1714a15c3c759a259fc26db8d1553cf"
     else
-      url "https://github.com/guibeira/wakezilla/releases/download/v0.2.5/wakezilla-0.2.5-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "78751af73b0aa39aecb561e37abf368d6e7d17bc42c69564fc5b7407392db9fb"
+      url "https://github.com/guibeira/wakezilla/releases/download/v0.2.6/wakezilla-0.2.6-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "4de72150352179849b8110d2d0e01337822c37ef4212cd3dbc4c823ab89f7d9a"
     end
   end
 
