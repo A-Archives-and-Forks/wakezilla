@@ -189,6 +189,39 @@ proxy server runs on the same host:
  wakezilla tui
 ```
 
+### Run the desktop tray menu
+
+Build Wakezilla with desktop tray support, then start the tray/menu-bar
+controller:
+
+```bash
+cargo run --features desktop-tray -- tray
+```
+
+Official release binaries for Linux GNU, macOS, and Windows are built with
+`desktop-tray`, so after installing a release:
+
+```bash
+wakezilla tray
+```
+
+Linux musl release binaries remain server-only because the tray backend depends
+on the desktop GTK/AppIndicator stack.
+
+The tray menu can open the local dashboard, copy its URL, show proxy/client
+status, open logs, check for updates, and request start/stop/restart for
+installed Wakezilla services. The `Configure startup` menu item installs tray
+autostart for the current user's graphical login and opens the service setup
+wizard for proxy/client boot startup.
+
+Linux desktop-tray builds require GTK/AppIndicator development packages from
+your distro, such as `libgtk-3-dev` and `libayatana-appindicator3-dev` on
+Debian/Ubuntu. Running the tray also requires the matching runtime libraries,
+typically installed automatically as dependencies of those packages. The tray
+process is meant to start with the user's graphical login; the proxy/client
+services should continue to be installed through `wakezilla setup` so they can
+start at boot.
+
 ### Set up auto-start (system service)
 
 1. **Run the interactive setup wizard** (requires `sudo`/admin privileges):

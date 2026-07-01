@@ -55,6 +55,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      - name: Install desktop tray Linux dependencies
+        if: ${{ contains(matrix.target, 'linux-gnu') }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev
+
       - name: Add Rust target
         shell: bash
         run: rustup target add ${{ matrix.target }}
@@ -88,7 +95,14 @@ jobs:
 
       - name: Build binary
         shell: bash
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          FEATURES=()
+          if [[ "${TARGET}" != *linux-musl* ]]; then
+            FEATURES+=(--features desktop-tray)
+          fi
+          cargo build --release --target "${TARGET}" "${FEATURES[@]}"
 
       - name: Create release archive
         shell: bash

@@ -97,6 +97,10 @@ pub struct WindowsServiceArgs {
     pub mode: String,
 }
 
+#[derive(Parser, Debug)]
+#[command()]
+pub struct TrayArgs {}
+
 /// Simple Wake-on-LAN sender + post-WOL reachability check.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -119,6 +123,8 @@ pub enum Commands {
     ClientServer(ClientServerArgs),
     /// Start the terminal UI against a running proxy server
     Tui(TuiArgs),
+    /// Start the desktop system tray menu
+    Tray(TrayArgs),
     /// Configure this host to auto-start a Wakezilla server as a system service
     Setup(SetupArgs),
     /// Remove Wakezilla services installed by setup
@@ -142,6 +148,7 @@ pub fn should_check_for_updates(cli: &Cli) -> bool {
         Commands::Setup(_)
             | Commands::Uninstall
             | Commands::Update(_)
+            | Commands::Tray(_)
             | Commands::WindowsService(_)
     )
 }
@@ -205,6 +212,17 @@ mod cli_tests {
             Commands::Tui(args) => assert_eq!(args.api_url, "http://127.0.0.1:3000"),
             other => panic!("expected Tui command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_accepts_tray_subcommand() {
+        let cli = Cli::try_parse_from(["wakezilla", "tray"]).expect("tray subcommand parses");
+
+        match cli.command {
+            Commands::Tray(_) => {}
+            other => panic!("expected Tray command, got {other:?}"),
+        }
+        assert!(!should_check_for_updates(&cli));
     }
 
     #[test]
