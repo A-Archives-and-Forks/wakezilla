@@ -33,6 +33,7 @@ const CLIENT_LOGS_ID: &str = "client_logs";
 enum UserEvent {
     Menu(String),
     Refresh,
+    Status(ServiceStatuses),
     Message(String),
 }
 
@@ -63,6 +64,19 @@ struct TrayApp {
     menu: Option<TrayMenu>,
     tray_icon: Option<TrayIcon>,
     startup_error: Option<String>,
+    status_refresh_in_flight: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServiceStatuses {
+    proxy: ModeStatus,
+    client: ModeStatus,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModeStatus {
+    installed: bool,
+    running: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -84,6 +98,7 @@ pub fn run() -> Result<()> {
         menu: None,
         tray_icon: None,
         startup_error: None,
+        status_refresh_in_flight: false,
     };
 
     event_loop
@@ -130,6 +145,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
         match event {
             UserEvent::Menu(id) => self.handle_menu_event(event_loop, &id),
             UserEvent::Refresh => self.refresh_status(),
+            UserEvent::Status(statuses) => self.apply_status(statuses),
             UserEvent::Message(message) => self.set_message(message),
         }
     }
@@ -280,9 +296,26 @@ impl TrayApp {
     }
 
     fn refresh_status(&mut self) {
+        if self.menu.is_none() || self.status_refresh_in_flight {
+            return;
+        }
+
+        self.status_refresh_in_flight = true;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let statuses = ServiceStatuses {
+                proxy: query_mode_status(service::Mode::Proxy),
+                client: query_mode_status(service::Mode::Client),
+            };
+            let _ = proxy.send_event(UserEvent::Status(statuses));
+        });
+    }
+
+    fn apply_status(&mut self, statuses: ServiceStatuses) {
+        self.status_refresh_in_flight = false;
         if let Some(menu) = &self.menu {
-            update_mode_menu(service::Mode::Proxy, &menu.proxy);
-            update_mode_menu(service::Mode::Client, &menu.client);
+            update_mode_menu(service::Mode::Proxy, &menu.proxy, statuses.proxy);
+            update_mode_menu(service::Mode::Client, &menu.client, statuses.client);
         }
     }
 
@@ -403,16 +436,10 @@ fn build_mode_submenu(mode: service::Mode) -> Result<(Submenu, ModeMenu)> {
     ))
 }
 
-fn update_mode_menu(mode: service::Mode, menu: &ModeMenu) {
-    let installed = service::is_installed(mode);
-    let running = installed && service::is_running(mode);
-    let label = if !installed {
-        "not installed"
-    } else if running {
-        "running"
-    } else {
-        "stopped"
-    };
+fn update_mode_menu(mode: service::Mode, menu: &ModeMenu, status: ModeStatus) {
+    let installed = status.installed;
+    let running = status.running;
+    let label = service_status_label(status);
 
     menu.status
         .set_text(format!("{}: {label}", mode_label(mode)));
@@ -420,6 +447,23 @@ fn update_mode_menu(mode: service::Mode, menu: &ModeMenu) {
     menu.stop.set_enabled(installed && running);
     menu.restart.set_enabled(installed);
     menu.logs.set_enabled(installed);
+}
+
+fn query_mode_status(mode: service::Mode) -> ModeStatus {
+    let installed = service::is_installed(mode);
+    let running = installed && service::is_running(mode);
+
+    ModeStatus { installed, running }
+}
+
+fn service_status_label(status: ModeStatus) -> &'static str {
+    if !status.installed {
+        "not installed"
+    } else if status.running {
+        "running"
+    } else {
+        "stopped"
+    }
 }
 
 fn run_service_control(mode: service::Mode, control: ServiceControl) -> Result<String> {
@@ -622,7 +666,13 @@ fn install_tray_autostart() -> Result<std::path::PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn desktop_entry_quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -780,6 +830,31 @@ mod tests {
         assert_eq!(mode_label(service::Mode::Client), "Client");
     }
 
+    #[test]
+    fn service_status_labels_match_state() {
+        assert_eq!(
+            service_status_label(ModeStatus {
+                installed: false,
+                running: false
+            }),
+            "not installed"
+        );
+        assert_eq!(
+            service_status_label(ModeStatus {
+                installed: true,
+                running: false
+            }),
+            "stopped"
+        );
+        assert_eq!(
+            service_status_label(ModeStatus {
+                installed: true,
+                running: true
+            }),
+            "running"
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn shell_quote_wraps_single_quotes() {
@@ -789,6 +864,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn desktop_entry_quote_escapes_quotes() {
-        assert_eq!(desktop_entry_quote("/tmp/a\"b"), "\"/tmp/a\\\"b\"");
+        assert_eq!(desktop_entry_quote("/tmp/a\"b%20"), "\"/tmp/a\\\"b%%20\"");
     }
 }
