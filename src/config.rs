@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 /// Default configuration file path for machines database
 pub const DEFAULT_MACHINES_DB_PATH: &str = "machines.json";
+pub const DEFAULT_ACCESS_HISTORY_PATH: &str = "access_history.json";
 
 /// Main configuration structure for the entire application
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -71,6 +72,31 @@ pub fn config_dir() -> PathBuf {
     {
         PathBuf::from("/etc/wakezilla")
     }
+}
+
+/// OS-standard directory for Wakezilla service data files.
+pub fn data_dir() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/var/lib/wakezilla")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Library/Application Support/wakezilla")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
+        PathBuf::from(base).join("wakezilla")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        PathBuf::from("/var/lib/wakezilla")
+    }
+}
+
+pub fn data_path(file_name: &str) -> PathBuf {
+    data_dir().join(file_name)
 }
 
 /// Full path to the system config file.
@@ -216,6 +242,10 @@ pub struct StorageConfig {
     #[serde(default = "default_machines_db_path")]
     pub machines_db_path: String,
 
+    /// Path to the access-history database file (default: "access_history.json")
+    #[serde(default = "default_access_history_path")]
+    pub access_history_path: String,
+
     /// Maximum access-history records kept per service (default: 2000)
     #[serde(default = "default_max_access_records")]
     pub max_access_records: usize,
@@ -225,6 +255,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             machines_db_path: default_machines_db_path(),
+            access_history_path: default_access_history_path(),
             max_access_records: default_max_access_records(),
         }
     }
@@ -306,6 +337,9 @@ fn default_network_read_timeout_secs() -> u64 {
 }
 fn default_machines_db_path() -> String {
     DEFAULT_MACHINES_DB_PATH.into()
+}
+fn default_access_history_path() -> String {
+    DEFAULT_ACCESS_HISTORY_PATH.into()
 }
 fn default_max_access_records() -> usize {
     2000

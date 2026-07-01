@@ -1,9 +1,18 @@
 //! OS-native system service installation for the `setup` subcommand.
 
 use anyhow::{anyhow, Context, Result};
+#[cfg(target_os = "windows")]
+use std::collections::VecDeque;
+#[cfg(target_os = "windows")]
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
+#[cfg(target_os = "windows")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 
 /// Which Wakezilla server the service runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +49,24 @@ impl Mode {
         }
     }
 
+    /// Human-readable service display name.
+    #[allow(dead_code)]
+    pub fn service_display_name(self) -> &'static str {
+        match self {
+            Mode::Proxy => "Wakezilla Proxy",
+            Mode::Client => "Wakezilla Client",
+        }
+    }
+
+    /// Stable CLI argument used by the hidden Windows service entrypoint.
+    #[allow(dead_code)]
+    pub fn service_arg(self) -> &'static str {
+        match self {
+            Mode::Proxy => "proxy",
+            Mode::Client => "client",
+        }
+    }
+
     /// launchd label (reverse-DNS).
     // Platform-conditional: used by the systemd (Linux) / launchd (macOS) / Windows install paths; some are cfg'd out per-OS.
     #[allow(dead_code)]
@@ -62,6 +89,103 @@ impl Mode {
 /// Arguments passed to a Wakezilla process managed by the OS service layer.
 pub fn service_program_args(mode: Mode) -> [&'static str; 2] {
     ["--no-update-check", mode.subcommand()]
+}
+
+/// Arguments used when Windows Service Manager starts this binary.
+#[allow(dead_code)]
+pub fn windows_service_program_args(mode: Mode) -> [&'static str; 3] {
+    ["--no-update-check", "windows-service", mode.service_arg()]
+}
+
+/// Windows Firewall rule name used for the inbound service port.
+#[allow(dead_code)]
+pub fn firewall_rule_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Proxy => "Wakezilla Proxy Server",
+        Mode::Client => "Wakezilla Client Server",
+    }
+}
+
+/// Log file name used by OS service processes when stdout/stderr are not
+/// captured by the platform service manager.
+#[allow(dead_code)]
+pub fn service_log_file_name(mode: Mode) -> String {
+    format!("{}.log", mode.service_name())
+}
+
+/// OS-standard path for Wakezilla service log files.
+#[allow(dead_code)]
+pub fn service_log_path(mode: Mode) -> PathBuf {
+    crate::config::data_path(&service_log_file_name(mode))
+}
+
+/// Create or update the OS firewall rule needed for remote access to the service.
+///
+/// On Windows this installs an inbound TCP allow rule for the configured port
+/// and executable. Other platforms currently do not need setup-managed firewall
+/// configuration, so this is a no-op.
+pub fn configure_firewall(mode: Mode, exe: &str, port: u16) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let rule_name = firewall_rule_name(mode);
+        let name_arg = format!("name={rule_name}");
+        let program_arg = format!("program={exe}");
+        let port_arg = format!("localport={port}");
+
+        run_ignore_err(
+            "netsh",
+            &["advfirewall", "firewall", "delete", "rule", &name_arg],
+        );
+        run(
+            "netsh",
+            &[
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &name_arg,
+                "dir=in",
+                "action=allow",
+                &program_arg,
+                "enable=yes",
+                "profile=any",
+                "protocol=TCP",
+                &port_arg,
+            ],
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (mode, exe, port);
+        Ok(())
+    }
+}
+
+/// Remove the OS firewall rule managed by Wakezilla setup.
+pub fn remove_firewall(mode: Mode) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let rule_name = firewall_rule_name(mode);
+        let name_arg = format!("name={rule_name}");
+
+        let output = run_output(
+            "netsh",
+            &["advfirewall", "firewall", "delete", "rule", &name_arg],
+        )?;
+        if output.status.success() || netsh_rule_not_found(&output) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "netsh failed to remove firewall rule '{}': {}",
+            rule_name,
+            command_output_text(&output)
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = mode;
+        Ok(())
+    }
 }
 
 /// Render a systemd unit file. `exe` is the absolute path to the wakezilla binary.
@@ -221,30 +345,71 @@ pub fn install(mode: Mode, exe: &str) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        // Best-effort teardown of any previous instance so `sc create` does not
-        // error "service already exists" on a re-run.
-        run_ignore_err("sc", &["stop", mode.service_name()]);
-        run_ignore_err("sc", &["delete", mode.service_name()]);
-        let [no_update_check, sub] = service_program_args(mode);
-        let bin_path = format!("\"{exe}\" {no_update_check} {sub}");
-        run(
-            "sc",
-            &[
-                "create",
-                mode.service_name(),
-                "binPath=",
-                &bin_path,
-                "start=",
-                "auto",
-            ],
-        )?;
-        run("sc", &["start", mode.service_name()])?;
+        install_windows_service(mode, exe)?;
+        start(mode)?;
         Ok(())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (mode, exe);
         Err(anyhow!("service install not supported on this OS"))
+    }
+}
+
+/// Modes that can be installed and removed by the setup/uninstall workflow.
+pub fn managed_modes() -> [Mode; 2] {
+    [Mode::Proxy, Mode::Client]
+}
+
+/// Remove the system service/autostart configuration for one Wakezilla mode.
+///
+/// This intentionally leaves Wakezilla config, data, and logs in place.
+pub fn uninstall(mode: Mode) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let service_result: Result<()> = {
+        run_ignore_err("systemctl", &["stop", mode.service_name()]);
+        run_ignore_err("systemctl", &["disable", mode.service_name()]);
+        remove_file_if_exists(&descriptor_path(mode))?;
+        run("systemctl", &["daemon-reload"])?;
+        run_ignore_err("systemctl", &["reset-failed", mode.service_name()]);
+        Ok(())
+    };
+    #[cfg(target_os = "macos")]
+    let service_result = {
+        let path = descriptor_path(mode);
+        run_ignore_err("launchctl", &["unload", &path]);
+        remove_file_if_exists(&path)
+    };
+    #[cfg(target_os = "windows")]
+    let service_result = uninstall_windows_service(mode);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let service_result = Err(anyhow!("service uninstall not supported on this OS"));
+
+    let firewall_result = remove_firewall(mode);
+    service_result?;
+    firewall_result?;
+    Ok(())
+}
+
+/// Remove all Wakezilla services installed by setup.
+pub fn uninstall_all() -> Result<Vec<Mode>> {
+    let mut removed = Vec::new();
+    for mode in managed_modes() {
+        let was_installed = is_installed(mode);
+        uninstall(mode).with_context(|| format!("failed to uninstall {}", mode.subcommand()))?;
+        if was_installed {
+            removed.push(mode);
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_file_if_exists(path: &str) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("removing {path}")),
     }
 }
 
@@ -266,6 +431,35 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
 #[allow(dead_code)]
 fn run_ignore_err(cmd: &str, args: &[&str]) {
     let _ = Command::new(cmd).args(args).status();
+}
+
+/// Run a command and capture stdout/stderr for callers that need to distinguish
+/// expected non-zero exits from real failures.
+#[cfg(target_os = "windows")]
+fn run_output(cmd: &str, args: &[&str]) -> Result<std::process::Output> {
+    Command::new(cmd)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run {cmd}"))
+}
+
+#[cfg(target_os = "windows")]
+fn command_output_text(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = format!("{stdout}{stderr}");
+    let text = text.trim();
+    if text.is_empty() {
+        output.status.to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn netsh_rule_not_found(output: &std::process::Output) -> bool {
+    let text = command_output_text(output).to_ascii_lowercase();
+    text.contains("no rules match") || text.contains("nenhuma regra")
 }
 
 /// Run a command inheriting the terminal's stdio (for streaming logs). Returns an
@@ -299,11 +493,7 @@ pub fn is_installed(mode: Mode) -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        Command::new("sc")
-            .args(["query", mode.service_name()])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        open_windows_service(mode, windows_service::service::ServiceAccess::QUERY_STATUS).is_ok()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -314,7 +504,7 @@ pub fn is_installed(mode: Mode) -> bool {
 
 /// The set of modes currently installed as services on this host.
 pub fn installed_modes() -> Vec<Mode> {
-    [Mode::Proxy, Mode::Client]
+    managed_modes()
         .into_iter()
         .filter(|m| is_installed(*m))
         .collect()
@@ -332,7 +522,8 @@ pub fn start(mode: Mode) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        run("sc", &["start", mode.service_name()])
+        let service = open_windows_service(mode, windows_service::service::ServiceAccess::START)?;
+        service.start::<std::ffi::OsString>(&[]).map_err(Into::into)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -353,7 +544,8 @@ pub fn stop(mode: Mode) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        run("sc", &["stop", mode.service_name()])
+        let service = open_windows_service(mode, windows_service::service::ServiceAccess::STOP)?;
+        service.stop().map(|_| ()).map_err(Into::into)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -375,8 +567,8 @@ pub fn restart(mode: Mode) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        run_ignore_err("sc", &["stop", mode.service_name()]);
-        run("sc", &["start", mode.service_name()])
+        stop_windows_service_for_restart(mode, Duration::from_secs(15))?;
+        start(mode)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -408,16 +600,270 @@ pub fn is_running(mode: Mode) -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        Command::new("sc")
-            .args(["query", mode.service_name()])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("RUNNING"))
+        open_windows_service(mode, windows_service::service::ServiceAccess::QUERY_STATUS)
+            .and_then(|service| service.query_status().map_err(Into::into))
+            .map(|status| status.current_state == windows_service::service::ServiceState::Running)
             .unwrap_or(false)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = mode;
         false
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_service(
+    mode: Mode,
+    access: windows_service::service::ServiceAccess,
+) -> Result<windows_service::service::Service> {
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    manager
+        .open_service(mode.service_name(), access)
+        .with_context(|| format!("failed to open Windows service {}", mode.service_name()))
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_service(mode: Mode, exe: &str) -> Result<()> {
+    use std::ffi::OsString;
+    use windows_service::service::{
+        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+    };
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
+    let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
+
+    delete_windows_service_if_exists(&service_manager, mode)?;
+
+    let service_info = ServiceInfo {
+        name: OsString::from(mode.service_name()),
+        display_name: OsString::from(mode.service_display_name()),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: PathBuf::from(exe),
+        launch_arguments: windows_service_program_args(mode)
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        dependencies: vec![],
+        account_name: None,
+        account_password: None,
+    };
+
+    let service = service_manager.create_service(
+        &service_info,
+        ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
+    )?;
+    service
+        .set_description(format!(
+            "Runs Wakezilla {} as a Windows service.",
+            mode.subcommand()
+        ))
+        .ok();
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_service_for_restart(mode: Mode, timeout: Duration) -> Result<()> {
+    use windows_service::service::{ServiceAccess, ServiceState};
+
+    let service = open_windows_service(mode, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)?;
+    let status = service.query_status()?;
+    if status.current_state == ServiceState::Stopped {
+        return Ok(());
+    }
+    if status.current_state != ServiceState::StopPending {
+        service.stop()?;
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = service.query_status()?;
+        if status.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "{} service did not stop within {:?}; current state: {:?}",
+                mode.subcommand(),
+                timeout,
+                status.current_state
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_windows_service(mode: Mode) -> Result<()> {
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let service_manager =
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    delete_windows_service_if_exists(&service_manager, mode)
+}
+
+#[cfg(target_os = "windows")]
+fn delete_windows_service_if_exists(
+    service_manager: &windows_service::service_manager::ServiceManager,
+    mode: Mode,
+) -> Result<()> {
+    use windows_service::service::{ServiceAccess, ServiceState};
+
+    let access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+    let service = match service_manager.open_service(mode.service_name(), access) {
+        Ok(service) => service,
+        Err(_) => return Ok(()),
+    };
+
+    if service
+        .query_status()
+        .map(|status| status.current_state != ServiceState::Stopped)
+        .unwrap_or(false)
+    {
+        let _ = service.stop();
+    }
+    service.delete()?;
+    drop(service);
+
+    for _ in 0..10 {
+        if service_manager
+            .open_service(mode.service_name(), ServiceAccess::QUERY_STATUS)
+            .is_err()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+windows_service::define_windows_service!(ffi_service_main, windows_service_main);
+
+#[cfg(target_os = "windows")]
+static WINDOWS_SERVICE_MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+pub fn run_windows_service(mode: Mode) -> Result<()> {
+    let _ = WINDOWS_SERVICE_MODE.set(mode);
+    windows_service::service_dispatcher::start(mode.service_name(), ffi_service_main)
+        .with_context(|| format!("failed to start Windows service {}", mode.service_name()))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn run_windows_service(mode: Mode) -> Result<()> {
+    let _ = mode;
+    Err(anyhow!(
+        "Windows service entrypoint is only supported on Windows"
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_main(_arguments: Vec<std::ffi::OsString>) {
+    if let Err(err) = run_windows_service_inner() {
+        tracing::error!("Windows service failed: {err:#}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_service_inner() -> Result<()> {
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::oneshot;
+    use windows_service::service::{ServiceControl, ServiceControlAccept, ServiceState};
+    use windows_service::service_control_handler::{
+        self, ServiceControlHandlerResult, ServiceStatusHandle,
+    };
+
+    let mode = WINDOWS_SERVICE_MODE
+        .get()
+        .copied()
+        .ok_or_else(|| anyhow!("missing Windows service mode"))?;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
+    let status_handle_slot: Arc<Mutex<Option<ServiceStatusHandle>>> = Arc::new(Mutex::new(None));
+
+    let handler_shutdown_tx = Arc::clone(&shutdown_tx);
+    let handler_status = Arc::clone(&status_handle_slot);
+    let event_handler = move |control_event| -> ServiceControlHandlerResult {
+        match control_event {
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            ServiceControl::Stop => {
+                if let Some(status_handle) =
+                    *handler_status.lock().unwrap_or_else(|e| e.into_inner())
+                {
+                    let _ = status_handle.set_service_status(windows_status(
+                        ServiceState::StopPending,
+                        ServiceControlAccept::empty(),
+                    ));
+                }
+                if let Some(tx) = handler_shutdown_tx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
+                ServiceControlHandlerResult::NoError
+            }
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+
+    let status_handle = service_control_handler::register(mode.service_name(), event_handler)?;
+    *status_handle_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(status_handle);
+
+    status_handle.set_service_status(windows_status(
+        ServiceState::Running,
+        ServiceControlAccept::STOP,
+    ))?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start Tokio runtime for Windows service")?;
+
+    let config = crate::config::Config::load();
+    let result = runtime.block_on(async move {
+        let shutdown = async {
+            let _ = shutdown_rx.await;
+        };
+        match mode {
+            Mode::Proxy => crate::proxy_server::start_with_shutdown(config, shutdown).await,
+            Mode::Client => {
+                crate::client_server::start_with_shutdown(config.server.client_port, shutdown).await
+            }
+        }
+    });
+
+    status_handle.set_service_status(windows_status(
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+    ))?;
+
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn windows_status(
+    current_state: windows_service::service::ServiceState,
+    controls_accepted: windows_service::service::ServiceControlAccept,
+) -> windows_service::service::ServiceStatus {
+    windows_service::service::ServiceStatus {
+        service_type: windows_service::service::ServiceType::OWN_PROCESS,
+        current_state,
+        controls_accepted,
+        exit_code: windows_service::service::ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
     }
 }
 
@@ -452,17 +898,92 @@ pub fn logs(mode: Mode, follow: bool, lines: u32) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = (follow, lines);
-        println!(
-            "Log streaming is not captured for the Windows service ({}). \
-             Check the Windows Event Viewer.",
-            mode.subcommand()
-        );
+        let path = service_log_path(mode);
+        if !path.exists() {
+            anyhow::bail!(
+                "no log file at {} yet. The service may not have started or \
+                 produced any output.",
+                path.display()
+            );
+        }
+        print_last_log_lines(&path, lines)?;
+        if follow {
+            follow_log_file(&path)?;
+        }
         Ok(())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (mode, follow, lines);
         Err(anyhow!("log viewing not supported on this OS"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn print_last_log_lines(path: &Path, line_count: u32) -> Result<()> {
+    if line_count == 0 {
+        return Ok(());
+    }
+
+    let tail = read_tail_for_lines(path, line_count)?;
+    let contents = String::from_utf8_lossy(&tail);
+    let lines: Vec<&str> = contents.lines().collect();
+    let start = lines.len().saturating_sub(line_count as usize);
+    for line in &lines[start..] {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn read_tail_for_lines(path: &Path, line_count: u32) -> Result<Vec<u8>> {
+    const CHUNK_SIZE: u64 = 8192;
+
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut remaining = file
+        .seek(SeekFrom::End(0))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+    let mut newline_count = 0usize;
+    let mut chunks = VecDeque::new();
+
+    while remaining > 0 && newline_count <= line_count as usize {
+        let read_len = remaining.min(CHUNK_SIZE);
+        remaining -= read_len;
+        file.seek(SeekFrom::Start(remaining))
+            .with_context(|| format!("failed to seek {}", path.display()))?;
+
+        let mut chunk = vec![0; read_len as usize];
+        file.read_exact(&mut chunk)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
+        chunks.push_front(chunk);
+    }
+
+    let total_len = chunks.iter().map(Vec::len).sum();
+    let mut tail = Vec::with_capacity(total_len);
+    for chunk in chunks {
+        tail.extend(chunk);
+    }
+    Ok(tail)
+}
+
+#[cfg(target_os = "windows")]
+fn follow_log_file(path: &Path) -> Result<()> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    file.seek(SeekFrom::End(0))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+
+    loop {
+        let mut chunk = String::new();
+        let bytes = file
+            .read_to_string(&mut chunk)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if bytes > 0 {
+            print!("{chunk}");
+            std::io::stdout().flush().ok();
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 }

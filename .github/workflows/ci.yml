@@ -64,6 +64,41 @@ jobs:
       - name: Run installer tests
         run: scripts/test-install-sh.sh
 
+  windows:
+    name: windows
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            frontend
+
+      - name: Prepare frontend assets for backend checks
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path target/frontend-dist | Out-Null
+          Set-Content -NoNewline -Path target/frontend-dist/index.html -Value '<!doctype html><html><head><title>wakezilla</title></head><body></body></html>'
+
+      - name: Run PowerShell installer tests
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-install-ps1.ps1
+
+      - name: Check Windows backend
+        run: cargo check -p wakezilla --all-targets --locked
+
+      - name: Run Windows backend tests
+        run: cargo test -p wakezilla -p wakezilla-common --locked
+
   frontend:
     name: frontend
     runs-on: ubuntu-latest

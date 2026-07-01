@@ -16,6 +16,11 @@ fn mode_exposes_subcommand_and_service_name() {
 }
 
 #[test]
+fn managed_modes_include_proxy_and_client() {
+    assert_eq!(service::managed_modes(), [Mode::Proxy, Mode::Client]);
+}
+
+#[test]
 fn service_program_args_disable_update_checks() {
     assert_eq!(
         service::service_program_args(Mode::Proxy),
@@ -24,6 +29,42 @@ fn service_program_args_disable_update_checks() {
     assert_eq!(
         service::service_program_args(Mode::Client),
         ["--no-update-check", "client-server"]
+    );
+}
+
+#[test]
+fn windows_service_program_args_use_hidden_entrypoint() {
+    assert_eq!(
+        service::windows_service_program_args(Mode::Proxy),
+        ["--no-update-check", "windows-service", "proxy"]
+    );
+    assert_eq!(
+        service::windows_service_program_args(Mode::Client),
+        ["--no-update-check", "windows-service", "client"]
+    );
+}
+
+#[test]
+fn firewall_rule_names_are_stable_per_mode() {
+    assert_eq!(
+        service::firewall_rule_name(Mode::Proxy),
+        "Wakezilla Proxy Server"
+    );
+    assert_eq!(
+        service::firewall_rule_name(Mode::Client),
+        "Wakezilla Client Server"
+    );
+}
+
+#[test]
+fn service_log_file_names_are_stable_per_mode() {
+    assert_eq!(
+        service::service_log_file_name(Mode::Proxy),
+        "wakezilla-proxy.log"
+    );
+    assert_eq!(
+        service::service_log_file_name(Mode::Client),
+        "wakezilla-client.log"
     );
 }
 

@@ -63,6 +63,12 @@ pub fn build_config(mode: Mode, port: u16) -> Config {
         Mode::Proxy => cfg.server.proxy_port = port,
         Mode::Client => cfg.server.client_port = port,
     }
+    cfg.storage.machines_db_path = config::data_path(config::DEFAULT_MACHINES_DB_PATH)
+        .to_string_lossy()
+        .into_owned();
+    cfg.storage.access_history_path = config::data_path(config::DEFAULT_ACCESS_HISTORY_PATH)
+        .to_string_lossy()
+        .into_owned();
     cfg
 }
 
@@ -85,10 +91,24 @@ pub fn apply(mode: Mode, port: u16) -> Result<std::path::PathBuf> {
         Mode::Proxy => cfg.server.proxy_port = port,
         Mode::Client => cfg.server.client_port = port,
     }
+    if cfg.storage.machines_db_path == config::DEFAULT_MACHINES_DB_PATH {
+        cfg.storage.machines_db_path = config::data_path(config::DEFAULT_MACHINES_DB_PATH)
+            .to_string_lossy()
+            .into_owned();
+    }
+    if cfg.storage.access_history_path == config::DEFAULT_ACCESS_HISTORY_PATH {
+        cfg.storage.access_history_path = config::data_path(config::DEFAULT_ACCESS_HISTORY_PATH)
+            .to_string_lossy()
+            .into_owned();
+    }
     cfg.save_to(&path)
         .with_context(|| format!("failed to write config to {}", path.display()))?;
 
-    service::install(mode, &exe).context("failed to install system service")?;
+    service::configure_firewall(mode, &exe, port).context("failed to configure firewall rule")?;
+    if let Err(err) = service::install(mode, &exe).context("failed to install system service") {
+        let _ = service::remove_firewall(mode);
+        return Err(err);
+    }
     service::validate(port, 10).context("service installed but did not become reachable")?;
 
     Ok(path)
@@ -151,7 +171,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -205,6 +225,29 @@ pub fn run(args: SetupArgs) -> Result<()> {
         mode.subcommand(),
         path.display()
     );
+    Ok(())
+}
+
+/// Entry point for the `uninstall` subcommand. Removes Wakezilla services and
+/// autostart hooks created by `setup`, but preserves config and data files.
+pub fn run_uninstall() -> Result<()> {
+    if !service::is_elevated() {
+        eprintln!(
+            "wakezilla uninstall must run with administrator privileges.\n\
+             Re-run with: sudo wakezilla uninstall   (Linux/macOS)  or  an elevated shell (Windows)."
+        );
+        std::process::exit(1);
+    }
+
+    let removed = service::uninstall_all().context("failed to uninstall Wakezilla services")?;
+    if removed.is_empty() {
+        println!("No Wakezilla service was installed.");
+    } else {
+        for mode in removed {
+            println!("Removed {} service.", mode.subcommand());
+        }
+    }
+    println!("Wakezilla configuration, data, and logs were left in place.");
     Ok(())
 }
 
@@ -271,6 +314,10 @@ fn wizard_loop<B: ratatui::backend::Backend>(
             continue;
         }
         if let Event::Key(key) = event::read()? {
+            if !is_action_key_event(&key) {
+                continue;
+            }
+
             // Ctrl-C / Esc aborts.
             if key.code == KeyCode::Esc
                 || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
@@ -281,11 +328,17 @@ fn wizard_loop<B: ratatui::backend::Backend>(
             match w.step {
                 Step::ModeSelect => match key.code {
                     KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
-                        w.mode = match w.mode {
+                        let mode = match w.mode {
                             Mode::Proxy => Mode::Client,
                             Mode::Client => Mode::Proxy,
                         };
-                        w.port_input = w.mode.default_port().to_string();
+                        set_wizard_mode(&mut w, mode);
+                    }
+                    KeyCode::Char('1') | KeyCode::Char('p') | KeyCode::Char('P') => {
+                        set_wizard_mode(&mut w, Mode::Proxy);
+                    }
+                    KeyCode::Char('2') | KeyCode::Char('c') | KeyCode::Char('C') => {
+                        set_wizard_mode(&mut w, Mode::Client);
                     }
                     KeyCode::Enter => w.step = Step::PortInput,
                     _ => {}
@@ -319,6 +372,17 @@ fn wizard_loop<B: ratatui::backend::Backend>(
     }
 }
 
+fn is_action_key_event(key: &KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+fn set_wizard_mode(w: &mut Wizard, mode: Mode) {
+    if w.mode != mode {
+        w.mode = mode;
+        w.port_input = mode.default_port().to_string();
+    }
+}
+
 fn draw_wizard(f: &mut Frame, w: &Wizard) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -336,12 +400,10 @@ fn draw_wizard(f: &mut Frame, w: &Wizard) {
 
     let body = match w.step {
         Step::ModeSelect => {
-            let proxy = mode_span("Proxy server", w.mode == Mode::Proxy);
-            let client = mode_span("Client server", w.mode == Mode::Client);
+            let proxy = mode_span("1 Proxy server", w.mode == Mode::Proxy);
+            let client = mode_span("2 Client server", w.mode == Mode::Client);
             vec![
-                Line::from(
-                    "What do you want to configure? (Left/Right to switch, Enter to confirm)",
-                ),
+                Line::from("What do you want to configure? (1/2 or Left/Right, Enter to confirm)"),
                 Line::from(""),
                 Line::from(vec![proxy, Span::raw("   "), client]),
             ]
@@ -409,6 +471,11 @@ pub fn run_service(args: ServiceArgs) -> Result<()> {
         std::process::exit(1);
     }
 
+    #[cfg(target_os = "windows")]
+    if args.action == ServiceAction::Logs && args.mode.is_none() {
+        return run_windows_logs_for_installed_services(args.follow, args.lines.unwrap_or(50));
+    }
+
     let mode = match &args.mode {
         Some(mode_str) => {
             let mode = Mode::from_str_opt(mode_str).with_context(|| {
@@ -458,6 +525,34 @@ pub fn run_service(args: ServiceArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn run_windows_logs_for_installed_services(follow: bool, lines: u32) -> Result<()> {
+    let installed = service::installed_modes();
+    match installed.as_slice() {
+        [] => anyhow::bail!("No Wakezilla service is installed. Run `wakezilla setup` first."),
+        [mode] => {
+            print_status(*mode);
+            println!("--- logs ---");
+            service::logs(*mode, follow, lines).context("failed to show logs")?;
+        }
+        modes if follow => {
+            let names: Vec<&str> = modes.iter().map(|m| m.subcommand()).collect();
+            anyhow::bail!(
+                "Multiple Wakezilla services are installed ({}). Use `--mode <proxy|client>` with `--follow`.",
+                names.join(", ")
+            );
+        }
+        modes => {
+            for mode in modes {
+                print_status(*mode);
+                println!("--- {} logs ---", mode.subcommand());
+                service::logs(*mode, false, lines).context("failed to show logs")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Print whether the service for `mode` is currently running.
 fn print_status(mode: Mode) {
     let state = if service::is_running(mode) {
@@ -498,6 +593,10 @@ fn pick_mode_loop<B: ratatui::backend::Backend>(
             continue;
         }
         if let Event::Key(key) = event::read()? {
+            if !is_action_key_event(&key) {
+                continue;
+            }
+
             if key.code == KeyCode::Esc
                 || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
             {
@@ -507,11 +606,25 @@ fn pick_mode_loop<B: ratatui::backend::Backend>(
                 KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
                     selected = (selected + 1) % modes.len();
                 }
+                KeyCode::Char(c) => {
+                    if let Some(index) = mode_index_for_shortcut(modes, c) {
+                        selected = index;
+                    }
+                }
                 KeyCode::Enter => return Ok(modes[selected]),
                 _ => {}
             }
         }
     }
+}
+
+fn mode_index_for_shortcut(modes: &[Mode], key: char) -> Option<usize> {
+    let mode = match key.to_ascii_lowercase() {
+        '1' | 'p' => Mode::Proxy,
+        '2' | 'c' => Mode::Client,
+        _ => return None,
+    };
+    modes.iter().position(|m| *m == mode)
 }
 
 fn draw_pick_mode(f: &mut Frame, modes: &[Mode], selected: usize) {
@@ -534,15 +647,15 @@ fn draw_pick_mode(f: &mut Frame, modes: &[Mode], selected: usize) {
         .enumerate()
         .flat_map(|(i, m)| {
             let label = match m {
-                Mode::Proxy => "Proxy server",
-                Mode::Client => "Client server",
+                Mode::Proxy => "1 Proxy server",
+                Mode::Client => "2 Client server",
             };
             vec![mode_span(label, i == selected), Span::raw("   ")]
         })
         .collect();
 
     let body = vec![
-        Line::from("Which service? (Left/Right to switch, Enter to select)"),
+        Line::from("Which service? (1/2 or Left/Right to switch, Enter to select)"),
         Line::from(""),
         Line::from(spans),
     ];
@@ -552,4 +665,46 @@ fn draw_pick_mode(f: &mut Frame, modes: &[Mode], selected: usize) {
     let footer =
         Paragraph::new("Esc / Ctrl-C: cancel").block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_key_filter_ignores_release_events() {
+        let press =
+            KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Press);
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Repeat);
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Release);
+
+        assert!(is_action_key_event(&press));
+        assert!(is_action_key_event(&repeat));
+        assert!(!is_action_key_event(&release));
+    }
+
+    #[test]
+    fn wizard_mode_selection_updates_default_port() {
+        let mut wizard = Wizard::new(&SetupArgs::default());
+        assert_eq!(wizard.mode, Mode::Proxy);
+        assert_eq!(wizard.port_input, "3000");
+
+        set_wizard_mode(&mut wizard, Mode::Client);
+        assert_eq!(wizard.mode, Mode::Client);
+        assert_eq!(wizard.port_input, "3001");
+    }
+
+    #[test]
+    fn mode_shortcuts_select_installed_mode_index() {
+        let modes = [Mode::Proxy, Mode::Client];
+
+        assert_eq!(mode_index_for_shortcut(&modes, '1'), Some(0));
+        assert_eq!(mode_index_for_shortcut(&modes, 'p'), Some(0));
+        assert_eq!(mode_index_for_shortcut(&modes, '2'), Some(1));
+        assert_eq!(mode_index_for_shortcut(&modes, 'C'), Some(1));
+        assert_eq!(mode_index_for_shortcut(&[Mode::Proxy], '2'), None);
+        assert_eq!(mode_index_for_shortcut(&modes, 'x'), None);
+    }
 }

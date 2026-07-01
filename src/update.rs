@@ -12,6 +12,7 @@ use tar::Archive;
 pub const REPO_OWNER: &str = "guibeira";
 pub const REPO_NAME: &str = "wakezilla";
 pub const BIN_NAME: &str = "wakezilla";
+pub const WINDOWS_BIN_NAME: &str = "wakezilla.exe";
 
 #[derive(Debug, Clone)]
 pub struct UpdateRequest {
@@ -64,6 +65,14 @@ fn asset_name(version: &str, target: &str) -> String {
     format!("{BIN_NAME}-{}-{target}.tar.gz", normalize_tag(version))
 }
 
+fn binary_name_for_target(target: &str) -> &'static str {
+    if target.contains("windows") {
+        WINDOWS_BIN_NAME
+    } else {
+        BIN_NAME
+    }
+}
+
 fn target_from_parts(os: &str, arch: &str, libc: Option<&str>) -> Result<String> {
     let arch = match arch {
         "x86_64" | "amd64" => "x86_64",
@@ -77,6 +86,10 @@ fn target_from_parts(os: &str, arch: &str, libc: Option<&str>) -> Result<String>
             libc.filter(|value| !value.is_empty()).unwrap_or("gnu")
         )),
         "macos" | "darwin" => Ok(format!("{arch}-apple-darwin")),
+        "windows" => match arch {
+            "x86_64" => Ok("x86_64-pc-windows-msvc".to_string()),
+            other => bail!("unsupported architecture for Windows Wakezilla releases: {other}"),
+        },
         other => bail!("unsupported OS for Wakezilla releases: {other}"),
     }
 }
@@ -387,7 +400,11 @@ pub async fn run_update(request: UpdateRequest) -> Result<()> {
     let archive_path = tmpdir.path().join(&asset.name);
     fs::write(&archive_path, &archive_bytes)
         .with_context(|| format!("failed to write {}", archive_path.display()))?;
-    let extracted = extract_binary(&archive_path, &tmpdir.path().join("extract"), BIN_NAME)?;
+    let extracted = extract_binary(
+        &archive_path,
+        &tmpdir.path().join("extract"),
+        binary_name_for_target(&target),
+    )?;
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     install_binary(&extracted, &current_exe)?;
 
@@ -484,6 +501,23 @@ mod tests {
             target_from_parts("darwin", "arm64", None).unwrap(),
             "aarch64-apple-darwin"
         );
+        assert_eq!(
+            target_from_parts("windows", "x86_64", None).unwrap(),
+            "x86_64-pc-windows-msvc"
+        );
+    }
+
+    #[test]
+    fn update_uses_exe_binary_name_for_windows_targets() {
+        assert_eq!(
+            asset_name("0.2.3", "x86_64-pc-windows-msvc"),
+            "wakezilla-0.2.3-x86_64-pc-windows-msvc.tar.gz"
+        );
+        assert_eq!(
+            binary_name_for_target("x86_64-pc-windows-msvc"),
+            WINDOWS_BIN_NAME
+        );
+        assert_eq!(binary_name_for_target("x86_64-unknown-linux-gnu"), BIN_NAME);
     }
 
     #[test]

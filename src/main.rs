@@ -1,6 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
+use std::io::Write;
+use std::path::PathBuf;
 use tracing::{error, info, instrument};
+use tracing_subscriber::fmt::MakeWriter;
 
 mod access_log;
 mod api_models;
@@ -28,7 +31,7 @@ use cli::{handle_send_command, should_check_for_updates, Cli, Commands};
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    init_tracing();
+    init_tracing(tracing_log_path(&cli));
 
     if should_check_for_updates(&cli) {
         if let Err(e) = update::warn_if_update_available(env!("CARGO_PKG_VERSION")).await {
@@ -70,6 +73,12 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Commands::Uninstall => {
+            if let Err(e) = setup::run_uninstall() {
+                error!("Uninstall error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Commands::Service(args) => {
             if let Err(e) = setup::run_service(args) {
                 error!("Service error: {}", e);
@@ -82,17 +91,80 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
+        Commands::WindowsService(args) => {
+            let mode = service::Mode::from_str_opt(&args.mode)
+                .with_context(|| format!("invalid Windows service mode: {}", args.mode))?;
+            service::run_windows_service(mode)?;
+        }
     }
 
     Ok(())
 }
 
-fn init_tracing() {
+fn tracing_log_path(cli: &Cli) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Commands::WindowsService(args) = &cli.command {
+            return service::Mode::from_str_opt(&args.mode).map(service::service_log_path);
+        }
+    }
+    let _ = cli;
+    None
+}
+
+#[derive(Clone)]
+struct TracingWriter {
+    log_path: Option<PathBuf>,
+}
+
+enum TracingOutput {
+    File(std::fs::File),
+    Stderr(std::io::Stderr),
+}
+
+impl Write for TracingOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            TracingOutput::File(file) => file.write(buf),
+            TracingOutput::Stderr(stderr) => stderr.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            TracingOutput::File(file) => file.flush(),
+            TracingOutput::Stderr(stderr) => stderr.flush(),
+        }
+    }
+}
+
+impl<'a> MakeWriter<'a> for TracingWriter {
+    type Writer = TracingOutput;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        let Some(path) = &self.log_path else {
+            return TracingOutput::Stderr(std::io::stderr());
+        };
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map(TracingOutput::File)
+            .unwrap_or_else(|_| TracingOutput::Stderr(std::io::stderr()))
+    }
+}
+
+fn init_tracing(log_path: Option<PathBuf>) {
     let env_filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
 
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(TracingWriter { log_path })
         .with_env_filter(env_filter)
         .init();
 }

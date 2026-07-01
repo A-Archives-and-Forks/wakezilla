@@ -1,14 +1,24 @@
-use anyhow::{bail, Context, Result};
+#[cfg(not(windows))]
+use anyhow::Context;
+use anyhow::{bail, Result};
+#[cfg(not(windows))]
 use futures_util::StreamExt;
+#[cfg(not(windows))]
 use ipnetwork::IpNetwork;
+#[cfg(not(windows))]
 use pnet::datalink::{self, Channel, Config, NetworkInterface as PnetNetworkInterface};
+#[cfg(not(windows))]
 use pnet::packet::arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket};
+#[cfg(not(windows))]
 use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
+#[cfg(not(windows))]
 use pnet::packet::Packet;
+#[cfg(not(windows))]
 use pnet::util::MacAddr;
 use serde::Serialize;
-use std::net::IpAddr;
-use std::time::Duration;
+#[cfg(not(windows))]
+use std::{net::IpAddr, time::Duration};
+#[cfg(not(windows))]
 use tracing::{info, warn};
 
 /// Maximum number of concurrent hostname lookups during network scans.
@@ -22,6 +32,7 @@ pub struct DiscoveredDevice {
     pub hostname: Option<String>,
 }
 impl DiscoveredDevice {
+    #[cfg(not(windows))]
     fn scan_with_pnet(
         interface: PnetNetworkInterface,
         network: IpNetwork,
@@ -141,55 +152,14 @@ pub struct NetworkInterface {
 
 impl NetworkInterface {
     pub async fn list_interfaces() -> Result<Vec<NetworkInterface>> {
-        let interfaces = datalink::interfaces()
-            .into_iter()
-            .filter(|iface| {
-                iface.is_up()
-                    && !iface.is_loopback()
-                    && iface.mac.is_some()
-                    && iface.ips.iter().any(|ip| ip.is_ipv4())
-            })
-            .map(|iface| {
-                let ip = iface
-                    .ips
-                    .iter()
-                    .find(|ip| ip.is_ipv4())
-                    .map(|ip| ip.ip().to_string())
-                    .unwrap_or_else(|| "No IPv4".to_string());
+        #[cfg(windows)]
+        {
+            return Ok(Vec::new());
+        }
 
-                let mac = iface
-                    .mac
-                    .map(|mac| mac.to_string().to_uppercase())
-                    .unwrap_or_else(|| "No MAC".to_string());
-
-                let is_up = iface.is_up();
-                let name = iface.name;
-
-                NetworkInterface {
-                    name,
-                    ip,
-                    mac,
-                    is_up,
-                }
-            })
-            .collect();
-
-        Ok(interfaces)
-    }
-
-    pub async fn scan_network_with_interface(
-        interface_name: Option<&str>,
-    ) -> Result<Vec<DiscoveredDevice>> {
-        info!("Starting network scan on interface: {:?}", interface_name);
-
-        let pnet_iface = if let Some(name) = interface_name {
-            datalink::interfaces()
-                .into_iter()
-                .find(|iface| iface.name == name)
-                .ok_or_else(|| anyhow::anyhow!("Interface '{}' not found", name))?
-        } else {
-            // Use the original logic for automatic selection
-            datalink::interfaces()
+        #[cfg(not(windows))]
+        {
+            let interfaces = datalink::interfaces()
                 .into_iter()
                 .filter(|iface| {
                     iface.is_up()
@@ -197,79 +167,141 @@ impl NetworkInterface {
                         && iface.mac.is_some()
                         && iface.ips.iter().any(|ip| ip.is_ipv4())
                 })
-                .find(|iface| {
-                    // Prefer interfaces that are not Docker bridge networks (172.x.x.x)
-                    // and prefer macvlan interfaces (eth1, eth2, etc. over eth0)
-                    let has_non_docker_ip = iface.ips.iter().any(|ip| {
-                        if let std::net::IpAddr::V4(ipv4) = ip.ip() {
-                            ipv4.octets()[0] != 172 // Avoid Docker bridge networks
-                        } else {
-                            false
-                        }
-                    });
+                .map(|iface| {
+                    let ip = iface
+                        .ips
+                        .iter()
+                        .find(|ip| ip.is_ipv4())
+                        .map(|ip| ip.ip().to_string())
+                        .unwrap_or_else(|| "No IPv4".to_string());
 
-                    // If we have a non-Docker IP, prefer this interface
-                    if has_non_docker_ip {
-                        return true;
+                    let mac = iface
+                        .mac
+                        .map(|mac| mac.to_string().to_uppercase())
+                        .unwrap_or_else(|| "No MAC".to_string());
+
+                    let is_up = iface.is_up();
+                    let name = iface.name;
+
+                    NetworkInterface {
+                        name,
+                        ip,
+                        mac,
+                        is_up,
                     }
-
-                    // Otherwise, prefer interfaces that are not eth0 (Docker default)
-                    !iface.name.starts_with("eth0")
                 })
-                .or_else(|| {
-                    // Fallback to any suitable interface if no preferred one found
-                    datalink::interfaces().into_iter().find(|iface| {
+                .collect();
+
+            Ok(interfaces)
+        }
+    }
+
+    pub async fn scan_network_with_interface(
+        interface_name: Option<&str>,
+    ) -> Result<Vec<DiscoveredDevice>> {
+        #[cfg(windows)]
+        {
+            let _ = interface_name;
+            bail!(
+                "Network scanning is not available in Windows builds because \
+                 ARP scanning through pnet requires the external Npcap/WinPcap \
+                 Packet.lib SDK at link time. Wake-on-LAN, proxy, client, TUI, \
+                 setup, service, and update commands remain supported."
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            info!("Starting network scan on interface: {:?}", interface_name);
+
+            let pnet_iface = if let Some(name) = interface_name {
+                datalink::interfaces()
+                    .into_iter()
+                    .find(|iface| iface.name == name)
+                    .ok_or_else(|| anyhow::anyhow!("Interface '{}' not found", name))?
+            } else {
+                // Use the original logic for automatic selection
+                datalink::interfaces()
+                    .into_iter()
+                    .filter(|iface| {
                         iface.is_up()
                             && !iface.is_loopback()
                             && iface.mac.is_some()
                             && iface.ips.iter().any(|ip| ip.is_ipv4())
                     })
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!("No suitable network interface found for scanning.")
-                })?
-        };
+                    .find(|iface| {
+                        // Prefer interfaces that are not Docker bridge networks (172.x.x.x)
+                        // and prefer macvlan interfaces (eth1, eth2, etc. over eth0)
+                        let has_non_docker_ip = iface.ips.iter().any(|ip| {
+                            if let std::net::IpAddr::V4(ipv4) = ip.ip() {
+                                ipv4.octets()[0] != 172 // Avoid Docker bridge networks
+                            } else {
+                                false
+                            }
+                        });
 
-        // Validate the selected interface
-        if !pnet_iface.is_up() {
-            bail!("Selected interface '{}' is not up", pnet_iface.name);
-        }
-        if pnet_iface.is_loopback() {
-            bail!("Selected interface '{}' is loopback", pnet_iface.name);
-        }
-        if pnet_iface.mac.is_none() {
-            bail!(
-                "Selected interface '{}' has no MAC address",
-                pnet_iface.name
+                        // If we have a non-Docker IP, prefer this interface
+                        if has_non_docker_ip {
+                            return true;
+                        }
+
+                        // Otherwise, prefer interfaces that are not eth0 (Docker default)
+                        !iface.name.starts_with("eth0")
+                    })
+                    .or_else(|| {
+                        // Fallback to any suitable interface if no preferred one found
+                        datalink::interfaces().into_iter().find(|iface| {
+                            iface.is_up()
+                                && !iface.is_loopback()
+                                && iface.mac.is_some()
+                                && iface.ips.iter().any(|ip| ip.is_ipv4())
+                        })
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("No suitable network interface found for scanning.")
+                    })?
+            };
+
+            // Validate the selected interface
+            if !pnet_iface.is_up() {
+                bail!("Selected interface '{}' is not up", pnet_iface.name);
+            }
+            if pnet_iface.is_loopback() {
+                bail!("Selected interface '{}' is loopback", pnet_iface.name);
+            }
+            if pnet_iface.mac.is_none() {
+                bail!(
+                    "Selected interface '{}' has no MAC address",
+                    pnet_iface.name
+                );
+            }
+            if !pnet_iface.ips.iter().any(|ip| ip.is_ipv4()) {
+                bail!(
+                    "Selected interface '{}' has no IPv4 address",
+                    pnet_iface.name
+                );
+            }
+
+            let ip_network = pnet_iface
+                .ips
+                .iter()
+                .find(|ip| ip.is_ipv4())
+                .ok_or_else(|| anyhow::anyhow!("Selected interface has no IPv4 address."))?;
+
+            let source_ip = ip_network.ip();
+            let network = IpNetwork::new(ip_network.ip(), ip_network.prefix())
+                .context("Failed to create IP network")?;
+
+            info!(
+                "Found network interface to scan: {} on {}",
+                network, pnet_iface.name
             );
-        }
-        if !pnet_iface.ips.iter().any(|ip| ip.is_ipv4()) {
-            bail!(
-                "Selected interface '{}' has no IPv4 address",
-                pnet_iface.name
-            );
-        }
 
-        let ip_network = pnet_iface
-            .ips
-            .iter()
-            .find(|ip| ip.is_ipv4())
-            .ok_or_else(|| anyhow::anyhow!("Selected interface has no IPv4 address."))?;
+            let source_mac = pnet_iface
+                .mac
+                .ok_or_else(|| anyhow::anyhow!("Interface has no MAC address"))?;
 
-        let source_ip = ip_network.ip();
-        let network = IpNetwork::new(ip_network.ip(), ip_network.prefix())
-            .context("Failed to create IP network")?;
-
-        info!(
-            "Found network interface to scan: {} on {}",
-            network, pnet_iface.name
-        );
-
-        let source_mac = pnet_iface
-            .mac
-            .ok_or_else(|| anyhow::anyhow!("Interface has no MAC address"))?;
-
-        let discovered_devices_no_hostname = tokio::task::spawn_blocking(move || {
+            let discovered_devices_no_hostname = tokio::task::spawn_blocking(move || {
         DiscoveredDevice::scan_with_pnet(pnet_iface, network, source_ip, source_mac)
     })
     .await
@@ -281,29 +313,31 @@ impl NetworkInterface {
          or use 'sudo' on macOS/Linux."
     )?;
 
-        // Use buffer_unordered to limit concurrent hostname lookups,
-        // preventing DNS/task spikes on large subnets.
-        // Offload blocking DNS lookups to spawn_blocking to avoid blocking the executor.
-        let discovered_devices: Vec<DiscoveredDevice> =
-            futures_util::stream::iter(discovered_devices_no_hostname)
-                .map(|mut device| async move {
-                    if let Ok(ip_addr) = device.ip.parse::<IpAddr>() {
-                        let hostname_result =
-                            tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip_addr))
-                                .await;
-                        // Handle both the JoinError and the lookup Result
-                        device.hostname = hostname_result.ok().and_then(|r| r.ok());
-                    }
-                    device
-                })
-                .buffer_unordered(HOSTNAME_LOOKUP_CONCURRENCY)
-                .collect()
-                .await;
+            // Use buffer_unordered to limit concurrent hostname lookups,
+            // preventing DNS/task spikes on large subnets.
+            // Offload blocking DNS lookups to spawn_blocking to avoid blocking the executor.
+            let discovered_devices: Vec<DiscoveredDevice> =
+                futures_util::stream::iter(discovered_devices_no_hostname)
+                    .map(|mut device| async move {
+                        if let Ok(ip_addr) = device.ip.parse::<IpAddr>() {
+                            let hostname_result = tokio::task::spawn_blocking(move || {
+                                dns_lookup::lookup_addr(&ip_addr)
+                            })
+                            .await;
+                            // Handle both the JoinError and the lookup Result
+                            device.hostname = hostname_result.ok().and_then(|r| r.ok());
+                        }
+                        device
+                    })
+                    .buffer_unordered(HOSTNAME_LOOKUP_CONCURRENCY)
+                    .collect()
+                    .await;
 
-        info!(
-            "Network scan finished. Found {} devices.",
-            discovered_devices.len()
-        );
-        Ok(discovered_devices)
+            info!(
+                "Network scan finished. Found {} devices.",
+                discovered_devices.len()
+            );
+            Ok(discovered_devices)
+        }
     }
 }

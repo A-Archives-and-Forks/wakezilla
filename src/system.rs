@@ -1,12 +1,20 @@
+#[cfg(not(windows))]
 use pnet::datalink;
 use std::process::Command;
 
 #[allow(dead_code)]
 pub fn get_local_mac_addresses() -> Vec<String> {
-    datalink::interfaces()
-        .into_iter()
-        .filter_map(|iface| iface.mac.map(|mac| mac.to_string()))
-        .collect()
+    #[cfg(windows)]
+    {
+        Vec::new()
+    }
+    #[cfg(not(windows))]
+    {
+        datalink::interfaces()
+            .into_iter()
+            .filter_map(|iface| iface.mac.map(|mac| mac.to_string()))
+            .collect()
+    }
 }
 
 #[allow(dead_code)]
