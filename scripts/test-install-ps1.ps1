@@ -117,9 +117,87 @@ function Test-ArchiveAndInstall {
     }
 }
 
+function New-MockService {
+    param(
+        [string]$Name,
+        [string]$Status
+    )
+
+    $service = [pscustomobject]@{
+        Name   = $Name
+        Status = $Status
+    }
+    $service | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {
+        param(
+            [object]$Status,
+            [TimeSpan]$Timeout
+        )
+        $script:WaitedServices += "$($this.Name):$Status"
+        $this.Status = $Status
+    }
+    $service
+}
+
+function Get-Service {
+    param(
+        [string]$Name,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [object[]]$Remaining
+    )
+
+    if ($script:MockServices -and $script:MockServices.ContainsKey($Name)) {
+        return $script:MockServices[$Name]
+    }
+}
+
+function Stop-Service {
+    param(
+        [string]$Name,
+        [switch]$Force,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [object[]]$Remaining
+    )
+
+    $script:StoppedServices += $Name
+    $script:MockServices[$Name].Status = "Stopped"
+}
+
+function Start-Service {
+    param(
+        [string]$Name,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [object[]]$Remaining
+    )
+
+    $script:StartedServices += $Name
+}
+
+function Test-ServiceStopAndRestartHelpers {
+    $script:MockServices = @{
+        "wakezilla-proxy"  = New-MockService -Name "wakezilla-proxy" -Status "Running"
+        "wakezilla-client" = New-MockService -Name "wakezilla-client" -Status "Stopped"
+    }
+    $script:StoppedServices = @()
+    $script:StartedServices = @()
+    $script:WaitedServices = @()
+
+    $restartServices = @(Stop-WakezillaServicesForInstall -ServiceNames @("wakezilla-proxy", "wakezilla-client"))
+
+    Assert-Equal 1 $restartServices.Count "restart service count"
+    Assert-Equal "wakezilla-proxy" $restartServices[0] "restart service name"
+    Assert-Equal 1 $script:StoppedServices.Count "stopped service count"
+    Assert-Equal "wakezilla-proxy" $script:StoppedServices[0] "stopped service name"
+    Assert-Equal "wakezilla-proxy:Stopped" $script:WaitedServices[0] "waited service"
+
+    Restart-WakezillaServicesAfterInstall -ServiceNames $restartServices
+    Assert-Equal 1 $script:StartedServices.Count "started service count"
+    Assert-Equal "wakezilla-proxy" $script:StartedServices[0] "started service name"
+}
+
 Test-TargetDetection
 Test-ReleaseHelpers
 Test-ChecksumHelpers
 Test-ArchiveAndInstall
+Test-ServiceStopAndRestartHelpers
 
 Write-Host "install.ps1 tests passed"
