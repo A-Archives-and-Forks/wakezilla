@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 use tray_icon::{
-    menu::{MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     Icon, TrayIcon, TrayIconBuilder,
 };
 use winit::{
@@ -336,7 +336,7 @@ impl ServiceControl {
     }
 }
 
-fn build_menu() -> Result<(Submenu, TrayMenu)> {
+fn build_menu() -> Result<(Menu, TrayMenu)> {
     let open_dashboard = MenuItem::with_id(OPEN_DASHBOARD_ID, "Open dashboard", true, None);
     let copy_dashboard_url =
         MenuItem::with_id(COPY_DASHBOARD_URL_ID, "Copy dashboard URL", true, None);
@@ -353,7 +353,7 @@ fn build_menu() -> Result<(Submenu, TrayMenu)> {
     let separator3 = PredefinedMenuItem::separator();
     let separator4 = PredefinedMenuItem::separator();
 
-    let root = Submenu::new("Wakezilla", true);
+    let root = Menu::new();
     root.append_items(&[
         &message,
         &separator1,
