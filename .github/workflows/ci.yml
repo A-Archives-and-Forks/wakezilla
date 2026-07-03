@@ -103,6 +103,9 @@ jobs:
       - name: Check Windows backend
         run: cargo check -p wakezilla --all-targets --locked --features desktop-tray
 
+      - name: Check Windows tray
+        run: cargo check -p wakezilla --bin wakezilla-tray --features desktop-tray --locked
+
       - name: Run Windows backend tests
         run: cargo test -p wakezilla -p wakezilla-common --locked
 
