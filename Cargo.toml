@@ -52,6 +52,10 @@ include = [
     "LICENSE",
 ]
 
+[[bin]]
+name = "wakezilla-tray"
+path = "src/bin/wakezilla-tray.rs"
+required-features = ["desktop-tray"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

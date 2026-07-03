@@ -104,6 +104,11 @@ jobs:
           fi
           cargo build --release --target "${TARGET}" "${FEATURES[@]}"
 
+      - name: Build Windows tray binary
+        if: ${{ contains(matrix.target, 'windows') }}
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} --bin wakezilla-tray --features desktop-tray
+
       - name: Create release archive
         shell: bash
         run: |
@@ -112,14 +117,23 @@ jobs:
           TARGET="${{ matrix.target }}"
           ARCHIVE="wakezilla-${VERSION}-${TARGET}.tar.gz"
           BIN="wakezilla"
+          EXTRA_BINS=()
           if [[ "${TARGET}" == *windows* ]]; then
             BIN="wakezilla.exe"
+            EXTRA_BINS=("wakezilla-tray.exe")
           fi
           mkdir -p release
           cp "target/${TARGET}/release/${BIN}" "release/${BIN}"
           chmod +x "release/${BIN}"
-          tar -C release -czf "release/${ARCHIVE}" "${BIN}"
+          for extra_bin in "${EXTRA_BINS[@]}"; do
+            cp "target/${TARGET}/release/${extra_bin}" "release/${extra_bin}"
+            chmod +x "release/${extra_bin}"
+          done
+          tar -C release -czf "release/${ARCHIVE}" "${BIN}" "${EXTRA_BINS[@]}"
           rm -f "release/${BIN}"
+          for extra_bin in "${EXTRA_BINS[@]}"; do
+            rm -f "release/${extra_bin}"
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

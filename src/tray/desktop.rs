@@ -3,7 +3,7 @@ use anyhow::{anyhow, Context, Result};
 #[cfg(target_os = "windows")]
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use tray_icon::{
@@ -585,13 +585,56 @@ fn rgba_from_png_frame(bytes: &[u8], color_type: png::ColorType) -> Result<Vec<u
 }
 
 fn open_wakezilla_command(elevated: bool, args: &[&str], keep_open: bool) -> Result<()> {
-    let exe = std::env::current_exe().context("failed to resolve wakezilla executable")?;
+    let exe = wakezilla_cli_exe()?;
     open_command(elevated, &exe, args, keep_open)
+}
+
+fn wakezilla_cli_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("failed to resolve wakezilla executable")?;
+    if !is_wakezilla_tray_exe(&exe) {
+        return Ok(exe);
+    }
+
+    sibling_exe(&exe, "wakezilla").with_context(|| {
+        format!(
+            "failed to find wakezilla CLI executable next to {}",
+            exe.display()
+        )
+    })
+}
+
+fn wakezilla_tray_command() -> Result<(PathBuf, Vec<&'static str>)> {
+    let exe = std::env::current_exe().context("failed to resolve wakezilla executable")?;
+    if is_wakezilla_tray_exe(&exe) {
+        return Ok((exe, Vec::new()));
+    }
+
+    if let Some(tray_exe) = sibling_exe(&exe, "wakezilla-tray") {
+        return Ok((tray_exe, Vec::new()));
+    }
+
+    Ok((exe, vec!["tray"]))
+}
+
+fn is_wakezilla_tray_exe(exe: &Path) -> bool {
+    exe.file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("wakezilla-tray"))
+}
+
+fn sibling_exe(exe: &Path, name: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let file_name = format!("{name}.exe");
+    #[cfg(not(target_os = "windows"))]
+    let file_name = name;
+
+    let candidate = exe.parent()?.join(file_name);
+    candidate.is_file().then_some(candidate)
 }
 
 #[cfg(target_os = "linux")]
 fn install_tray_autostart() -> Result<std::path::PathBuf> {
-    let exe = std::env::current_exe().context("failed to resolve wakezilla executable")?;
+    let (exe, args) = wakezilla_tray_command()?;
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -606,10 +649,10 @@ fn install_tray_autostart() -> Result<std::path::PathBuf> {
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=Wakezilla Tray\n\
-         Exec={} tray\n\
+         Exec={}\n\
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n",
-        desktop_entry_quote(&exe.to_string_lossy()),
+        desktop_entry_command(&exe, &args),
     );
     std::fs::write(&path, content)
         .with_context(|| format!("failed to write {}", path.display()))?;
@@ -618,7 +661,7 @@ fn install_tray_autostart() -> Result<std::path::PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn install_tray_autostart() -> Result<std::path::PathBuf> {
-    let exe = std::env::current_exe().context("failed to resolve wakezilla executable")?;
+    let (exe, args) = wakezilla_tray_command()?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .context("HOME is required to install tray autostart")?;
@@ -636,13 +679,14 @@ fn install_tray_autostart() -> Result<std::path::PathBuf> {
          \t<key>ProgramArguments</key>\n\
          \t<array>\n\
          \t\t<string>{}</string>\n\
-         \t\t<string>tray</string>\n\
+         {}\
          \t</array>\n\
          \t<key>RunAtLoad</key>\n\
          \t<true/>\n\
          </dict>\n\
          </plist>\n",
         xml_escape(&exe.to_string_lossy()),
+        plist_args(&args),
     );
     std::fs::write(&path, content)
         .with_context(|| format!("failed to write {}", path.display()))?;
@@ -651,8 +695,8 @@ fn install_tray_autostart() -> Result<std::path::PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn install_tray_autostart() -> Result<std::path::PathBuf> {
-    let exe = std::env::current_exe().context("failed to resolve wakezilla executable")?;
-    let command = format!("\"{}\" tray", exe.display());
+    let (exe, args) = wakezilla_tray_command()?;
+    let command = windows_command(&exe, &args);
     let status = Command::new("reg")
         .args([
             "add",
@@ -674,6 +718,14 @@ fn install_tray_autostart() -> Result<std::path::PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+fn desktop_entry_command(exe: &Path, args: &[&str]) -> String {
+    std::iter::once(desktop_entry_quote(&exe.to_string_lossy()))
+        .chain(args.iter().map(|arg| desktop_entry_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(target_os = "linux")]
 fn desktop_entry_quote(value: &str) -> String {
     format!(
         "\"{}\"",
@@ -685,6 +737,13 @@ fn desktop_entry_quote(value: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn plist_args(args: &[&str]) -> String {
+    args.iter()
+        .map(|arg| format!("\t\t<string>{}</string>\n", xml_escape(arg)))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -692,6 +751,14 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_command(exe: &Path, args: &[&str]) -> String {
+    std::iter::once(format!("\"{}\"", exe.display()))
+        .chain(args.iter().map(|arg| format!("\"{arg}\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
