@@ -595,7 +595,12 @@ fn wakezilla_cli_exe() -> Result<PathBuf> {
         return Ok(exe);
     }
 
-    Ok(sibling_exe(&exe, "wakezilla").unwrap_or(exe))
+    sibling_exe(&exe, "wakezilla").with_context(|| {
+        format!(
+            "failed to find wakezilla CLI executable next to {}",
+            exe.display()
+        )
+    })
 }
 
 fn wakezilla_tray_command() -> Result<(PathBuf, Vec<&'static str>)> {
