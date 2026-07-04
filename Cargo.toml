@@ -21,7 +21,7 @@ codegen-units = 1
 
 [package]
 name = "wakezilla"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 build = "build.rs"
 license = "MIT"
