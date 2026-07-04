@@ -117,22 +117,22 @@ jobs:
           TARGET="${{ matrix.target }}"
           ARCHIVE="wakezilla-${VERSION}-${TARGET}.tar.gz"
           BIN="wakezilla"
-          EXTRA_BINS=()
           if [[ "${TARGET}" == *windows* ]]; then
             BIN="wakezilla.exe"
-            EXTRA_BINS=("wakezilla-tray.exe")
           fi
+          ARCHIVE_ITEMS=("${BIN}")
           mkdir -p release
           cp "target/${TARGET}/release/${BIN}" "release/${BIN}"
           chmod +x "release/${BIN}"
-          for extra_bin in "${EXTRA_BINS[@]}"; do
+          if [[ "${TARGET}" == *windows* ]]; then
+            extra_bin="wakezilla-tray.exe"
             cp "target/${TARGET}/release/${extra_bin}" "release/${extra_bin}"
             chmod +x "release/${extra_bin}"
-          done
-          tar -C release -czf "release/${ARCHIVE}" "${BIN}" "${EXTRA_BINS[@]}"
-          rm -f "release/${BIN}"
-          for extra_bin in "${EXTRA_BINS[@]}"; do
-            rm -f "release/${extra_bin}"
+            ARCHIVE_ITEMS+=("${extra_bin}")
+          fi
+          tar -C release -czf "release/${ARCHIVE}" "${ARCHIVE_ITEMS[@]}"
+          for archive_item in "${ARCHIVE_ITEMS[@]}"; do
+            rm -f "release/${archive_item}"
           done
 
       - name: Upload artifact
