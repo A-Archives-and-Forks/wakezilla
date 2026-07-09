@@ -13,6 +13,8 @@ pub const REPO_OWNER: &str = "guibeira";
 pub const REPO_NAME: &str = "wakezilla";
 pub const BIN_NAME: &str = "wakezilla";
 pub const WINDOWS_BIN_NAME: &str = "wakezilla.exe";
+const TRAY_HELPER_BIN_NAME: &str = "wakezilla-tray";
+const WINDOWS_TRAY_HELPER_BIN_NAME: &str = "wakezilla-tray.exe";
 
 #[derive(Debug, Clone)]
 pub struct UpdateRequest {
@@ -70,6 +72,14 @@ fn binary_name_for_target(target: &str) -> &'static str {
         WINDOWS_BIN_NAME
     } else {
         BIN_NAME
+    }
+}
+
+fn tray_helper_name_for_target(target: &str) -> &'static str {
+    if target.contains("windows") {
+        WINDOWS_TRAY_HELPER_BIN_NAME
+    } else {
+        TRAY_HELPER_BIN_NAME
     }
 }
 
@@ -284,6 +294,33 @@ fn verify_checksum_bytes(bytes: &[u8], checksums: &str, asset_name: &str) -> Res
     }
 }
 
+fn find_binary_in_dir(out_dir: &Path, bin_name: &str) -> Result<Option<PathBuf>> {
+    let direct = out_dir.join(bin_name);
+    if direct.is_file() {
+        return Ok(Some(direct));
+    }
+
+    let mut pending = vec![out_dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
+        {
+            let entry = entry.context("failed to read extracted archive entry")?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("failed to read file type for {}", path.display()))?;
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() && entry.file_name() == bin_name {
+                return Ok(Some(path));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 fn extract_binary(archive_path: &Path, out_dir: &Path, bin_name: &str) -> Result<PathBuf> {
     fs::create_dir_all(out_dir).with_context(|| {
         format!(
@@ -300,30 +337,8 @@ fn extract_binary(archive_path: &Path, out_dir: &Path, bin_name: &str) -> Result
         .unpack(out_dir)
         .with_context(|| format!("failed to extract {}", archive_path.display()))?;
 
-    let direct = out_dir.join(bin_name);
-    if direct.is_file() {
-        return Ok(direct);
-    }
-
-    let mut pending = vec![out_dir.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        for entry in
-            fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
-        {
-            let entry = entry.context("failed to read extracted archive entry")?;
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("failed to read file type for {}", path.display()))?;
-            if file_type.is_dir() {
-                pending.push(path);
-            } else if file_type.is_file() && entry.file_name() == bin_name {
-                return Ok(path);
-            }
-        }
-    }
-
-    bail!("binary {bin_name} not found in downloaded asset")
+    find_binary_in_dir(out_dir, bin_name)?
+        .ok_or_else(|| anyhow!("binary {bin_name} not found in downloaded asset"))
 }
 
 fn install_binary(src: &Path, dst: &Path) -> Result<()> {
@@ -366,6 +381,39 @@ fn install_binary(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn install_optional_tray_helper(
+    extract_dir: &Path,
+    current_exe: &Path,
+    target: &str,
+) -> Result<()> {
+    let helper_name = tray_helper_name_for_target(target);
+    let helper_dst = current_exe
+        .parent()
+        .ok_or_else(|| {
+            anyhow!(
+                "current executable has no parent directory: {}",
+                current_exe.display()
+            )
+        })?
+        .join(helper_name);
+
+    if let Some(helper_src) = find_binary_in_dir(extract_dir, helper_name)? {
+        install_binary(&helper_src, &helper_dst)?;
+    } else {
+        remove_file_if_present(&helper_dst)?;
+    }
+
+    Ok(())
+}
+
 pub async fn run_update(request: UpdateRequest) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -400,13 +448,11 @@ pub async fn run_update(request: UpdateRequest) -> Result<()> {
     let archive_path = tmpdir.path().join(&asset.name);
     fs::write(&archive_path, &archive_bytes)
         .with_context(|| format!("failed to write {}", archive_path.display()))?;
-    let extracted = extract_binary(
-        &archive_path,
-        &tmpdir.path().join("extract"),
-        binary_name_for_target(&target),
-    )?;
+    let extract_dir = tmpdir.path().join("extract");
+    let extracted = extract_binary(&archive_path, &extract_dir, binary_name_for_target(&target))?;
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     install_binary(&extracted, &current_exe)?;
+    install_optional_tray_helper(&extract_dir, &current_exe, &target)?;
 
     println!(
         "Updated wakezilla to v{release_version} at {}.",
@@ -627,5 +673,54 @@ mod tests {
                 0o755
             );
         }
+    }
+
+    #[test]
+    fn update_installs_optional_tray_helper_next_to_current_exe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extract_dir = dir.path().join("extract");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&extract_dir).expect("create extract dir");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let helper_src = extract_dir.join(TRAY_HELPER_BIN_NAME);
+        let current_exe = bin_dir.join(BIN_NAME);
+        fs::write(&helper_src, b"tray").expect("write tray helper");
+        fs::write(&current_exe, b"wakezilla").expect("write current exe");
+
+        install_optional_tray_helper(&extract_dir, &current_exe, "x86_64-unknown-linux-musl")
+            .expect("install tray helper");
+
+        let helper_dst = bin_dir.join(TRAY_HELPER_BIN_NAME);
+        assert_eq!(fs::read(&helper_dst).expect("read helper"), b"tray");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&helper_dst)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
+    }
+
+    #[test]
+    fn update_removes_stale_optional_tray_helper_when_missing_from_archive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extract_dir = dir.path().join("extract");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&extract_dir).expect("create extract dir");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let current_exe = bin_dir.join(BIN_NAME);
+        let helper_dst = bin_dir.join(TRAY_HELPER_BIN_NAME);
+        fs::write(&current_exe, b"wakezilla").expect("write current exe");
+        fs::write(&helper_dst, b"stale").expect("write stale tray helper");
+
+        install_optional_tray_helper(&extract_dir, &current_exe, "x86_64-unknown-linux-musl")
+            .expect("remove stale tray helper");
+
+        assert!(!helper_dst.exists());
     }
 }

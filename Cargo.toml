@@ -92,7 +92,7 @@ tar = "0.4"
 tempfile = "3"
 base64 = { version = "0.22.1", optional = true }
 
-[target.'cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "musl"))))'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"], optional = true }
 open = { version = "5.3.6", optional = true }
 png = { version = "0.18", optional = true }

@@ -3,6 +3,7 @@ set -eu
 
 REPO="${REPO:-guibeira/wakezilla}"
 BIN_NAME="${BIN_NAME:-wakezilla}"
+TRAY_HELPER_NAME="${TRAY_HELPER_NAME:-wakezilla-tray}"
 
 info() {
   printf '%s\n' "$*"
@@ -293,11 +294,7 @@ extract_binary() {
       ;;
   esac
 
-  if [ -f "$out_dir/$bin_name" ]; then
-    bin_file="$out_dir/$bin_name"
-  else
-    bin_file=$(find "$out_dir" -type f -name "$bin_name" 2>/dev/null | head -n 1)
-  fi
+  bin_file=$(find_binary_in_dir "$out_dir" "$bin_name")
 
   if [ -z "${bin_file:-}" ] || [ ! -f "$bin_file" ]; then
     err "binary_lookup" "binary $bin_name not found in downloaded asset"
@@ -305,6 +302,35 @@ extract_binary() {
 
   chmod 755 "$bin_file"
   printf '%s\n' "$bin_file"
+}
+
+find_binary_in_dir() {
+  root_dir="$1"
+  bin_name="$2"
+
+  if [ -f "$root_dir/$bin_name" ]; then
+    printf '%s\n' "$root_dir/$bin_name"
+    return 0
+  fi
+
+  find "$root_dir" -type f -name "$bin_name" 2>/dev/null | head -n 1
+}
+
+install_optional_tray_helper() {
+  extract_dir="$1"
+  install_dir="$2"
+  helper_file=$(find_binary_in_dir "$extract_dir" "$TRAY_HELPER_NAME")
+  helper_dst="$install_dir/$TRAY_HELPER_NAME"
+
+  if [ -n "${helper_file:-}" ] && [ -f "$helper_file" ]; then
+    chmod 755 "$helper_file"
+    install_bin "$helper_file" "$helper_dst" || err "install" "failed to install binary to $helper_dst"
+    return 0
+  fi
+
+  if [ -e "$helper_dst" ] || [ -L "$helper_dst" ]; then
+    rm -f "$helper_dst" || warn "failed to remove stale tray helper at $helper_dst"
+  fi
 }
 
 path_guidance() {
@@ -386,8 +412,10 @@ download_and_install_target() {
   download_file "$(checksum_url_for_release "$release_version")" "$checksums" "SHA256SUMS"
   verify_checksum "$install_archive" "$checksums" "$install_asset_name"
 
-  install_bin_file=$(extract_binary "$install_archive" "$tmpdir/extract-$install_target" "$BIN_NAME")
+  install_extract_dir="$tmpdir/extract-$install_target"
+  install_bin_file=$(extract_binary "$install_archive" "$install_extract_dir" "$BIN_NAME")
   install_bin "$install_bin_file" "$bin_dir/$BIN_NAME" || err "install" "failed to install binary to $bin_dir/$BIN_NAME"
+  install_optional_tray_helper "$install_extract_dir" "$bin_dir"
 
   INSTALLED_ASSET_URL="$install_asset_url"
 }

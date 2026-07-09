@@ -214,8 +214,10 @@ test_end_to_end_install_with_fake_curl() {
   write_install_dependency_stubs "$temp_dir/bin"
 
   printf '#!/usr/bin/env sh\nprintf "wakezilla 0.1.49\\n"\n' > "$temp_dir/archive/wakezilla"
+  printf '#!/usr/bin/env sh\nexit 0\n' > "$temp_dir/archive/wakezilla-tray"
   chmod +x "$temp_dir/archive/wakezilla"
-  tar -C "$temp_dir/archive" -czf "$temp_dir/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz" wakezilla
+  chmod +x "$temp_dir/archive/wakezilla-tray"
+  tar -C "$temp_dir/archive" -czf "$temp_dir/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz" wakezilla wakezilla-tray
   if ! sha=$(sha256_file "$temp_dir/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz"); then
     printf 'SKIP: end-to-end fake release test requires sha256sum or shasum\n'
     rm -rf "$temp_dir"
@@ -299,6 +301,9 @@ EOF
   assert_not_contains "$output" "unexpected url" "end-to-end no unexpected network"
   if [ ! -x "$temp_dir/install/wakezilla" ]; then
     fail "end-to-end install: expected installed binary"
+  fi
+  if [ ! -x "$temp_dir/install/wakezilla-tray" ]; then
+    fail "end-to-end install: expected installed tray helper"
   fi
 
   rm -rf "$temp_dir"
@@ -742,6 +747,7 @@ test_install_release_json_helpers_defined() {
   assert_command_exists checksum_url_for_release "checksum url helper" || missing=1
   assert_command_exists verify_checksum "verify checksum helper" || missing=1
   assert_command_exists extract_binary "extract binary helper" || missing=1
+  assert_command_exists install_optional_tray_helper "install optional tray helper" || missing=1
   assert_command_exists install_bin "install binary helper" || missing=1
   [ "$missing" -eq 0 ]
 }
@@ -826,6 +832,33 @@ test_extract_binary_from_nested_tarball() {
   rm -rf "$temp_dir"
 }
 
+test_install_optional_tray_helper_installs_when_present() {
+  temp_dir=$(mktemp -d)
+  mkdir -p "$temp_dir/extract" "$temp_dir/bin"
+  printf '#!/usr/bin/env sh\nexit 0\n' > "$temp_dir/extract/wakezilla-tray"
+
+  install_optional_tray_helper "$temp_dir/extract" "$temp_dir/bin"
+  if [ ! -x "$temp_dir/bin/wakezilla-tray" ]; then
+    fail "install optional tray helper: expected executable helper"
+  fi
+
+  rm -rf "$temp_dir"
+}
+
+test_install_optional_tray_helper_removes_stale_helper() {
+  temp_dir=$(mktemp -d)
+  mkdir -p "$temp_dir/extract" "$temp_dir/bin"
+  printf '#!/usr/bin/env sh\nexit 0\n' > "$temp_dir/bin/wakezilla-tray"
+  chmod +x "$temp_dir/bin/wakezilla-tray"
+
+  install_optional_tray_helper "$temp_dir/extract" "$temp_dir/bin"
+  if [ -e "$temp_dir/bin/wakezilla-tray" ]; then
+    fail "install optional tray helper: expected stale helper removal"
+  fi
+
+  rm -rf "$temp_dir"
+}
+
 test_install_bin_sets_executable() {
   temp_dir=$(mktemp -d)
   mkdir -p "$temp_dir/bin"
@@ -879,6 +912,8 @@ if test_install_release_json_helpers_defined; then
   test_verify_checksum_rejects_mismatch
   test_extract_binary_from_tarball
   test_extract_binary_from_nested_tarball
+  test_install_optional_tray_helper_installs_when_present
+  test_install_optional_tray_helper_removes_stale_helper
   test_install_bin_sets_executable
   test_install_bin_fallback_replaces_symlink
 fi

@@ -104,6 +104,26 @@ jobs:
           fi
           cargo build --release --target "${TARGET}" "${FEATURES[@]}"
 
+      - name: Build Linux musl tray helper
+        if: ${{ contains(matrix.target, 'linux-musl') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            -e TARGET="${TARGET}" \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            rust:1-alpine \
+            sh -lc '
+              set -eu
+              export PATH=/usr/local/cargo/bin:$PATH
+              apk add --no-cache build-base pkgconf gtk+3.0-dev libayatana-appindicator-dev
+              CARGO_TARGET_DIR=target/musl-tray cargo build --release --target "$TARGET" --bin wakezilla-tray --features desktop-tray
+              cp "target/musl-tray/$TARGET/release/wakezilla-tray" "target/$TARGET/release/wakezilla-tray"
+            '
+
       - name: Build Windows tray binary
         if: ${{ contains(matrix.target, 'windows') }}
         shell: bash
@@ -126,6 +146,11 @@ jobs:
           chmod +x "release/${BIN}"
           if [[ "${TARGET}" == *windows* ]]; then
             extra_bin="wakezilla-tray.exe"
+            cp "target/${TARGET}/release/${extra_bin}" "release/${extra_bin}"
+            chmod +x "release/${extra_bin}"
+            ARCHIVE_ITEMS+=("${extra_bin}")
+          elif [[ "${TARGET}" == *linux-musl* ]]; then
+            extra_bin="wakezilla-tray"
             cp "target/${TARGET}/release/${extra_bin}" "release/${extra_bin}"
             chmod +x "release/${extra_bin}"
             ARCHIVE_ITEMS+=("${extra_bin}")
