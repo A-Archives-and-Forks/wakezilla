@@ -47,7 +47,7 @@ jobs:
       - name: Install desktop tray Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxkbcommon-x11-0 xvfb xauth
 
       - name: Prepare frontend assets for backend lint
         run: |
@@ -56,6 +56,9 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked --features desktop-tray -- -D warnings
+
+      - name: Test desktop tray startup
+        run: xvfb-run -a cargo test -p wakezilla --locked --features desktop-tray --test tray_startup
 
   install-script:
     name: install script

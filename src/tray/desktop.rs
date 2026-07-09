@@ -82,6 +82,9 @@ struct ModeStatus {
 }
 
 pub fn run() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    gtk::init().context("failed to initialize GTK")?;
+
     let config = config::Config::load();
     let dashboard_url = dashboard_url(&config);
 
