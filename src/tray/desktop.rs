@@ -856,7 +856,9 @@ fn wakezilla_tray_command() -> Result<(PathBuf, Vec<&'static str>)> {
         return Ok((tray_exe, Vec::new()));
     }
 
-    Ok((exe, vec!["tray"]))
+    Err(anyhow!(
+        "wakezilla-tray helper is required for graphical startup; refusing to launch the console CLI"
+    ))
 }
 
 fn is_wakezilla_tray_exe(exe: &Path) -> bool {

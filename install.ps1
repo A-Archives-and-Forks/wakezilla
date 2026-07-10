@@ -323,8 +323,10 @@ function Get-WakezillaProcessesForInstall {
         return @()
     }
 
+    $processName = Split-Path -Leaf $ExecutablePath
+
     try {
-        @(Get-CimInstance Win32_Process -Filter "name = '$ExeName'" -ErrorAction Stop |
+        @(Get-CimInstance Win32_Process -Filter "name = '$processName'" -ErrorAction Stop |
             Where-Object { Test-SamePath $_.ExecutablePath $ExecutablePath })
     }
     catch {
@@ -422,6 +424,161 @@ function Add-UserPath {
     }
 }
 
+function Get-RegularReleaseFile {
+    param(
+        [string]$Root,
+        [string]$Name
+    )
+
+    $candidate = Join-Path $Root $Name
+    $item = Get-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
+    if (-not $item -or $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Stop-Install "archive" "release archive is missing regular file $Name"
+    }
+    $item.FullName
+}
+
+function New-WakezillaShortcut {
+    param(
+        [string]$Path,
+        [string]$TargetPath,
+        [string]$WorkingDirectory,
+        [string]$IconPath
+    )
+
+    $parent = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($Path)
+    $shortcut.TargetPath = $TargetPath
+    $shortcut.Arguments = ""
+    $shortcut.WorkingDirectory = $WorkingDirectory
+    $shortcut.IconLocation = "$IconPath,0"
+    $shortcut.Description = "Wakezilla tray"
+    $shortcut.Save()
+}
+
+function Get-WakezillaUninstallScript {
+    param([string]$InstallRoot)
+
+    $scriptPath = Join-Path $InstallRoot "uninstall-wakezilla.ps1"
+    $script = @'
+[CmdletBinding()]
+param([switch]$Quiet)
+$ErrorActionPreference = "Stop"
+$installRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$binDir = Join-Path $installRoot "bin"
+$tray = Join-Path $binDir "wakezilla-tray.exe"
+$cli = Join-Path $binDir "wakezilla.exe"
+$icon = Join-Path $binDir "wakezilla.ico"
+$programs = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)
+$desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
+$shortcuts = @((Join-Path $programs "Wakezilla.lnk"), (Join-Path $desktop "Wakezilla.lnk"))
+foreach ($path in $shortcuts) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
+Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name WakezillaTray -ErrorAction SilentlyContinue
+Remove-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Wakezilla" -Recurse -Force -ErrorAction SilentlyContinue
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath) {
+    $keptPath = @($userPath -split ";" | Where-Object { $_ -and ($_.TrimEnd("\") -ine $binDir.TrimEnd("\")) }) -join ";"
+    [Environment]::SetEnvironmentVariable("Path", $keptPath, "User")
+}
+foreach ($path in @($tray, $cli, $icon, (Join-Path $installRoot "uninstall-wakezilla.ps1"))) {
+    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+}
+if (Test-Path -LiteralPath $binDir) {
+    $remaining = @(Get-ChildItem -LiteralPath $binDir -Force)
+    if ($remaining.Count -eq 0) { Remove-Item -LiteralPath $binDir -Force }
+}
+if (Test-Path -LiteralPath $installRoot) {
+    $remainingRoot = @(Get-ChildItem -LiteralPath $installRoot -Force)
+    if ($remainingRoot.Count -eq 0) { Remove-Item -LiteralPath $installRoot -Force }
+}
+if (-not $Quiet) { Write-Host "Wakezilla graphical integration removed; configuration and data were preserved." }
+'@
+    Set-Content -LiteralPath $scriptPath -Value $script -Encoding UTF8 -NoNewline
+    $scriptPath
+}
+
+function Install-WakezillaDesktopIntegration {
+    param(
+        [string]$ExtractDir,
+        [string]$BinDir,
+        [string]$InstallVersion
+    )
+
+    $traySource = Get-RegularReleaseFile -Root $ExtractDir -Name "wakezilla-tray.exe"
+    $iconSource = Get-RegularReleaseFile -Root $ExtractDir -Name "wakezilla.ico"
+    $cliSource = Get-RegularReleaseFile -Root $ExtractDir -Name "wakezilla.exe"
+    $installRoot = Split-Path -Parent $BinDir
+    $existingBin = Get-Item -LiteralPath $BinDir -Force -ErrorAction SilentlyContinue
+    if ($existingBin -and ($existingBin.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Stop-Install "install" "refusing a reparse-point install directory: $BinDir"
+    }
+    New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+    $tray = Join-Path $BinDir "wakezilla-tray.exe"
+    $cli = Join-Path $BinDir "wakezilla.exe"
+    $icon = Join-Path $BinDir "wakezilla.ico"
+    $programs = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)
+    $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
+    $programShortcut = Join-Path $programs "Wakezilla.lnk"
+    $desktopShortcut = Join-Path $desktop "Wakezilla.lnk"
+    $uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Wakezilla"
+    $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+    $temporary = Join-Path $BinDir ".wakezilla-integration.$PID.tmp"
+    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $temporary | Out-Null
+    $published = @()
+    try {
+        foreach ($pair in @(
+            @{ Source = $cliSource; Destination = (Join-Path $temporary "wakezilla.exe") },
+            @{ Source = $traySource; Destination = (Join-Path $temporary "wakezilla-tray.exe") },
+            @{ Source = $iconSource; Destination = (Join-Path $temporary "wakezilla.ico") }
+        )) {
+            Copy-Item -LiteralPath $pair.Source -Destination $pair.Destination -Force
+        }
+        Stop-WakezillaProcessesForInstall -ExecutablePath $cli
+        Stop-WakezillaProcessesForInstall -ExecutablePath $tray
+        Move-Item -LiteralPath (Join-Path $temporary "wakezilla.exe") -Destination $cli -Force
+        $published += $cli
+        Move-Item -LiteralPath (Join-Path $temporary "wakezilla-tray.exe") -Destination $tray -Force
+        $published += $tray
+        Move-Item -LiteralPath (Join-Path $temporary "wakezilla.ico") -Destination $icon -Force
+        $published += $icon
+        $uninstaller = Get-WakezillaUninstallScript -InstallRoot $installRoot
+        New-WakezillaShortcut -Path $programShortcut -TargetPath $tray -WorkingDirectory $BinDir -IconPath $icon
+        New-WakezillaShortcut -Path $desktopShortcut -TargetPath $tray -WorkingDirectory $BinDir -IconPath $icon
+        New-Item -Path $runKey -Force | Out-Null
+        New-ItemProperty -Path $runKey -Name WakezillaTray -PropertyType String -Value ('"' + $tray + '"') -Force | Out-Null
+        New-Item -Path $uninstallKey -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name DisplayName -PropertyType String -Value "Wakezilla" -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name DisplayVersion -PropertyType String -Value $InstallVersion -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name Publisher -PropertyType String -Value "Wakezilla" -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name DisplayIcon -PropertyType String -Value "$icon,0" -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name InstallLocation -PropertyType String -Value $installRoot -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name URLInfoAbout -PropertyType String -Value "https://github.com/guibeira/wakezilla" -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name InstallDate -PropertyType String -Value ([DateTime]::UtcNow.ToString("yyyyMMdd")) -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name EstimatedSize -PropertyType DWord -Value 1 -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name UninstallString -PropertyType String -Value ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $uninstaller + '"') -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name QuietUninstallString -PropertyType String -Value ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $uninstaller + '" -Quiet') -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name NoModify -PropertyType DWord -Value 1 -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name NoRepair -PropertyType DWord -Value 1 -Force | Out-Null
+        if ($env:SESSIONNAME -or $env:USERNAME) {
+            Start-Process -FilePath $tray -WorkingDirectory $BinDir | Out-Null
+        }
+        else {
+            Write-Warn "no interactive Windows session detected; Wakezilla will start at the next login"
+        }
+    }
+    catch {
+        foreach ($path in $published) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } }
+        throw
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    [pscustomobject]@{ Cli = $cli; Tray = $tray; Icon = $icon; InstallRoot = $installRoot }
+}
+
 function Invoke-WakezillaInstall {
     $targetValue = Get-WakezillaTarget
     $binDir = Resolve-InstallDir
@@ -445,8 +602,6 @@ function Invoke-WakezillaInstall {
         Remove-Item -Recurse -Force $tmpDir
     }
     New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-    $servicesToRestart = @()
-
     try {
         $assetName = [System.IO.Path]::GetFileName(([System.Uri]$assetUrl).LocalPath)
         $archive = Join-Path $tmpDir $assetName
@@ -459,9 +614,10 @@ function Invoke-WakezillaInstall {
         $checksumsText = Get-Content -Raw -Path $checksumsPath
         Assert-Checksum -File $archive -ChecksumsText $checksumsText -AssetName $assetName
 
-        $binary = Expand-WakezillaArchive -Archive $archive -OutDir (Join-Path $tmpDir "extract")
-        $servicesToRestart = @(Stop-WakezillaServicesForInstall)
-        $installed = Install-WakezillaBinary -Source $binary -DestinationDir $binDir
+        $extractDir = Join-Path $tmpDir "extract"
+        $binary = Expand-WakezillaArchive -Archive $archive -OutDir $extractDir
+        $integration = Install-WakezillaDesktopIntegration -ExtractDir $extractDir -BinDir $binDir -InstallVersion $releaseVersion
+        $installed = $integration.Cli
 
         if (-not $NoPath) {
             Add-UserPath -Directory $binDir
@@ -491,9 +647,6 @@ function Invoke-WakezillaInstall {
         }
     }
     finally {
-        if ($servicesToRestart.Count -gt 0) {
-            Restart-WakezillaServicesAfterInstall -ServiceNames $servicesToRestart
-        }
         if (Test-Path $tmpDir) {
             Remove-Item -Recurse -Force $tmpDir
         }
