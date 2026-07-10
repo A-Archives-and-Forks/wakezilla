@@ -3,8 +3,10 @@ use anyhow::{anyhow, Context, Result};
 #[cfg(target_os = "windows")]
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use std::io::Cursor;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, OwnedFd};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -77,7 +79,9 @@ struct TrayApp {
 }
 
 struct TrayInstanceGuard {
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    _socket: OwnedFd,
+    #[cfg(target_os = "windows")]
     _instance: single_instance::SingleInstance,
     #[cfg(target_os = "macos")]
     _lock_file: std::fs::File,
@@ -86,12 +90,13 @@ struct TrayInstanceGuard {
 impl TrayInstanceGuard {
     fn acquire_named(name: &str) -> Result<Option<Self>> {
         #[cfg(target_os = "linux")]
-        let backend_name = linux_backend_name(name, effective_uid());
-        #[cfg(target_os = "windows")]
-        let backend_name = name.to_owned();
-
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
+            Self::acquire_linux(name)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let backend_name = name.to_owned();
             let instance =
                 single_instance::SingleInstance::new(&backend_name).with_context(|| {
                     format!("failed to acquire tray instance lock `{name}` as `{backend_name}`")
@@ -108,6 +113,46 @@ impl TrayInstanceGuard {
         #[cfg(target_os = "macos")]
         {
             Self::acquire_macos(name)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn acquire_linux(name: &str) -> Result<Option<Self>> {
+        let backend_name = linux_backend_name(name, effective_uid());
+        let socket_type = combine_linux_socket_type(libc::SOCK_STREAM, libc::SOCK_CLOEXEC);
+
+        // SAFETY: socket is called with valid Linux domain/type/protocol constants and no
+        // pointers. A nonnegative result is a newly owned descriptor.
+        let raw_socket = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
+        if raw_socket < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("failed to create tray instance socket `{backend_name}`")
+            });
+        }
+        // SAFETY: raw_socket was just returned as an owned descriptor and has not been wrapped
+        // or closed. OwnedFd now closes it on every return path.
+        let socket = unsafe { OwnedFd::from_raw_fd(raw_socket) };
+        let (address, address_len) = linux_abstract_socket_address(&backend_name)?;
+
+        // SAFETY: socket is a valid AF_UNIX descriptor; address points to an initialized
+        // sockaddr_un and address_len covers only its family and populated abstract name.
+        let rc = unsafe {
+            libc::bind(
+                socket.as_raw_fd(),
+                std::ptr::addr_of!(address).cast::<libc::sockaddr>(),
+                address_len,
+            )
+        };
+        if rc == 0 {
+            return Ok(Some(Self { _socket: socket }));
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EADDRINUSE) {
+            Ok(None)
+        } else {
+            Err(error)
+                .with_context(|| format!("failed to bind tray instance socket `{backend_name}`"))
         }
     }
 
@@ -156,6 +201,37 @@ fn effective_uid() -> libc::uid_t {
 #[cfg(target_os = "linux")]
 fn linux_backend_name(name: &str, euid: libc::uid_t) -> String {
     format!("{name}.uid-{euid}")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn combine_linux_socket_type(stream: i32, cloexec: i32) -> i32 {
+    stream | cloexec
+}
+
+#[cfg(target_os = "linux")]
+fn linux_abstract_socket_address(name: &str) -> Result<(libc::sockaddr_un, libc::socklen_t)> {
+    // SAFETY: sockaddr_un contains only integer fields and a c_char array, for which all-zero is
+    // a valid bit pattern. Zeroing also establishes the leading NUL for an abstract address.
+    let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+
+    let name_bytes = name.as_bytes();
+    let maximum_name_len = address.sun_path.len().saturating_sub(1);
+    if name_bytes.len() > maximum_name_len {
+        anyhow::bail!(
+            "tray instance socket name is {} bytes; maximum is {maximum_name_len}",
+            name_bytes.len()
+        );
+    }
+    address.sun_path[0] = 0;
+    for (index, byte) in name_bytes.iter().enumerate() {
+        address.sun_path[index + 1] = *byte as libc::c_char;
+    }
+
+    let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name_bytes.len();
+    let address_len = libc::socklen_t::try_from(address_len)
+        .context("tray instance socket address length overflowed socklen_t")?;
+    Ok((address, address_len))
 }
 
 #[cfg(target_os = "macos")]
@@ -1107,9 +1183,19 @@ mod tests {
 
         drop(first);
 
-        assert!(TrayInstanceGuard::acquire_named(&name)
+        let reacquired = TrayInstanceGuard::acquire_named(&name)
             .expect("acquire after drop")
-            .is_some());
+            .expect("instance after drop");
+        drop(reacquired);
+
+        #[cfg(target_os = "macos")]
+        std::fs::remove_file(macos_lock_path(&name).expect("test lock path"))
+            .expect("remove test lock file");
+    }
+
+    #[test]
+    fn tray_instance_linux_socket_type_combines_cloexec_atomically() {
+        assert_eq!(combine_linux_socket_type(0b0001, 0b1000), 0b1001);
     }
 
     #[cfg(target_os = "linux")]
@@ -1120,6 +1206,97 @@ mod tests {
 
         assert_eq!(first_user, "dev.wakezilla.tray.uid-1000");
         assert_ne!(first_user, second_user);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tray_instance_linux_socket_does_not_survive_exec() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::process::{Child, Stdio};
+
+        const CHILD_ENV: &str = "WAKEZILLA_TEST_TRAY_INSTANCE_CLOEXEC_CHILD";
+        const READY_MARKER: &str = "WAKEZILLA_TRAY_INSTANCE_CHILD_READY";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "{READY_MARKER}").expect("write child ready marker");
+            stdout.flush().expect("flush child ready marker");
+            drop(stdout);
+
+            let mut release = [0_u8; 1];
+            std::io::stdin()
+                .read_exact(&mut release)
+                .expect("wait for parent release");
+            return;
+        }
+
+        struct ChildGuard(Option<Child>);
+
+        impl ChildGuard {
+            fn child_mut(&mut self) -> &mut Child {
+                self.0.as_mut().expect("child process")
+            }
+
+            fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+                let result = self.0.as_mut().expect("child process").wait();
+                if result.is_ok() {
+                    self.0.take();
+                }
+                result
+            }
+        }
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let name = format!("dev.wakezilla.tray.cloexec.test.{}", std::process::id());
+        let first = TrayInstanceGuard::acquire_named(&name)
+            .expect("first acquire")
+            .expect("first instance");
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tray::desktop::tests::tray_instance_linux_socket_does_not_survive_exec",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn child test process");
+        let mut child = ChildGuard(Some(child));
+        let stdout = child.child_mut().stdout.take().expect("child stdout pipe");
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(stdout.read_line(&mut line).expect("read child output"), 0);
+            if line.contains(READY_MARKER) {
+                break;
+            }
+        }
+
+        drop(first);
+        let reacquired = TrayInstanceGuard::acquire_named(&name)
+            .expect("reacquire while child lives")
+            .expect("socket fd must close during exec");
+        drop(reacquired);
+
+        child
+            .child_mut()
+            .stdin
+            .as_mut()
+            .expect("child stdin pipe")
+            .write_all(b"x")
+            .expect("release child");
+        let status = child.wait().expect("wait for child test process");
+        assert!(status.success(), "child test process should exit cleanly");
     }
 
     #[cfg(target_os = "macos")]

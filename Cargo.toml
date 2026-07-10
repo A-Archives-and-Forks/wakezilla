@@ -102,7 +102,7 @@ png = { version = "0.18", optional = true }
 tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"], optional = true }
 winit = { version = "0.30", optional = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
 single-instance = { version = "0.3.3", optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
