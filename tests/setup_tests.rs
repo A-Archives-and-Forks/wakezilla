@@ -101,6 +101,7 @@ fn protected_service_binary_paths_are_fixed_per_platform_and_mode() {
 }
 
 #[test]
+#[cfg(not(target_os = "windows"))]
 fn systemd_unit_uses_only_the_fixed_protected_binary() {
     let unit = service::generate_systemd_unit(Mode::Proxy);
     assert!(unit.contains(
@@ -124,6 +125,7 @@ fn systemd_unit_uses_only_the_fixed_protected_binary() {
 }
 
 #[test]
+#[cfg(not(target_os = "windows"))]
 fn launchd_plist_uses_only_the_fixed_protected_binary() {
     let plist = service::generate_launchd_plist(Mode::Client);
     assert!(plist.contains("dev.wakezilla.client"));
