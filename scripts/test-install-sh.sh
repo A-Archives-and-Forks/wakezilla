@@ -170,6 +170,15 @@ sha256_file() {
   fi
 }
 
+portable_file_mode() {
+  mode_path="$1"
+  if stat -f '%Lp' "$mode_path" >/dev/null 2>&1; then
+    stat -f '%Lp' "$mode_path"
+  else
+    stat -c '%a' "$mode_path"
+  fi
+}
+
 write_linux_integration_fixture() {
   extract_dir="$1"
   mkdir -p "$extract_dir/icons/hicolor/48x48/apps" \
@@ -477,6 +486,74 @@ SH
   rm -rf "$temp_dir"
 }
 
+test_end_to_end_rejects_malicious_archive_before_extracting() {
+  temp_dir=$(mktemp -d)
+  mkdir -p "$temp_dir/bin" "$temp_dir/archive" "$temp_dir/install" "$temp_dir/home"
+  write_install_dependency_stubs "$temp_dir/bin"
+  sentinel="$temp_dir/outside-sentinel"
+  printf 'outside-sentinel-content\n' > "$sentinel"
+  chmod 0640 "$sentinel"
+  sentinel_mode=$(portable_file_mode "$sentinel")
+  sentinel_contents=$(cat "$sentinel")
+
+  ln -s "$sentinel" "$temp_dir/archive/wakezilla"
+  write_linux_integration_fixture "$temp_dir/archive"
+  malicious_archive="$temp_dir/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz"
+  tar -C "$temp_dir/archive" -czf "$malicious_archive" wakezilla wakezilla-tray icons
+  printf '%s  %s\n' "$(sha256_file "$malicious_archive")" "${malicious_archive##*/}" > "$temp_dir/SHA256SUMS"
+  cat > "$temp_dir/release.json" <<'EOF'
+{
+  "tag_name": "v0.1.49",
+  "assets": [
+    {"name":"wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz","browser_download_url":"https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz"}
+  ]
+}
+EOF
+  cat > "$temp_dir/bin/curl" <<SH
+#!/usr/bin/env sh
+set -eu
+out=
+url=
+while [ "\$#" -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    -H) shift 2 ;;
+    -*) shift ;;
+    *) url="\$1"; shift ;;
+  esac
+done
+case "\$url" in
+  https://api.github.com/repos/guibeira/wakezilla/releases/tags/v0.1.49) cat '$temp_dir/release.json' ;;
+  https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz) cp '$malicious_archive' "\$out" ;;
+  https://github.com/guibeira/wakezilla/releases/download/v0.1.49/SHA256SUMS) cp '$temp_dir/SHA256SUMS' "\$out" ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod 755 "$temp_dir/bin/curl"
+
+  output_file=$(mktemp)
+  set +e
+  PATH="$temp_dir/bin:$PATH" HOME="$temp_dir/home" BIN_DIR="$temp_dir/install" \
+    XDG_DATA_HOME="$temp_dir/data" XDG_CONFIG_HOME="$temp_dir/config" \
+    TARGET=x86_64-unknown-linux-gnu DISPLAY= WAYLAND_DISPLAY= \
+    "$SCRIPT" 0.1.49 > "$output_file" 2>&1
+  status=$?
+  set -e
+  output=$(cat "$output_file")
+  rm -f "$output_file"
+
+  if [ "$status" -eq 0 ]; then
+    fail "malicious release archive: expected installer failure"
+  fi
+  assert_contains "$output" "unsafe release archive" "malicious release archive error"
+  assert_eq "$sentinel_contents" "$(cat "$sentinel")" "malicious release archive sentinel contents"
+  assert_eq "$sentinel_mode" "$(portable_file_mode "$sentinel")" "malicious release archive sentinel mode"
+  if [ -e "$temp_dir/install/wakezilla" ]; then
+    fail "malicious release archive: binary was installed"
+  fi
+  rm -rf "$temp_dir"
+}
+
 test_version_command_nonzero_warns() {
   temp_dir=$(mktemp -d)
   old_path="$PATH"
@@ -567,6 +644,7 @@ test_help_includes_required_docs
 test_no_args_resolves_release_metadata
 test_end_to_end_install_with_fake_curl
 test_linux_integration_uses_final_musl_fallback_extract_once
+test_end_to_end_rejects_malicious_archive_before_extracting
 test_version_command_nonzero_warns
 test_missing_dependency_reports_hint
 test_unknown_args_fail_with_parser_error
@@ -800,7 +878,53 @@ test_resolve_bin_dir_requires_home_for_default() {
   fi
 }
 
+test_validate_tar_archive_rejects_unsafe_member_kinds_and_paths() {
+  temp_dir=$(mktemp -d)
+  archive_dir="$temp_dir/archive"
+  mkdir -p "$archive_dir"
+  printf 'regular\n' > "$archive_dir/regular"
+  ln -s regular "$archive_dir/symlink"
+  ln "$archive_dir/regular" "$archive_dir/hardlink"
+  mkfifo "$archive_dir/fifo"
+
+  tar -C "$archive_dir" -czf "$temp_dir/symlink.tar.gz" symlink 2>/dev/null
+  tar -C "$archive_dir" -czf "$temp_dir/hardlink.tar.gz" regular hardlink 2>/dev/null
+  tar -C "$archive_dir" -czf "$temp_dir/fifo.tar.gz" fifo 2>/dev/null
+  for archive_kind in symlink hardlink fifo; do
+    if validation_error=$(validate_tar_archive "$temp_dir/$archive_kind.tar.gz"); then
+      fail "archive $archive_kind member: expected rejection"
+    else
+      assert_contains "$validation_error" "unsupported archive member type" \
+        "archive $archive_kind member rejection"
+    fi
+  done
+
+  tar -czPf "$temp_dir/absolute.tar.gz" "$archive_dir/regular" 2>/dev/null
+  if validation_error=$(validate_tar_archive "$temp_dir/absolute.tar.gz"); then
+    fail "archive absolute member: expected rejection"
+  else
+    assert_contains "$validation_error" "absolute member path" "archive absolute member rejection"
+  fi
+
+  if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+    tar -C "$archive_dir" --transform='s|^regular$|../escape|' \
+      -czf "$temp_dir/traversal.tar.gz" regular 2>/dev/null
+  else
+    tar -C "$archive_dir" -s ',^regular$,../escape,' \
+      -czf "$temp_dir/traversal.tar.gz" regular 2>/dev/null
+  fi
+  if validation_error=$(validate_tar_archive "$temp_dir/traversal.tar.gz"); then
+    fail "archive traversal member: expected rejection"
+  else
+    assert_contains "$validation_error" "parent traversal member path" \
+      "archive traversal member rejection"
+  fi
+
+  rm -rf "$temp_dir"
+}
+
 load_install_helpers
+test_validate_tar_archive_rejects_unsafe_member_kinds_and_paths
 if test_canonical_bin_dir_helper_defined; then
   test_canonicalize_bin_dir_makes_relative_path_physical_and_absolute
 fi
@@ -1295,7 +1419,7 @@ SH
       autostart) launcher_contents=$autostart_contents ;;
     esac
     assert_contains "$launcher_contents" "Type=Application" "linux $launcher_kind type"
-    assert_contains "$launcher_contents" "Version=1.0" "linux $launcher_kind version"
+    assert_not_contains "$launcher_contents" "Version=" "linux $launcher_kind omits stale desktop spec version"
     assert_contains "$launcher_contents" "Name=Wakezilla" "linux $launcher_kind name"
     assert_contains "$launcher_contents" "Comment=" "linux $launcher_kind comment"
     assert_eq "$expected_exec" "$(printf '%s\n' "$launcher_contents" | awk '/^Exec=/ { print; exit }')" "linux $launcher_kind exact direct helper Exec"
@@ -1334,7 +1458,7 @@ test_desktop_exec_gio_launches_hostile_path_without_arguments() {
   temp_dir=$(mktemp -d)
   home_dir="$temp_dir/home"
   extract_dir="$temp_dir/extract"
-  bin_dir=$temp_dir/'bin space\slash"quote`touch wakezilla-backtick-pwned`dollar$(touch wakezilla-dollar-pwned)%percent'
+  bin_dir=$temp_dir/'bin space\slash"quote`touch wakezilla-backtick-pwned`dollar$(touch wakezilla-dollar-pwned)'
   data_dir="$temp_dir/data"
   config_dir="$temp_dir/config"
   sentinel="$temp_dir/launched"
@@ -1371,7 +1495,14 @@ SH
     return 0
   fi
   if [ "$gio_status" -ne 0 ]; then
-    fail "desktop Exec gio launch: gio rejected the generated desktop entry"
+    gio_message=$(tr '\n' ' ' < "$gio_output" 2>/dev/null || true)
+    if command -v desktop-file-validate >/dev/null 2>&1; then
+      desktop_validation=$(desktop-file-validate "$app_entry" 2>&1 | tr '\n' ' ' || true)
+    else
+      desktop_validation="desktop-file-validate unavailable"
+    fi
+    generated_commands=$(awk '/^(TryExec|Exec)=/ { print }' "$app_entry" | tr '\n' ' ')
+    fail "desktop Exec gio launch: gio rejected the generated desktop entry: $gio_message; $desktop_validation; $generated_commands"
   fi
   gio_wait=0
   while [ ! -e "$sentinel" ] && [ "$gio_wait" -lt 100 ]; do
@@ -1400,6 +1531,20 @@ tray' >/dev/null 2>&1; then
   fi
 }
 
+test_desktop_entry_encoders_reject_ascii_controls() {
+  tab=$(printf '\t')
+  escape=$(printf '\033')
+  delete=$(printf '\177')
+  for control in "$tab" "$escape" "$delete"; do
+    if desktop_exec_quote "/tmp/wakezilla${control}tray" >/dev/null 2>&1; then
+      fail "desktop Exec ASCII control: expected rejection"
+    fi
+    if desktop_string_escape "/tmp/wakezilla${control}tray" >/dev/null 2>&1; then
+      fail "desktop string ASCII control: expected rejection"
+    fi
+  done
+}
+
 test_linux_desktop_integration_launches_graphical_helper_once() {
   temp_dir=$(mktemp -d)
   home_dir="$temp_dir/home"
@@ -1418,6 +1563,7 @@ SH
   cat > "$temp_dir/stub-bin/nohup" <<'SH'
 #!/usr/bin/env sh
 printf '%s\n' "$@" >> "$WAKEZILLA_NOHUP_LOG"
+trap '' HUP
 exec "$@"
 SH
   chmod 755 "$temp_dir/stub-bin/nohup"
@@ -1434,7 +1580,7 @@ SH
   )
 
   launch_wait=0
-  while [ ! -f "$launch_log" ] && [ "$launch_wait" -lt 50 ]; do
+  while [ ! -f "$launch_log" ] && [ "$launch_wait" -lt 500 ]; do
     sleep 0.01
     launch_wait=$((launch_wait + 1))
   done
@@ -1449,6 +1595,7 @@ SH
   assert_eq "$bin_dir/wakezilla-tray|0" "$launch_record" "graphical direct helper invocation"
   assert_eq "$bin_dir/wakezilla-tray" "$(cat "$nohup_log" 2>/dev/null || true)" "graphical nohup direct helper"
   assert_not_contains "$output" "next graphical login" "graphical install omits next-login message"
+  assert_contains "$output" "launch requested" "graphical install launch-request message"
 
   rm -rf "$temp_dir"
 }
@@ -1491,6 +1638,27 @@ test_resolve_linux_desktop_dir_parses_without_execution() {
   if [ -e "$temp_dir/wakezilla-user-dirs-pwned" ]; then
     fail "user-dirs parser: command substitution was executed"
   fi
+  rm -rf "$temp_dir"
+}
+
+test_resolve_linux_desktop_dir_treats_home_as_disabled() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  config_dir="$temp_dir/config"
+  mkdir -p "$home_dir/Desktop" "$config_dir" "$temp_dir/xdg-bin" "$temp_dir/empty-bin"
+  cat > "$temp_dir/xdg-bin/xdg-user-dir" <<SH
+#!/usr/bin/env sh
+printf '%s\n' '$home_dir'
+SH
+  chmod 755 "$temp_dir/xdg-bin/xdg-user-dir"
+  resolved=$(HOME="$home_dir" PATH="$temp_dir/xdg-bin:$PATH" \
+    resolve_linux_desktop_dir "$home_dir" "$config_dir")
+  assert_eq "" "$resolved" "xdg-user-dir HOME disables Desktop shortcut"
+
+  printf '%s\n' 'XDG_DESKTOP_DIR="$HOME"' > "$config_dir/user-dirs.dirs"
+  resolved=$(HOME="$home_dir" PATH="$temp_dir/empty-bin" \
+    resolve_linux_desktop_dir "$home_dir" "$config_dir")
+  assert_eq "" "$resolved" "user-dirs HOME disables Desktop shortcut"
   rm -rf "$temp_dir"
 }
 
@@ -1609,12 +1777,89 @@ EOF
     fail "owned legacy CLI tray autostart: expected removal"
   fi
 
-  printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Another App' 'Exec=/other/app' > "$legacy_entry"
+  printf '%s\n' \
+    '[Other Group]' 'Name=Wakezilla Tray' 'Exec=/old/bin/wakezilla-tray' \
+    '[Desktop Entry]' 'Type=Application' 'Name=Another App' 'Exec=/other/app' > "$legacy_entry"
   HOME="$home_dir" XDG_DATA_HOME="$temp_dir/data" XDG_CONFIG_HOME="$config_dir" \
     WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
     install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
   if [ ! -f "$legacy_entry" ]; then
     fail "foreign legacy-named autostart: expected preservation"
+  fi
+
+  cat > "$legacy_entry" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Wakezilla Tray
+Exec=/other/not-wakezilla-tray-helper
+EOF
+  HOME="$home_dir" XDG_DATA_HOME="$temp_dir/data" XDG_CONFIG_HOME="$config_dir" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+  if [ ! -f "$legacy_entry" ]; then
+    fail "legacy substring executable: expected preservation"
+  fi
+
+  cat > "$legacy_entry" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Wakezilla Tray
+[Desktop Entry]
+Exec=/old/bin/wakezilla-tray
+EOF
+  HOME="$home_dir" XDG_DATA_HOME="$temp_dir/data" XDG_CONFIG_HOME="$config_dir" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+  if [ ! -f "$legacy_entry" ]; then
+    fail "legacy multiple Desktop Entry groups: expected preservation"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_root_treats_home_desktop_as_disabled() {
+  temp_dir=$(mktemp -d)
+  root_home="$temp_dir/root-home"
+  user_home="$temp_dir/user-home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/system-bin"
+  legacy_entry="$user_home/.config/autostart/wakezilla-tray.desktop"
+  test_uid=$(id -u)
+  test_gid=$(id -g)
+  mkdir -p "$root_home" "$user_home/Desktop" "$user_home/.config/autostart" \
+    "$bin_dir" "$temp_dir/stub-bin"
+  printf '%s\n' 'XDG_DESKTOP_DIR="$HOME"' > "$user_home/.config/user-dirs.dirs"
+  cat > "$legacy_entry" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Wakezilla Tray
+Exec=/other/not-wakezilla-tray-helper
+EOF
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  write_fake_sudo "$temp_dir/stub-bin/sudo"
+  write_fake_chown "$temp_dir/stub-bin/chown"
+  : > "$temp_dir/chown.log"
+  : > "$temp_dir/privilege.log"
+
+  HOME="$root_home" WAKEZILLA_EUID=0 \
+    WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
+    WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
+    WAKEZILLA_TEST_SUDO_HOME="$user_home" \
+    WAKEZILLA_PRIVILEGE_LOG="$temp_dir/privilege.log" \
+    WAKEZILLA_CHOWN_LOG="$temp_dir/chown.log" \
+    DISPLAY= WAYLAND_DISPLAY= PATH="$temp_dir/stub-bin:$PATH" \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+
+  if [ ! -f "$user_home/.local/share/applications/dev.wakezilla.Wakezilla.desktop" ]; then
+    fail "sudo HOME Desktop disabled: expected application entry"
+  fi
+  if [ -e "$user_home/dev.wakezilla.Wakezilla.desktop" ] || \
+     [ -e "$user_home/Desktop/dev.wakezilla.Wakezilla.desktop" ]; then
+    fail "sudo HOME Desktop disabled: expected no Desktop shortcut"
+  fi
+  if [ ! -f "$legacy_entry" ]; then
+    fail "sudo strict legacy matcher: expected foreign substring entry preserved"
   fi
   rm -rf "$temp_dir"
 }
@@ -1667,6 +1912,163 @@ test_linux_integration_is_idempotent_without_temp_siblings() {
   assert_eq "0" "$temp_count" "idempotent integration temporary siblings"
   assert_eq "1" "$(find "$data_dir/applications" -name 'dev.wakezilla.Wakezilla.desktop' -print | wc -l | tr -d ' ')" "idempotent application entry count"
   assert_eq "1" "$(find "$config_dir/autostart" -name 'dev.wakezilla.tray.desktop' -print | wc -l | tr -d ' ')" "idempotent autostart entry count"
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_rolls_back_late_autostart_failure() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  data_dir="$temp_dir/data"
+  config_dir="$temp_dir/config"
+  app_entry="$data_dir/applications/dev.wakezilla.Wakezilla.desktop"
+  autostart_entry="$config_dir/autostart/dev.wakezilla.tray.desktop"
+  legacy_entry="$config_dir/autostart/wakezilla-tray.desktop"
+  icon_48="$data_dir/icons/hicolor/48x48/apps/dev.wakezilla.Wakezilla.png"
+  icon_128="$data_dir/icons/hicolor/128x128/apps/dev.wakezilla.Wakezilla.png"
+  icon_256="$data_dir/icons/hicolor/256x256/apps/dev.wakezilla.Wakezilla.png"
+  mkdir -p "$home_dir" "$bin_dir" "${app_entry%/*}" "${autostart_entry%/*}" \
+    "${icon_48%/*}"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  printf 'old application\n' > "$app_entry"
+  printf 'old autostart\n' > "$autostart_entry"
+  printf 'old icon\n' > "$icon_48"
+  cat > "$legacy_entry" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Wakezilla Tray
+Exec=/old/bin/wakezilla-tray
+EOF
+  chmod 0600 "$app_entry"
+  chmod 0640 "$autostart_entry"
+  chmod 0604 "$icon_48"
+
+  set +e
+  HOME="$home_dir" XDG_DATA_HOME="$data_dir" XDG_CONFIG_HOME="$config_dir" \
+    WAKEZILLA_EUID=1000 WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION=autostart \
+    DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+  install_status=$?
+  set -e
+
+  if [ "$install_status" -eq 0 ]; then
+    fail "late integration failure: expected nonzero status"
+  fi
+  assert_eq "old application" "$(cat "$app_entry")" "late rollback application bytes"
+  assert_eq "old autostart" "$(cat "$autostart_entry")" "late rollback autostart bytes"
+  assert_eq "old icon" "$(cat "$icon_48")" "late rollback icon bytes"
+  assert_eq "600" "$(file_mode "$app_entry")" "late rollback application mode"
+  assert_eq "640" "$(file_mode "$autostart_entry")" "late rollback autostart mode"
+  assert_eq "604" "$(file_mode "$icon_48")" "late rollback icon mode"
+  if [ ! -f "$legacy_entry" ]; then
+    fail "late rollback legacy entry: expected restoration"
+  fi
+  if [ -e "$icon_128" ] || [ -e "$icon_256" ]; then
+    fail "late rollback new icons: expected removal"
+  fi
+  temp_count=$(find "$data_dir" "$config_dir" -name '*.tmp.*' -print | wc -l | tr -d ' ')
+  assert_eq "0" "$temp_count" "late rollback temporary siblings"
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_profile_directory_modes() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  data_dir="$temp_dir/data"
+  config_dir="$temp_dir/config"
+  mkdir -p "$home_dir" "$bin_dir" "$data_dir" "$config_dir"
+  chmod 0755 "$data_dir"
+  chmod 0711 "$config_dir"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+
+  HOME="$home_dir" XDG_DATA_HOME="$data_dir" XDG_CONFIG_HOME="$config_dir" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+
+  assert_eq "755" "$(file_mode "$data_dir")" "pre-existing data directory mode"
+  assert_eq "711" "$(file_mode "$config_dir")" "pre-existing config directory mode"
+  for private_dir in \
+    "$data_dir/applications" \
+    "$config_dir/autostart" \
+    "$data_dir/icons" \
+    "$data_dir/icons/hicolor" \
+    "$data_dir/icons/hicolor/48x48" \
+    "$data_dir/icons/hicolor/48x48/apps"; do
+    assert_eq "700" "$(file_mode "$private_dir")" "new profile directory mode $private_dir"
+  done
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_root_helper_rolls_back_late_failure() {
+  temp_dir=$(mktemp -d)
+  root_home="$temp_dir/root-home"
+  user_home="$temp_dir/user-home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/system-bin"
+  data_dir="$user_home/.local/share"
+  config_dir="$user_home/.config"
+  app_entry="$data_dir/applications/dev.wakezilla.Wakezilla.desktop"
+  autostart_entry="$config_dir/autostart/dev.wakezilla.tray.desktop"
+  legacy_entry="$config_dir/autostart/wakezilla-tray.desktop"
+  icon_48="$data_dir/icons/hicolor/48x48/apps/dev.wakezilla.Wakezilla.png"
+  icon_128="$data_dir/icons/hicolor/128x128/apps/dev.wakezilla.Wakezilla.png"
+  test_uid=$(id -u)
+  test_gid=$(id -g)
+  mkdir -p "$root_home" "$user_home" "$bin_dir" "$temp_dir/stub-bin" \
+    "${app_entry%/*}" "${autostart_entry%/*}" "${icon_48%/*}"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  printf 'root old application\n' > "$app_entry"
+  printf 'root old autostart\n' > "$autostart_entry"
+  printf 'root old icon\n' > "$icon_48"
+  cat > "$legacy_entry" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Wakezilla Tray
+Exec=/old/bin/wakezilla-tray
+EOF
+  chmod 0600 "$app_entry"
+  chmod 0640 "$autostart_entry"
+  chmod 0604 "$icon_48"
+  write_fake_sudo "$temp_dir/stub-bin/sudo"
+  write_fake_chown "$temp_dir/stub-bin/chown"
+  : > "$temp_dir/chown.log"
+  : > "$temp_dir/privilege.log"
+
+  set +e
+  HOME="$root_home" WAKEZILLA_EUID=0 WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
+    WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
+    WAKEZILLA_TEST_SUDO_HOME="$user_home" \
+    WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION=autostart \
+    WAKEZILLA_PRIVILEGE_LOG="$temp_dir/privilege.log" \
+    WAKEZILLA_CHOWN_LOG="$temp_dir/chown.log" \
+    DISPLAY= WAYLAND_DISPLAY= PATH="$temp_dir/stub-bin:$PATH" \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+  install_status=$?
+  set -e
+
+  if [ "$install_status" -eq 0 ]; then
+    fail "sudo late integration failure: expected nonzero status"
+  fi
+  assert_eq "root old application" "$(cat "$app_entry")" "sudo late rollback application bytes"
+  assert_eq "root old autostart" "$(cat "$autostart_entry")" "sudo late rollback autostart bytes"
+  assert_eq "root old icon" "$(cat "$icon_48")" "sudo late rollback icon bytes"
+  assert_eq "600" "$(file_mode "$app_entry")" "sudo late rollback application mode"
+  assert_eq "640" "$(file_mode "$autostart_entry")" "sudo late rollback autostart mode"
+  assert_eq "604" "$(file_mode "$icon_48")" "sudo late rollback icon mode"
+  if [ ! -f "$legacy_entry" ]; then
+    fail "sudo late rollback legacy entry: expected restoration"
+  fi
+  if [ -e "$icon_128" ]; then
+    fail "sudo late rollback new icon: expected removal"
+  fi
   rm -rf "$temp_dir"
 }
 
@@ -2198,13 +2600,18 @@ if test_linux_desktop_integration_helpers_defined; then
   test_desktop_exec_quote_escapes_reserved_characters
   test_desktop_exec_gio_launches_hostile_path_without_arguments
   test_desktop_exec_quote_rejects_line_breaks
+  test_desktop_entry_encoders_reject_ascii_controls
   test_linux_desktop_integration_launches_graphical_helper_once
   test_linux_integration_relative_xdg_falls_back_and_copies_icons
   test_linux_integration_validates_all_assets_before_writes
   test_linux_integration_is_idempotent_without_temp_siblings
+  test_linux_integration_rolls_back_late_autostart_failure
+  test_linux_integration_profile_directory_modes
+  test_linux_integration_root_helper_rolls_back_late_failure
   test_linux_integration_root_without_valid_sudo_user_skips_everything
   test_linux_integration_euid_override_is_test_mode_only
   test_linux_integration_valid_sudo_user_applies_as_target_user
+  test_linux_integration_root_treats_home_desktop_as_disabled
   test_linux_integration_privilege_failures_are_fatal
   test_resolve_linux_integration_user_rejects_unsafe_sudo_homes
   test_linux_integration_ignores_test_sudo_overrides_outside_test_mode
@@ -2221,6 +2628,7 @@ fi
 if test_linux_desktop_resolution_helpers_defined; then
   test_resolve_linux_desktop_dir_prefers_xdg_user_dir
   test_resolve_linux_desktop_dir_parses_without_execution
+  test_resolve_linux_desktop_dir_treats_home_as_disabled
   test_linux_desktop_copy_and_gio_trust_are_best_effort
   test_linux_integration_removes_only_owned_legacy_autostart
 fi

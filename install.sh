@@ -293,14 +293,89 @@ install_bin() {
   fi
 }
 
+validate_tar_archive() (
+  archive="$1"
+  archive_validation_dir=$(mktemp -d 2>/dev/null || mktemp -d -t wakezilla-archive-validation) || {
+    printf '%s\n' 'cannot create private archive validation directory'
+    exit 1
+  }
+  archive_names="$archive_validation_dir/names"
+  archive_types="$archive_validation_dir/types"
+  archive_validation_error=
+  archive_validation_cleanup() {
+    rm -rf "$archive_validation_dir"
+  }
+  trap archive_validation_cleanup 0
+  trap 'exit 1' 1 2 15
+
+  if ! tar -tzf "$archive" > "$archive_names" 2>/dev/null; then
+    archive_validation_error="cannot list archive members"
+  elif ! tar -tvzf "$archive" > "$archive_types" 2>/dev/null; then
+    archive_validation_error="cannot inspect archive member types"
+  fi
+
+  if [ -z "$archive_validation_error" ]; then
+    while IFS= read -r archive_member || [ -n "$archive_member" ]; do
+      if [ -z "$archive_member" ]; then
+        archive_validation_error="empty member name"
+        break
+      fi
+      case "$archive_member" in
+        /*)
+          archive_validation_error="absolute member path: $archive_member"
+          break
+          ;;
+        ..|../*|*/..|*/../*)
+          archive_validation_error="parent traversal member path: $archive_member"
+          break
+          ;;
+      esac
+      if printf '%s' "$archive_member" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+        archive_validation_error="control character in member path"
+        break
+      fi
+    done < "$archive_names"
+  fi
+
+  if [ -z "$archive_validation_error" ]; then
+    while IFS= read -r archive_listing || [ -n "$archive_listing" ]; do
+      archive_type=${archive_listing%"${archive_listing#?}"}
+      case "$archive_type" in
+        -|d) ;;
+        *)
+          archive_validation_error="unsupported archive member type: $archive_type"
+          break
+          ;;
+      esac
+    done < "$archive_types"
+  fi
+
+  if [ -z "$archive_validation_error" ]; then
+    archive_name_count=$(wc -l < "$archive_names" | tr -d ' ')
+    archive_type_count=$(wc -l < "$archive_types" | tr -d ' ')
+    if [ "$archive_name_count" != "$archive_type_count" ]; then
+      archive_validation_error="archive member listing mismatch"
+    fi
+  fi
+
+  if [ -n "$archive_validation_error" ]; then
+    printf '%s\n' "$archive_validation_error"
+    exit 1
+  fi
+  exit 0
+)
+
 extract_binary() {
   archive="$1"
   out_dir="$2"
   bin_name="$3"
 
-  mkdir -p "$out_dir"
   case "$archive" in
     *.tar.gz|*.tgz)
+      if ! archive_validation_error=$(validate_tar_archive "$archive"); then
+        err "extract" "unsafe release archive: $archive_validation_error"
+      fi
+      mkdir -p "$out_dir"
       tar -xzf "$archive" -C "$out_dir" || err "extract" "failed to extract $(basename "$archive")"
       ;;
     *)
@@ -310,11 +385,10 @@ extract_binary() {
 
   bin_file=$(find_binary_in_dir "$out_dir" "$bin_name")
 
-  if [ -z "${bin_file:-}" ] || [ ! -f "$bin_file" ]; then
+  if [ -z "${bin_file:-}" ] || [ ! -f "$bin_file" ] || [ -L "$bin_file" ]; then
     err "binary_lookup" "binary $bin_name not found in downloaded asset"
   fi
 
-  chmod 755 "$bin_file"
   printf '%s\n' "$bin_file"
 }
 
@@ -322,7 +396,7 @@ find_binary_in_dir() {
   root_dir="$1"
   bin_name="$2"
 
-  if [ -f "$root_dir/$bin_name" ]; then
+  if [ -f "$root_dir/$bin_name" ] && [ ! -L "$root_dir/$bin_name" ]; then
     printf '%s\n' "$root_dir/$bin_name"
     return 0
   fi
@@ -336,8 +410,7 @@ install_optional_tray_helper() {
   helper_file=$(find_binary_in_dir "$extract_dir" "$TRAY_HELPER_NAME")
   helper_dst="$install_dir/$TRAY_HELPER_NAME"
 
-  if [ -n "${helper_file:-}" ] && [ -f "$helper_file" ]; then
-    chmod 755 "$helper_file"
+  if [ -n "${helper_file:-}" ] && [ -f "$helper_file" ] && [ ! -L "$helper_file" ]; then
     install_bin "$helper_file" "$helper_dst" || err "install" "failed to install binary to $helper_dst"
     return 0
   fi
@@ -649,10 +722,14 @@ desktop_exec_quote() {
   case "$desktop_exec_value" in
     *"$desktop_exec_cr"*|*"
 "*)
-      warn "desktop launcher paths must not contain CR or LF"
+      warn "desktop launcher paths must not contain ASCII control characters"
       return 1
       ;;
   esac
+  if printf '%s' "$desktop_exec_value" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+    warn "desktop launcher paths must not contain ASCII control characters"
+    return 1
+  fi
 
   desktop_exec_layer=$(printf '%s' "$desktop_exec_value" | sed \
     -e 's/\\/\\\\/g' \
@@ -671,10 +748,14 @@ desktop_string_escape() {
   case "$desktop_string_value" in
     *"$desktop_string_cr"*|*"
 "*)
-      warn "desktop launcher paths must not contain CR or LF"
+      warn "desktop launcher paths must not contain ASCII control characters"
       return 1
       ;;
   esac
+  if printf '%s' "$desktop_string_value" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+    warn "desktop launcher paths must not contain ASCII control characters"
+    return 1
+  fi
   printf '%s' "$desktop_string_value" | sed -e 's/\\/\\\\/g'
   printf '\n'
 }
@@ -683,6 +764,7 @@ resolve_linux_desktop_dir() {
   desktop_home="$1"
   desktop_config_home="$2"
   desktop_cr=$(printf '\r')
+  desktop_home_physical=$(CDPATH= cd -- "$desktop_home" 2>/dev/null && pwd -P) || return 0
 
   if command -v xdg-user-dir >/dev/null 2>&1; then
     desktop_candidate=$(xdg-user-dir DESKTOP 2>/dev/null || printf '')
@@ -693,8 +775,11 @@ resolve_linux_desktop_dir() {
 "*) ;;
           *)
             if [ -d "$desktop_candidate" ]; then
-              printf '%s\n' "$desktop_candidate"
-              return 0
+              if desktop_candidate_physical=$(CDPATH= cd -- "$desktop_candidate" 2>/dev/null && pwd -P); then
+                [ "$desktop_candidate_physical" = "$desktop_home_physical" ] && return 0
+                printf '%s\n' "$desktop_candidate"
+                return 0
+              fi
             fi
             ;;
         esac
@@ -725,6 +810,8 @@ resolve_linux_desktop_dir() {
             *) continue ;;
           esac
           if [ -d "$desktop_candidate" ]; then
+            desktop_candidate_physical=$(CDPATH= cd -- "$desktop_candidate" 2>/dev/null && pwd -P) || continue
+            [ "$desktop_candidate_physical" = "$desktop_home_physical" ] && return 0
             printf '%s\n' "$desktop_candidate"
             return 0
           fi
@@ -734,6 +821,8 @@ resolve_linux_desktop_dir() {
   fi
 
   if [ -d "$desktop_home/Desktop" ]; then
+    desktop_candidate_physical=$(CDPATH= cd -- "$desktop_home/Desktop" 2>/dev/null && pwd -P) || return 0
+    [ "$desktop_candidate_physical" = "$desktop_home_physical" ] && return 0
     printf '%s\n' "$desktop_home/Desktop"
   fi
 }
@@ -742,9 +831,64 @@ legacy_linux_autostart_is_owned() {
   legacy_entry="$1"
   [ -f "$legacy_entry" ] || return 1
   [ ! -L "$legacy_entry" ] || return 1
-  grep -Eq '^Name=Wakezilla( Tray)?[[:space:]]*$' "$legacy_entry" 2>/dev/null || return 1
-  grep -Eq "^Exec=.*wakezilla-tray([[:space:]\"']|$)" "$legacy_entry" 2>/dev/null || \
-    grep -Eq "^Exec=.*wakezilla[\"']?[[:space:]]+tray([[:space:]]|$)" "$legacy_entry" 2>/dev/null
+  awk '
+    function finish_group() {
+      if (in_desktop && entry_type && entry_name && entry_exec) found = 1
+    }
+    function exec_is_owned(value, i, character, escaped, executable, rest, base, fields) {
+      sub(/^[ \t]+/, "", value)
+      if (substr(value, 1, 1) == "\"") {
+        escaped = 0
+        for (i = 2; i <= length(value); i++) {
+          character = substr(value, i, 1)
+          if (escaped) {
+            executable = executable character
+            escaped = 0
+          } else if (character == "\\") {
+            escaped = 1
+          } else if (character == "\"") {
+            rest = substr(value, i + 1)
+            break
+          } else {
+            executable = executable character
+          }
+        }
+        if (i > length(value)) return 0
+      } else {
+        executable = value
+        sub(/[ \t].*$/, "", executable)
+        rest = substr(value, length(executable) + 1)
+      }
+      base = executable
+      sub(/^.*\//, "", base)
+      if (base == "wakezilla-tray") return 1
+      if (base != "wakezilla") return 0
+      sub(/^[ \t]+/, "", rest)
+      split(rest, fields, /[ \t]+/)
+      return fields[1] == "tray"
+    }
+    /^[ \t]*\[[^]]+\][ \t]*$/ {
+      finish_group()
+      in_desktop = ($0 ~ /^[ \t]*\[Desktop Entry\][ \t]*$/)
+      entry_type = entry_name = entry_exec = 0
+      next
+    }
+    in_desktop {
+      separator = index($0, "=")
+      if (!separator) next
+      key = substr($0, 1, separator - 1)
+      value = substr($0, separator + 1)
+      gsub(/^[ \t]+|[ \t]+$/, "", key)
+      gsub(/^[ \t]+|[ \t]+$/, "", value)
+      if (key == "Type") entry_type = (value == "Application")
+      else if (key == "Name") entry_name = (value == "Wakezilla" || value == "Wakezilla Tray")
+      else if (key == "Exec") entry_exec = exec_is_owned(value)
+    }
+    END {
+      finish_group()
+      exit(found ? 0 : 1)
+    }
+  ' "$legacy_entry" 2>/dev/null
 }
 
 linux_root_profile_path_is_safe() (
@@ -800,6 +944,20 @@ atomic_install_file() (
   atomic_tmp=
 )
 
+atomic_restore_file() (
+  atomic_source="$1"
+  atomic_target="$2"
+  atomic_dir=$(dirname "$atomic_target") || exit 1
+  atomic_name=${atomic_target##*/}
+  [ ! -d "$atomic_target" ] || exit 1
+  atomic_tmp=$(mktemp "$atomic_dir/.${atomic_name}.tmp.XXXXXX") || exit 1
+  trap 'if [ -n "${atomic_tmp:-}" ]; then rm -f "$atomic_tmp"; fi' 0 1 2 15
+
+  cp -p "$atomic_source" "$atomic_tmp" || exit 1
+  mv -f "$atomic_tmp" "$atomic_target" || exit 1
+  atomic_tmp=
+)
+
 write_linux_profile_apply_helper() {
   apply_helper_path="$1"
   cat > "$apply_helper_path" <<'APPLY_HELPER'
@@ -810,6 +968,7 @@ stage_dir="$1"
 data_home="$2"
 config_home="$3"
 profile_home="$4"
+failure_hook="${5:-}"
 app_id=dev.wakezilla.Wakezilla
 icon_name=$app_id.png
 app_dir="$data_home/applications"
@@ -848,6 +1007,7 @@ resolve_desktop_dir() {
   home="$1"
   xdg_config="$2"
   cr=$(printf '\r')
+  home_physical=$(CDPATH= cd -- "$home" 2>/dev/null && pwd -P) || return 0
   if command -v xdg-user-dir >/dev/null 2>&1; then
     candidate=$(xdg-user-dir DESKTOP 2>/dev/null || printf '')
     case "$candidate" in
@@ -855,7 +1015,15 @@ resolve_desktop_dir() {
         case "$candidate" in
           *"$cr"*|*"
 "*) ;;
-          *) [ -d "$candidate" ] && { printf '%s\n' "$candidate"; return 0; } ;;
+          *)
+            if [ -d "$candidate" ]; then
+              if candidate_physical=$(CDPATH= cd -- "$candidate" 2>/dev/null && pwd -P); then
+                [ "$candidate_physical" = "$home_physical" ] && return 0
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            fi
+            ;;
         esac
         ;;
     esac
@@ -875,12 +1043,19 @@ resolve_desktop_dir() {
             /*) ;;
             *) continue ;;
           esac
-          [ -d "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+          if [ -d "$candidate" ]; then
+            candidate_physical=$(CDPATH= cd -- "$candidate" 2>/dev/null && pwd -P) || continue
+            [ "$candidate_physical" = "$home_physical" ] && return 0
+            printf '%s\n' "$candidate"
+            return 0
+          fi
           ;;
       esac
     done < "$user_dirs"
   fi
   if [ -d "$home/Desktop" ]; then
+    candidate_physical=$(CDPATH= cd -- "$home/Desktop" 2>/dev/null && pwd -P) || return 0
+    [ "$candidate_physical" = "$home_physical" ] && return 0
     printf '%s\n' "$home/Desktop"
   fi
   return 0
@@ -890,9 +1065,54 @@ legacy_is_owned() {
   entry="$1"
   [ -f "$entry" ] || return 1
   [ ! -L "$entry" ] || return 1
-  grep -Eq '^Name=Wakezilla( Tray)?[[:space:]]*$' "$entry" 2>/dev/null || return 1
-  grep -Eq "^Exec=.*wakezilla-tray([[:space:]\"']|$)" "$entry" 2>/dev/null || \
-    grep -Eq "^Exec=.*wakezilla[\"']?[[:space:]]+tray([[:space:]]|$)" "$entry" 2>/dev/null
+  awk '
+    function finish_group() {
+      if (in_desktop && entry_type && entry_name && entry_exec) found = 1
+    }
+    function exec_is_owned(value, i, character, escaped, executable, rest, base, fields) {
+      sub(/^[ \t]+/, "", value)
+      if (substr(value, 1, 1) == "\"") {
+        escaped = 0
+        for (i = 2; i <= length(value); i++) {
+          character = substr(value, i, 1)
+          if (escaped) { executable = executable character; escaped = 0 }
+          else if (character == "\\") escaped = 1
+          else if (character == "\"") { rest = substr(value, i + 1); break }
+          else executable = executable character
+        }
+        if (i > length(value)) return 0
+      } else {
+        executable = value
+        sub(/[ \t].*$/, "", executable)
+        rest = substr(value, length(executable) + 1)
+      }
+      base = executable
+      sub(/^.*\//, "", base)
+      if (base == "wakezilla-tray") return 1
+      if (base != "wakezilla") return 0
+      sub(/^[ \t]+/, "", rest)
+      split(rest, fields, /[ \t]+/)
+      return fields[1] == "tray"
+    }
+    /^[ \t]*\[[^]]+\][ \t]*$/ {
+      finish_group()
+      in_desktop = ($0 ~ /^[ \t]*\[Desktop Entry\][ \t]*$/)
+      entry_type = entry_name = entry_exec = 0
+      next
+    }
+    in_desktop {
+      separator = index($0, "=")
+      if (!separator) next
+      key = substr($0, 1, separator - 1)
+      value = substr($0, separator + 1)
+      gsub(/^[ \t]+|[ \t]+$/, "", key)
+      gsub(/^[ \t]+|[ \t]+$/, "", value)
+      if (key == "Type") entry_type = (value == "Application")
+      else if (key == "Name") entry_name = (value == "Wakezilla" || value == "Wakezilla Tray")
+      else if (key == "Exec") entry_exec = exec_is_owned(value)
+    }
+    END { finish_group(); exit(found ? 0 : 1) }
+  ' "$entry" 2>/dev/null
 }
 
 atomic_copy() (
@@ -909,6 +1129,78 @@ atomic_copy() (
   mv -f "$temp_file" "$target_file" || exit 1
   temp_file=
 )
+
+atomic_restore() (
+  source_file="$1"
+  target_file="$2"
+  target_dir=${target_file%/*}
+  target_name=${target_file##*/}
+  [ ! -d "$target_file" ] || exit 1
+  temp_file=$(mktemp "$target_dir/.${target_name}.tmp.XXXXXX") || exit 1
+  trap 'rm -f "$temp_file"' 0 1 2 15
+  cp -p "$source_file" "$temp_file" || exit 1
+  mv -f "$temp_file" "$target_file" || exit 1
+  temp_file=
+)
+
+snapshot_target() {
+  snapshot_key="$1"
+  snapshot_path="$2"
+  if [ -e "$snapshot_path" ] || [ -L "$snapshot_path" ]; then
+    [ -f "$snapshot_path" ] || return 1
+    [ ! -L "$snapshot_path" ] || return 1
+    cp -p "$snapshot_path" "$snapshot_dir/$snapshot_key.file" || return 1
+    : > "$snapshot_dir/$snapshot_key.present" || return 1
+  else
+    : > "$snapshot_dir/$snapshot_key.missing" || return 1
+  fi
+}
+
+restore_target() {
+  restore_key="$1"
+  restore_path="$2"
+  if [ -f "$snapshot_dir/$restore_key.present" ]; then
+    atomic_restore "$snapshot_dir/$restore_key.file" "$restore_path"
+  else
+    rm -f "$restore_path"
+  fi
+}
+
+publish_target() {
+  publish_key="$1"
+  publish_source="$2"
+  publish_path="$3"
+  publish_mode="$4"
+  [ "$failure_hook" != "$publish_key" ] || return 1
+  atomic_copy "$publish_source" "$publish_path" "$publish_mode" || return 1
+  touched_targets="$publish_key $touched_targets"
+}
+
+rollback_profile() {
+  set +e
+  for rollback_key in $touched_targets; do
+    case "$rollback_key" in
+      icon48) restore_target icon48 "$icon_48_target" ;;
+      icon128) restore_target icon128 "$icon_128_target" ;;
+      icon256) restore_target icon256 "$icon_256_target" ;;
+      application) restore_target application "$application_target" ;;
+      desktop) restore_target desktop "$desktop_target" ;;
+      legacy) restore_target legacy "$legacy_entry" ;;
+      autostart) restore_target autostart "$autostart_target" ;;
+    esac
+  done
+  set -e
+}
+
+transaction_cleanup() {
+  transaction_status=$?
+  trap - 0 1 2 15
+  if [ "${transaction_active:-no}" = yes ]; then
+    printf '%s\n' 'warning: Linux desktop integration failed; rolling back profile files' >&2
+    rollback_profile
+  fi
+  exit "$transaction_status"
+}
 
 for staged_file in application.desktop autostart.desktop icon-48.png icon-128.png icon-256.png; do
   [ -f "$stage_dir/$staged_file" ] || exit 1
@@ -929,6 +1221,7 @@ if [ -n "$desktop_dir" ] && ! profile_path_is_safe "$desktop_dir" "$profile_home
   desktop_dir=
 fi
 
+umask 077
 mkdir -p "$app_dir" "$autostart_dir" \
   "$data_home/icons/hicolor/48x48/apps" \
   "$data_home/icons/hicolor/128x128/apps" \
@@ -943,23 +1236,46 @@ for destination_dir in \
   profile_path_is_safe "$destination_dir" "$profile_home" || exit 1
 done
 
-atomic_copy "$stage_dir/application.desktop" "$app_dir/$app_id.desktop" 0644
-atomic_copy "$stage_dir/autostart.desktop" "$autostart_dir/dev.wakezilla.tray.desktop" 0644
-atomic_copy "$stage_dir/icon-48.png" "$data_home/icons/hicolor/48x48/apps/$icon_name" 0644
-atomic_copy "$stage_dir/icon-128.png" "$data_home/icons/hicolor/128x128/apps/$icon_name" 0644
-atomic_copy "$stage_dir/icon-256.png" "$data_home/icons/hicolor/256x256/apps/$icon_name" 0644
-
-if [ -n "$desktop_dir" ]; then
-  desktop_entry="$desktop_dir/$app_id.desktop"
-  atomic_copy "$stage_dir/application.desktop" "$desktop_entry" 0755
-  if command -v gio >/dev/null 2>&1; then
-    gio set "$desktop_entry" metadata::trusted true >/dev/null 2>&1 || true
-  fi
-fi
-
+application_target="$app_dir/$app_id.desktop"
+autostart_target="$autostart_dir/dev.wakezilla.tray.desktop"
+icon_48_target="$data_home/icons/hicolor/48x48/apps/$icon_name"
+icon_128_target="$data_home/icons/hicolor/128x128/apps/$icon_name"
+icon_256_target="$data_home/icons/hicolor/256x256/apps/$icon_name"
+desktop_target=
+[ -z "$desktop_dir" ] || desktop_target="$desktop_dir/$app_id.desktop"
 legacy_entry="$autostart_dir/wakezilla-tray.desktop"
+
+snapshot_dir="$stage_dir/.rollback"
+mkdir -p "$snapshot_dir"
+snapshot_target icon48 "$icon_48_target"
+snapshot_target icon128 "$icon_128_target"
+snapshot_target icon256 "$icon_256_target"
+snapshot_target application "$application_target"
+[ -z "$desktop_target" ] || snapshot_target desktop "$desktop_target"
+snapshot_target legacy "$legacy_entry"
+snapshot_target autostart "$autostart_target"
+
+touched_targets=
+transaction_active=yes
+trap transaction_cleanup 0
+trap 'exit 1' 1 2 15
+
+publish_target icon48 "$stage_dir/icon-48.png" "$icon_48_target" 0644
+publish_target icon128 "$stage_dir/icon-128.png" "$icon_128_target" 0644
+publish_target icon256 "$stage_dir/icon-256.png" "$icon_256_target" 0644
+publish_target application "$stage_dir/application.desktop" "$application_target" 0644
+if [ -n "$desktop_target" ]; then
+  publish_target desktop "$stage_dir/application.desktop" "$desktop_target" 0755
+fi
 if legacy_is_owned "$legacy_entry"; then
   rm -f "$legacy_entry"
+  touched_targets="legacy $touched_targets"
+fi
+publish_target autostart "$stage_dir/autostart.desktop" "$autostart_target" 0644
+transaction_active=no
+
+if [ -n "$desktop_target" ] && command -v gio >/dev/null 2>&1; then
+  gio set "$desktop_target" metadata::trusted true >/dev/null 2>&1 || true
 fi
 APPLY_HELPER
   chmod 0700 "$apply_helper_path"
@@ -973,6 +1289,7 @@ apply_linux_profile_as_user() {
   apply_user="$5"
   apply_uid="$6"
   apply_gid="$7"
+  apply_failure_hook="${8:-}"
 
   apply_chown=
   apply_env=
@@ -1024,7 +1341,8 @@ apply_linux_profile_as_user() {
       XDG_CONFIG_HOME="$apply_config_home" \
       PATH=/usr/local/bin:/usr/bin:/bin \
       "$apply_shell" "$apply_stage/apply-profile.sh" \
-      "$apply_stage" "$apply_data_home" "$apply_config_home" "$apply_home"
+      "$apply_stage" "$apply_data_home" "$apply_config_home" "$apply_home" \
+      "$apply_failure_hook"
     return $?
   fi
   if [ "$apply_runner_kind" = "runuser" ]; then
@@ -1035,7 +1353,8 @@ apply_linux_profile_as_user() {
       XDG_CONFIG_HOME="$apply_config_home" \
       PATH=/usr/local/bin:/usr/bin:/bin \
       "$apply_shell" "$apply_stage/apply-profile.sh" \
-      "$apply_stage" "$apply_data_home" "$apply_config_home" "$apply_home"
+      "$apply_stage" "$apply_data_home" "$apply_config_home" "$apply_home" \
+      "$apply_failure_hook"
     return $?
   fi
   warn "cannot apply Linux desktop integration as $apply_user: sudo or runuser is unavailable"
@@ -1104,14 +1423,26 @@ install_linux_desktop_integration() (
     warn "failed to create a temporary directory for Linux desktop integration"
     exit 1
   }
-  trap 'rm -rf "$linux_stage"' 0 1 2 15
+  linux_transaction_active=no
+  linux_touched_targets=
+  linux_integration_cleanup() {
+    linux_cleanup_status=$?
+    trap - 0 1 2 15
+    if [ "${linux_transaction_active:-no}" = yes ]; then
+      warn "Linux desktop integration failed; rolling back profile files"
+      linux_rollback_profile
+    fi
+    rm -rf "$linux_stage"
+    exit "$linux_cleanup_status"
+  }
+  trap linux_integration_cleanup 0
+  trap 'exit 1' 1 2 15
 
   linux_exec=$(desktop_exec_quote "$linux_helper") || exit 1
   linux_try_exec=$(desktop_string_escape "$linux_helper") || exit 1
   {
     printf '%s\n' '[Desktop Entry]'
     printf '%s\n' 'Type=Application'
-    printf '%s\n' 'Version=1.0'
     printf '%s\n' 'Name=Wakezilla'
     printf '%s\n' 'Comment=Wakezilla network wake-on-LAN tray application'
     printf 'TryExec=%s\n' "$linux_try_exec"
@@ -1124,6 +1455,10 @@ install_linux_desktop_integration() (
   cp "$linux_stage/application.desktop" "$linux_stage/autostart.desktop" || exit 1
 
   if [ "$integration_root" = "yes" ]; then
+    linux_failure_hook=
+    if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
+      linux_failure_hook=${WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION:-}
+    fi
     for linux_size in 48 128 256; do
       cp "$linux_extract_dir/icons/hicolor/${linux_size}x${linux_size}/apps/$linux_icon_name" \
         "$linux_stage/icon-$linux_size.png" || exit 1
@@ -1138,7 +1473,8 @@ install_linux_desktop_integration() (
       "$integration_home" \
       "$integration_user" \
       "$integration_uid" \
-      "$integration_gid"
+      "$integration_gid" \
+      "$linux_failure_hook"
     linux_apply_status=$?
     set -e
     case "$linux_apply_status" in
@@ -1152,6 +1488,7 @@ install_linux_desktop_integration() (
 
   linux_desktop_dir=$(resolve_linux_desktop_dir "$integration_home" "$linux_config_home")
 
+  umask 077
   mkdir -p "$linux_app_dir" "$linux_autostart_dir" || {
     warn "failed to create Linux desktop integration directories"
     exit 1
@@ -1160,31 +1497,105 @@ install_linux_desktop_integration() (
     mkdir -p "$linux_data_home/icons/hicolor/${linux_size}x${linux_size}/apps" || exit 1
   done
 
-  linux_install_file() {
-    atomic_install_file "$1" "$2" "$3"
+  linux_application_target="$linux_app_dir/dev.wakezilla.Wakezilla.desktop"
+  linux_autostart_target="$linux_autostart_dir/dev.wakezilla.tray.desktop"
+  linux_desktop_target=
+  [ -z "$linux_desktop_dir" ] || \
+    linux_desktop_target="$linux_desktop_dir/dev.wakezilla.Wakezilla.desktop"
+  linux_icon_48_target="$linux_data_home/icons/hicolor/48x48/apps/$linux_icon_name"
+  linux_icon_128_target="$linux_data_home/icons/hicolor/128x128/apps/$linux_icon_name"
+  linux_icon_256_target="$linux_data_home/icons/hicolor/256x256/apps/$linux_icon_name"
+  linux_legacy_entry="$linux_autostart_dir/wakezilla-tray.desktop"
+  linux_snapshot_dir="$linux_stage/.rollback"
+  mkdir -p "$linux_snapshot_dir" || exit 1
+
+  linux_snapshot_target() {
+    linux_snapshot_key="$1"
+    linux_snapshot_path="$2"
+    if [ -e "$linux_snapshot_path" ] || [ -L "$linux_snapshot_path" ]; then
+      [ -f "$linux_snapshot_path" ] || return 1
+      [ ! -L "$linux_snapshot_path" ] || return 1
+      cp -p "$linux_snapshot_path" "$linux_snapshot_dir/$linux_snapshot_key.file" || return 1
+      : > "$linux_snapshot_dir/$linux_snapshot_key.present" || return 1
+    else
+      : > "$linux_snapshot_dir/$linux_snapshot_key.missing" || return 1
+    fi
   }
 
-  linux_install_file "$linux_stage/application.desktop" \
-    "$linux_app_dir/dev.wakezilla.Wakezilla.desktop" 0644 || exit 1
-  linux_install_file "$linux_stage/autostart.desktop" \
-    "$linux_autostart_dir/dev.wakezilla.tray.desktop" 0644 || exit 1
-  if [ -n "$linux_desktop_dir" ]; then
-    linux_desktop_entry="$linux_desktop_dir/dev.wakezilla.Wakezilla.desktop"
-    linux_install_file "$linux_stage/application.desktop" "$linux_desktop_entry" 0755 || exit 1
-    if command -v gio >/dev/null 2>&1; then
-      gio set "$linux_desktop_entry" metadata::trusted true >/dev/null 2>&1 || true
+  linux_restore_target() {
+    linux_restore_key="$1"
+    linux_restore_path="$2"
+    if [ -f "$linux_snapshot_dir/$linux_restore_key.present" ]; then
+      atomic_restore_file "$linux_snapshot_dir/$linux_restore_key.file" "$linux_restore_path"
+    else
+      rm -f "$linux_restore_path"
     fi
-  fi
-  for linux_size in 48 128 256; do
-    linux_install_file \
-      "$linux_extract_dir/icons/hicolor/${linux_size}x${linux_size}/apps/$linux_icon_name" \
-      "$linux_data_home/icons/hicolor/${linux_size}x${linux_size}/apps/$linux_icon_name" \
-      0644 || exit 1
-  done
+  }
 
-  linux_legacy_entry="$linux_autostart_dir/wakezilla-tray.desktop"
+  linux_rollback_profile() {
+    set +e
+    for linux_rollback_key in $linux_touched_targets; do
+      case "$linux_rollback_key" in
+        icon48) linux_restore_target icon48 "$linux_icon_48_target" ;;
+        icon128) linux_restore_target icon128 "$linux_icon_128_target" ;;
+        icon256) linux_restore_target icon256 "$linux_icon_256_target" ;;
+        application) linux_restore_target application "$linux_application_target" ;;
+        desktop) linux_restore_target desktop "$linux_desktop_target" ;;
+        legacy) linux_restore_target legacy "$linux_legacy_entry" ;;
+        autostart) linux_restore_target autostart "$linux_autostart_target" ;;
+      esac
+    done
+    set -e
+  }
+
+  linux_publish_target() {
+    linux_publish_key="$1"
+    linux_publish_source="$2"
+    linux_publish_path="$3"
+    linux_publish_mode="$4"
+    if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ] && \
+       [ "${WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION:-}" = "$linux_publish_key" ]; then
+      return 1
+    fi
+    atomic_install_file "$linux_publish_source" "$linux_publish_path" "$linux_publish_mode" || return 1
+    linux_touched_targets="$linux_publish_key $linux_touched_targets"
+  }
+
+  linux_snapshot_target icon48 "$linux_icon_48_target" || exit 1
+  linux_snapshot_target icon128 "$linux_icon_128_target" || exit 1
+  linux_snapshot_target icon256 "$linux_icon_256_target" || exit 1
+  linux_snapshot_target application "$linux_application_target" || exit 1
+  [ -z "$linux_desktop_target" ] || \
+    linux_snapshot_target desktop "$linux_desktop_target" || exit 1
+  linux_snapshot_target legacy "$linux_legacy_entry" || exit 1
+  linux_snapshot_target autostart "$linux_autostart_target" || exit 1
+
+  linux_transaction_active=yes
+  linux_publish_target icon48 \
+    "$linux_extract_dir/icons/hicolor/48x48/apps/$linux_icon_name" \
+    "$linux_icon_48_target" 0644 || exit 1
+  linux_publish_target icon128 \
+    "$linux_extract_dir/icons/hicolor/128x128/apps/$linux_icon_name" \
+    "$linux_icon_128_target" 0644 || exit 1
+  linux_publish_target icon256 \
+    "$linux_extract_dir/icons/hicolor/256x256/apps/$linux_icon_name" \
+    "$linux_icon_256_target" 0644 || exit 1
+  linux_publish_target application "$linux_stage/application.desktop" \
+    "$linux_application_target" 0644 || exit 1
+  if [ -n "$linux_desktop_target" ]; then
+    linux_publish_target desktop "$linux_stage/application.desktop" \
+      "$linux_desktop_target" 0755 || exit 1
+  fi
   if legacy_linux_autostart_is_owned "$linux_legacy_entry"; then
     rm -f "$linux_legacy_entry" || exit 1
+    linux_touched_targets="legacy $linux_touched_targets"
+  fi
+  linux_publish_target autostart "$linux_stage/autostart.desktop" \
+    "$linux_autostart_target" 0644 || exit 1
+  linux_transaction_active=no
+
+  if [ -n "$linux_desktop_target" ] && command -v gio >/dev/null 2>&1; then
+    gio set "$linux_desktop_target" metadata::trusted true >/dev/null 2>&1 || true
   fi
 
   if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
@@ -1197,7 +1608,7 @@ install_linux_desktop_integration() (
         "$linux_helper" </dev/null >/dev/null 2>&1 &
       ) || true
     fi
-    info "Linux desktop integration installed; started the Wakezilla tray"
+    info "Linux desktop integration installed; Wakezilla tray launch requested"
   else
     info "Linux desktop integration installed; the Wakezilla tray will start at the next graphical login"
   fi
