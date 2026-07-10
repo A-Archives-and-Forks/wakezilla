@@ -206,6 +206,32 @@ SH
   rm -rf "$archive_stage"
 }
 
+write_fake_sudo() {
+  command_path="$1"
+  cat > "$command_path" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$@" >> "$WAKEZILLA_PRIVILEGE_LOG"
+[ "${1:-}" = "-u" ] || exit 91
+[ "${2:-}" != "root" ] || exit 92
+shift 2
+if [ "${1:-}" = "--" ]; then
+  shift
+fi
+exec "$@"
+SH
+  chmod 755 "$command_path"
+}
+
+write_fake_chown() {
+  command_path="$1"
+  cat > "$command_path" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$@" >> "$WAKEZILLA_CHOWN_LOG"
+exit 0
+SH
+  chmod 755 "$command_path"
+}
+
 test_help_includes_required_docs() {
   run_script --help
   assert_eq "0" "$status" "help exit status"
@@ -1161,6 +1187,54 @@ file_mode() {
   fi
 }
 
+reference_decode_desktop_exec() {
+  awk '
+    function desktop_unescape(value,    output, i, current, following) {
+      output = ""
+      for (i = 1; i <= length(value); i++) {
+        current = substr(value, i, 1)
+        if (current != "\\") {
+          output = output current
+          continue
+        }
+        following = substr(value, i + 1, 1)
+        if (following == "\\") output = output "\\"
+        else if (following == "s") output = output " "
+        else if (following == "n") output = output "\n"
+        else if (following == "t") output = output "\t"
+        else if (following == "r") output = output "\r"
+        else exit 2
+        i++
+      }
+      return output
+    }
+    {
+      value = $0
+      sub(/^Exec=/, "", value)
+      value = desktop_unescape(value)
+      if (substr(value, 1, 1) != "\"" || substr(value, length(value), 1) != "\"") exit 3
+      value = substr(value, 2, length(value) - 2)
+      output = ""
+      for (i = 1; i <= length(value); i++) {
+        current = substr(value, i, 1)
+        following = substr(value, i + 1, 1)
+        if (current == "\\") {
+          if (following != "\\" && following != "\"" && following != "`" && following != "$") exit 4
+          output = output following
+          i++
+        } else if (current == "%") {
+          if (following != "%") exit 5
+          output = output "%"
+          i++
+        } else {
+          output = output current
+        }
+      }
+      print output
+    }
+  '
+}
+
 test_linux_desktop_integration_helpers_defined() {
   missing=0
   assert_command_exists resolve_linux_integration_user "linux integration user resolver" || missing=1
@@ -1184,9 +1258,14 @@ test_linux_desktop_integration_writes_xdg_entries_headless() {
   bin_dir="$temp_dir/bin"
   data_dir="$temp_dir/xdg data"
   config_dir="$temp_dir/xdg config"
+  launch_log="$temp_dir/launch.log"
   mkdir -p "$home_dir" "$bin_dir"
   write_linux_integration_fixture "$extract_dir"
-  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  cat > "$bin_dir/wakezilla-tray" <<SH
+#!/usr/bin/env sh
+printf 'unexpected launch\n' > '$launch_log'
+SH
+  chmod 755 "$bin_dir/wakezilla-tray"
 
   output=$(
     HOME="$home_dir" \
@@ -1208,23 +1287,106 @@ test_linux_desktop_integration_writes_xdg_entries_headless() {
   fi
   app_contents=$(cat "$app_entry" 2>/dev/null || true)
   autostart_contents=$(cat "$autostart_entry" 2>/dev/null || true)
-  assert_contains "$app_contents" "Type=Application" "linux application type"
-  assert_contains "$app_contents" "Exec=\"$bin_dir/wakezilla-tray\"" "linux application direct helper Exec"
-  assert_contains "$app_contents" "TryExec=$bin_dir/wakezilla-tray" "linux application TryExec"
-  assert_contains "$app_contents" "Icon=dev.wakezilla.Wakezilla" "linux application icon"
-  assert_contains "$app_contents" "Categories=Network;Utility;" "linux application categories"
-  assert_contains "$autostart_contents" "Exec=\"$bin_dir/wakezilla-tray\"" "linux autostart direct helper Exec"
+  expected_exec="Exec=\"$bin_dir/wakezilla-tray\""
+  expected_try_exec="TryExec=$bin_dir/wakezilla-tray"
+  for launcher_kind in application autostart; do
+    case "$launcher_kind" in
+      application) launcher_contents=$app_contents ;;
+      autostart) launcher_contents=$autostart_contents ;;
+    esac
+    assert_contains "$launcher_contents" "Type=Application" "linux $launcher_kind type"
+    assert_contains "$launcher_contents" "Version=1.0" "linux $launcher_kind version"
+    assert_contains "$launcher_contents" "Name=Wakezilla" "linux $launcher_kind name"
+    assert_contains "$launcher_contents" "Comment=" "linux $launcher_kind comment"
+    assert_eq "$expected_exec" "$(printf '%s\n' "$launcher_contents" | awk '/^Exec=/ { print; exit }')" "linux $launcher_kind exact direct helper Exec"
+    assert_eq "$expected_try_exec" "$(printf '%s\n' "$launcher_contents" | awk '/^TryExec=/ { print; exit }')" "linux $launcher_kind exact TryExec"
+    assert_contains "$launcher_contents" "Terminal=false" "linux $launcher_kind terminal"
+    assert_contains "$launcher_contents" "StartupNotify=false" "linux $launcher_kind startup notification"
+    assert_contains "$launcher_contents" "Icon=dev.wakezilla.Wakezilla" "linux $launcher_kind icon"
+    assert_contains "$launcher_contents" "Categories=Network;Utility;" "linux $launcher_kind categories"
+  done
   assert_not_contains "$app_contents$autostart_contents" "wakezilla tray" "linux launchers avoid CLI tray subcommand"
   assert_contains "$output" "next graphical login" "linux headless next-login message"
+  if [ -e "$home_dir/Desktop" ]; then
+    fail "linux headless integration: nonexistent Desktop was created"
+  fi
+  if [ ! -f "$autostart_entry" ]; then
+    fail "linux headless integration: autostart was not retained"
+  fi
+  if [ -e "$launch_log" ]; then
+    fail "linux headless integration: helper launched without a graphical session"
+  fi
 
   rm -rf "$temp_dir"
 }
 
 test_desktop_exec_quote_escapes_reserved_characters() {
   exec_path='/tmp/wakezilla path/back\slash"quote`tick$dollar%percent/wakezilla-tray'
-  expected='"/tmp/wakezilla path/back\\slash\"quote\`tick\$dollar%%percent/wakezilla-tray"'
+  expected='"/tmp/wakezilla path/back\\\\slash\\"quote\\`tick\\$dollar%%percent/wakezilla-tray"'
   actual=$(desktop_exec_quote "$exec_path")
   assert_eq "$expected" "$actual" "desktop Exec reserved-character escaping"
+  decoded=$(printf 'Exec=%s\n' "$actual" | reference_decode_desktop_exec || true)
+  assert_eq "$exec_path" "$decoded" "desktop Exec independent reference decoding"
+}
+
+test_desktop_exec_gio_launches_hostile_path_without_arguments() {
+  command -v gio >/dev/null 2>&1 || return 0
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir=$temp_dir/'bin space\slash"quote`touch wakezilla-backtick-pwned`dollar$(touch wakezilla-dollar-pwned)%percent'
+  data_dir="$temp_dir/data"
+  config_dir="$temp_dir/config"
+  sentinel="$temp_dir/launched"
+  argv_log="$temp_dir/argv-count"
+  executable_log="$temp_dir/executable"
+  mkdir -p "$home_dir" "$bin_dir"
+  write_linux_integration_fixture "$extract_dir"
+  cat > "$bin_dir/wakezilla-tray" <<SH
+#!/usr/bin/env sh
+printf '%s\n' "\$#" > '$argv_log'
+printf '%s\n' "\$0" > '$executable_log'
+: > '$sentinel'
+SH
+  chmod 755 "$bin_dir/wakezilla-tray"
+
+  HOME="$home_dir" XDG_DATA_HOME="$data_dir" XDG_CONFIG_HOME="$config_dir" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+  app_entry="$data_dir/applications/dev.wakezilla.Wakezilla.desktop"
+  generated_exec=$(awk '/^Exec=/ { print; exit }' "$app_entry")
+  decoded_exec=$(printf '%s\n' "$generated_exec" | reference_decode_desktop_exec || true)
+  assert_eq "$bin_dir/wakezilla-tray" "$decoded_exec" "generated desktop Exec independent reference decoding"
+  gio_output="$temp_dir/gio-output"
+  set +e
+  (
+    cd "$temp_dir"
+    HOME="$home_dir" XDG_DATA_HOME="$data_dir" XDG_CONFIG_HOME="$config_dir" \
+      gio launch "$app_entry" >"$gio_output" 2>&1
+  )
+  gio_status=$?
+  set -e
+  if [ "$gio_status" -ne 0 ] && grep -qi 'not.*supported' "$gio_output"; then
+    rm -rf "$temp_dir"
+    return 0
+  fi
+  if [ "$gio_status" -ne 0 ]; then
+    fail "desktop Exec gio launch: gio rejected the generated desktop entry"
+  fi
+  gio_wait=0
+  while [ ! -e "$sentinel" ] && [ "$gio_wait" -lt 100 ]; do
+    sleep 0.01
+    gio_wait=$((gio_wait + 1))
+  done
+  if [ ! -e "$sentinel" ]; then
+    fail "desktop Exec gio launch: helper did not run"
+  fi
+  assert_eq "0" "$(cat "$argv_log" 2>/dev/null || true)" "desktop Exec gio argv count"
+  assert_eq "$bin_dir/wakezilla-tray" "$(cat "$executable_log" 2>/dev/null || true)" "desktop Exec gio executable"
+  if [ -e "$temp_dir/wakezilla-backtick-pwned" ] || [ -e "$temp_dir/wakezilla-dollar-pwned" ]; then
+    fail "desktop Exec gio launch: command substitution sentinel was created"
+  fi
+  rm -rf "$temp_dir"
 }
 
 test_desktop_exec_quote_rejects_line_breaks() {
@@ -1573,13 +1735,14 @@ SH
   rm -rf "$temp_dir"
 }
 
-test_linux_integration_valid_sudo_user_targets_profile_and_chowns() {
+test_linux_integration_valid_sudo_user_applies_as_target_user() {
   temp_dir=$(mktemp -d)
   root_home="$temp_dir/root-home"
   user_home="$temp_dir/user-home"
   extract_dir="$temp_dir/extract"
   bin_dir="$temp_dir/system-bin"
   chown_log="$temp_dir/chown.log"
+  privilege_log="$temp_dir/privilege.log"
   launch_log="$temp_dir/launch.log"
   test_uid=$(id -u)
   test_gid=$(id -g)
@@ -1592,6 +1755,8 @@ printf '%s\n' "$@" >> "$WAKEZILLA_CHOWN_LOG"
 exit 0
 SH
   chmod 755 "$temp_dir/stub-bin/chown"
+  write_fake_sudo "$temp_dir/stub-bin/sudo"
+  : > "$privilege_log"
 
   output=$(
     HOME="$root_home" \
@@ -1604,6 +1769,7 @@ SH
     WAKEZILLA_TEST_SUDO_GID="$test_gid" \
     WAKEZILLA_TEST_SUDO_HOME="$user_home" \
     WAKEZILLA_CHOWN_LOG="$chown_log" \
+    WAKEZILLA_PRIVILEGE_LOG="$privilege_log" \
     WAKEZILLA_LAUNCH_LOG="$launch_log" \
     DISPLAY=:99 \
     PATH="$temp_dir/stub-bin:$PATH" \
@@ -1624,7 +1790,51 @@ SH
   fi
   chown_args=$(cat "$chown_log" 2>/dev/null || true)
   assert_contains "$chown_args" "$test_uid:$test_gid" "sudo integration chown owner"
+  assert_not_contains "$chown_args" "$user_home" "sudo integration never chowns target home or profile"
+  privilege_args=$(tr '\n' ' ' < "$privilege_log" 2>/dev/null || true)
+  assert_contains "$privilege_args" "-u wakezilla-test-user --" "sudo integration drops to target user"
+  assert_not_contains "$privilege_args" "-u root" "sudo integration never selects root"
   assert_contains "$output" "next graphical login" "sudo integration next-login message"
+  rm -rf "$temp_dir"
+}
+
+test_resolve_linux_integration_user_rejects_unsafe_sudo_homes() {
+  temp_dir=$(mktemp -d)
+  safe_home="$temp_dir/safe-home"
+  outside_home="$temp_dir/outside-home"
+  missing_home="$temp_dir/missing-home"
+  symlink_home="$temp_dir/symlink-home"
+  test_uid=$(id -u)
+  test_gid=$(id -g)
+  mkdir -p "$safe_home" "$outside_home"
+  ln -s "$outside_home" "$symlink_home"
+
+  for unsafe_home in / /root "$symlink_home" "$missing_home"; do
+    if output=$(HOME=/root WAKEZILLA_EUID=0 WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+      WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
+      WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
+      WAKEZILLA_TEST_SUDO_HOME="$unsafe_home" resolve_linux_integration_user 2>&1); then
+      fail "sudo home validation: expected rejection for $unsafe_home"
+    else
+      assert_contains "$output" "skipping Linux desktop integration" "sudo home rejection warning"
+    fi
+  done
+
+  mkdir -p "$temp_dir/stat-bin"
+  cat > "$temp_dir/stat-bin/stat" <<'SH'
+#!/usr/bin/env sh
+printf '999999\n'
+SH
+  chmod 755 "$temp_dir/stat-bin/stat"
+  if output=$(HOME=/root WAKEZILLA_EUID=0 WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
+    WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
+    WAKEZILLA_TEST_SUDO_HOME="$safe_home" PATH="$temp_dir/stat-bin:$PATH" \
+    resolve_linux_integration_user 2>&1); then
+    fail "sudo home validation: expected owner mismatch rejection"
+  else
+    assert_contains "$output" "skipping Linux desktop integration" "sudo home owner mismatch warning"
+  fi
   rm -rf "$temp_dir"
 }
 
@@ -1668,12 +1878,17 @@ test_linux_integration_root_discards_desktop_outside_target_home() {
 printf '%s\n' '$outside_desktop'
 SH
   chmod 755 "$temp_dir/stub-bin/xdg-user-dir"
+  write_fake_sudo "$temp_dir/stub-bin/sudo"
+  write_fake_chown "$temp_dir/stub-bin/chown"
+  : > "$temp_dir/chown.log"
 
   HOME=/root WAKEZILLA_EUID=0 \
     WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
     WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
     WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
-    WAKEZILLA_TEST_SUDO_HOME="$user_home" DISPLAY= WAYLAND_DISPLAY= \
+    WAKEZILLA_TEST_SUDO_HOME="$user_home" WAKEZILLA_PRIVILEGE_LOG="$temp_dir/privilege.log" \
+    WAKEZILLA_CHOWN_LOG="$temp_dir/chown.log" \
+    DISPLAY= WAYLAND_DISPLAY= \
     PATH="$temp_dir/stub-bin:$PATH" \
     install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
   if [ -e "$outside_desktop/dev.wakezilla.Wakezilla.desktop" ]; then
@@ -1690,16 +1905,20 @@ test_linux_integration_root_rejects_profile_traversal_and_symlinks() {
   bin_dir="$temp_dir/bin"
   test_uid=$(id -u)
   test_gid=$(id -g)
-  mkdir -p "$user_home" "$outside_dir" "$bin_dir"
+  mkdir -p "$user_home" "$outside_dir" "$bin_dir" "$temp_dir/stub-bin"
   write_linux_integration_fixture "$extract_dir"
   cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  write_fake_sudo "$temp_dir/stub-bin/sudo"
+  write_fake_chown "$temp_dir/stub-bin/chown"
+  : > "$temp_dir/chown.log"
 
   HOME=/root WAKEZILLA_EUID=0 WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
     WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
     WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
     WAKEZILLA_TEST_SUDO_HOME="$user_home" \
     XDG_DATA_HOME="$user_home/../outside/data" \
-    XDG_CONFIG_HOME="$user_home/../outside/config" DISPLAY= WAYLAND_DISPLAY= \
+    XDG_CONFIG_HOME="$user_home/../outside/config" WAKEZILLA_PRIVILEGE_LOG="$temp_dir/privilege.log" \
+    WAKEZILLA_CHOWN_LOG="$temp_dir/chown.log" DISPLAY= WAYLAND_DISPLAY= PATH="$temp_dir/stub-bin:$PATH" \
     install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
   if [ -d "$outside_dir/data" ] || [ -d "$outside_dir/config" ]; then
     fail "sudo profile traversal: wrote outside target home"
@@ -1714,13 +1933,77 @@ test_linux_integration_root_rejects_profile_traversal_and_symlinks() {
     WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
     WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
     WAKEZILLA_TEST_SUDO_HOME="$user_home" \
-    XDG_DATA_HOME= XDG_CONFIG_HOME= DISPLAY= WAYLAND_DISPLAY= \
+    XDG_DATA_HOME= XDG_CONFIG_HOME= WAKEZILLA_PRIVILEGE_LOG="$temp_dir/privilege.log" \
+    WAKEZILLA_CHOWN_LOG="$temp_dir/chown.log" DISPLAY= WAYLAND_DISPLAY= PATH="$temp_dir/stub-bin:$PATH" \
     install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1; then
     fail "sudo profile symlink: expected integration failure"
   fi
   if [ -d "$outside_dir/share" ]; then
     fail "sudo profile symlink: wrote outside target home"
   fi
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_root_dropped_apply_rejects_intermediate_symlinks() {
+  temp_dir=$(mktemp -d)
+  user_home="$temp_dir/user-home"
+  outside_dir="$temp_dir/outside"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  chown_log="$temp_dir/chown.log"
+  privilege_log="$temp_dir/privilege.log"
+  test_uid=$(id -u)
+  test_gid=$(id -g)
+  mkdir -p "$user_home" "$outside_dir" "$bin_dir" "$temp_dir/stub-bin"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  write_fake_sudo "$temp_dir/stub-bin/sudo"
+  cat > "$temp_dir/stub-bin/chown" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$@" >> "$WAKEZILLA_CHOWN_LOG"
+exit 0
+SH
+  chmod 755 "$temp_dir/stub-bin/chown"
+
+  for symlink_case in applications icons hicolor autostart; do
+    rm -rf "$user_home/.local" "$user_home/.config" "$outside_dir"
+    mkdir -p "$outside_dir"
+    printf 'outside-sentinel\n' > "$outside_dir/sentinel"
+    case "$symlink_case" in
+      applications)
+        mkdir -p "$user_home/.local/share"
+        ln -s "$outside_dir" "$user_home/.local/share/applications"
+        ;;
+      icons)
+        mkdir -p "$user_home/.local/share"
+        ln -s "$outside_dir" "$user_home/.local/share/icons"
+        ;;
+      hicolor)
+        mkdir -p "$user_home/.local/share/icons"
+        ln -s "$outside_dir" "$user_home/.local/share/icons/hicolor"
+        ;;
+      autostart)
+        mkdir -p "$user_home/.config"
+        ln -s "$outside_dir" "$user_home/.config/autostart"
+        ;;
+    esac
+    : > "$chown_log"
+    : > "$privilege_log"
+    if HOME=/root WAKEZILLA_EUID=0 WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+      WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
+      WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
+      WAKEZILLA_TEST_SUDO_HOME="$user_home" WAKEZILLA_CHOWN_LOG="$chown_log" \
+      WAKEZILLA_PRIVILEGE_LOG="$privilege_log" DISPLAY= WAYLAND_DISPLAY= \
+      PATH="$temp_dir/stub-bin:$PATH" \
+      install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1; then
+      fail "sudo dropped apply $symlink_case symlink: expected failure"
+    fi
+    outside_count=$(find "$outside_dir" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')
+    assert_eq "1" "$outside_count" "sudo dropped apply $symlink_case symlink outside writes"
+    assert_not_contains "$(cat "$chown_log")" "$user_home" "sudo dropped apply $symlink_case never chowns profile"
+    runner_args=$(tr '\n' ' ' < "$privilege_log")
+    assert_contains "$runner_args" "-u wakezilla-test-user --" "sudo dropped apply $symlink_case target user"
+  done
   rm -rf "$temp_dir"
 }
 
@@ -1847,6 +2130,7 @@ test_atomic_install_file_rejects_directory_destination() {
 if test_linux_desktop_integration_helpers_defined; then
   test_linux_desktop_integration_writes_xdg_entries_headless
   test_desktop_exec_quote_escapes_reserved_characters
+  test_desktop_exec_gio_launches_hostile_path_without_arguments
   test_desktop_exec_quote_rejects_line_breaks
   test_linux_desktop_integration_launches_graphical_helper_once
   test_linux_integration_relative_xdg_falls_back_and_copies_icons
@@ -1854,10 +2138,12 @@ if test_linux_desktop_integration_helpers_defined; then
   test_linux_integration_is_idempotent_without_temp_siblings
   test_linux_integration_root_without_valid_sudo_user_skips_everything
   test_linux_integration_euid_override_is_test_mode_only
-  test_linux_integration_valid_sudo_user_targets_profile_and_chowns
+  test_linux_integration_valid_sudo_user_applies_as_target_user
+  test_resolve_linux_integration_user_rejects_unsafe_sudo_homes
   test_linux_integration_ignores_test_sudo_overrides_outside_test_mode
   test_linux_integration_root_discards_desktop_outside_target_home
   test_linux_integration_root_rejects_profile_traversal_and_symlinks
+  test_linux_integration_root_dropped_apply_rejects_intermediate_symlinks
   test_linux_integration_post_validation_setup_failures_are_fatal
   test_linux_integration_rejects_symlinked_archive_assets
   test_linux_integration_rejects_line_break_in_helper_path_before_writes

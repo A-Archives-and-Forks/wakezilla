@@ -508,6 +508,48 @@ offer_sudo_symlink() {
   fi
 }
 
+path_owner_uid() {
+  owner_path="$1"
+  owner_uid=
+  owner_stat=
+  if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
+    owner_stat=$(command -v stat 2>/dev/null || printf '')
+  else
+    for owner_stat_candidate in /usr/bin/stat /bin/stat; do
+      if [ -x "$owner_stat_candidate" ]; then
+        owner_stat=$owner_stat_candidate
+        break
+      fi
+    done
+  fi
+  [ -n "$owner_stat" ] || return 1
+  if owner_uid=$("$owner_stat" -f '%u' "$owner_path" 2>/dev/null); then
+    :
+  elif owner_uid=$("$owner_stat" -c '%u' -- "$owner_path" 2>/dev/null); then
+    :
+  else
+    return 1
+  fi
+  case "$owner_uid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$owner_uid"
+}
+
+validate_linux_sudo_home() (
+  sudo_home="$1"
+  sudo_uid="$2"
+  [ -d "$sudo_home" ] || exit 1
+  [ ! -L "$sudo_home" ] || exit 1
+  sudo_home_physical=$(CDPATH= cd -- "$sudo_home" 2>/dev/null && pwd -P) || exit 1
+  case "$sudo_home_physical" in
+    /|/root|/root/*) exit 1 ;;
+  esac
+  sudo_home_owner=$(path_owner_uid "$sudo_home_physical") || exit 1
+  [ "$sudo_home_owner" = "$sudo_uid" ] || exit 1
+  printf '%s\n' "$sudo_home_physical"
+)
+
 resolve_linux_integration_user() {
   if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
     integration_euid="${WAKEZILLA_EUID:-$(id -u 2>/dev/null || printf '')}"
@@ -517,7 +559,6 @@ resolve_linux_integration_user() {
   integration_home=
   integration_uid=
   integration_gid=
-  integration_chown=no
   integration_root=no
 
   if [ "$integration_euid" != "0" ]; then
@@ -585,12 +626,20 @@ resolve_linux_integration_user() {
     *) integration_user_valid=no ;;
   esac
 
+  if [ "$integration_user_valid" = "yes" ]; then
+    if integration_validated_home=$(validate_linux_sudo_home \
+      "$integration_home" "$integration_uid"); then
+      integration_home=$integration_validated_home
+    else
+      integration_user_valid=no
+    fi
+  fi
+
   if [ "$integration_user_valid" != "yes" ]; then
     warn "running as root without a validated non-root sudo user; skipping Linux desktop integration"
     return 1
   fi
 
-  integration_chown=yes
   return 0
 }
 
@@ -605,12 +654,14 @@ desktop_exec_quote() {
       ;;
   esac
 
-  desktop_exec_escaped=$(printf '%s' "$desktop_exec_value" | sed \
+  desktop_exec_layer=$(printf '%s' "$desktop_exec_value" | sed \
     -e 's/\\/\\\\/g' \
     -e 's/"/\\"/g' \
     -e 's/`/\\`/g' \
     -e 's/\$/\\$/g' \
     -e 's/%/%%/g') || return 1
+  desktop_exec_escaped=$(printf '%s' "$desktop_exec_layer" | sed \
+    -e 's/\\/\\\\/g') || return 1
   printf '"%s"\n' "$desktop_exec_escaped"
 }
 
@@ -726,25 +777,6 @@ linux_root_profile_path_is_safe() (
   esac
 )
 
-chown_linux_profile_dirs() (
-  profile_path="$1"
-  profile_home="$2"
-  profile_owner="$3:$4"
-  while :; do
-    [ -L "$profile_path" ] && exit 1
-    if [ -d "$profile_path" ]; then
-      chown "$profile_owner" "$profile_path" || exit 1
-    fi
-    [ "$profile_path" = "$profile_home" ] && exit 0
-    profile_parent=${profile_path%/*}
-    [ -n "$profile_parent" ] || profile_parent=/
-    case "$profile_parent" in
-      "$profile_home"|"$profile_home"/*) profile_path=$profile_parent ;;
-      *) exit 1 ;;
-    esac
-  done
-)
-
 atomic_install_file() (
   atomic_source="$1"
   atomic_target="$2"
@@ -767,6 +799,246 @@ atomic_install_file() (
   mv -f "$atomic_tmp" "$atomic_target" || exit 1
   atomic_tmp=
 )
+
+write_linux_profile_apply_helper() {
+  apply_helper_path="$1"
+  cat > "$apply_helper_path" <<'APPLY_HELPER'
+#!/usr/bin/env sh
+set -eu
+
+stage_dir="$1"
+data_home="$2"
+config_home="$3"
+profile_home="$4"
+app_id=dev.wakezilla.Wakezilla
+icon_name=$app_id.png
+app_dir="$data_home/applications"
+autostart_dir="$config_home/autostart"
+
+profile_path_is_safe() (
+  candidate="$1"
+  home="$2"
+  cr=$(printf '\r')
+  case "$candidate" in
+    "$home"|"$home"/*) ;;
+    *) exit 1 ;;
+  esac
+  suffix=${candidate#"$home"}
+  case "/$suffix/" in
+    *"$cr"*|*"
+"*|*/../*|*/./*) exit 1 ;;
+  esac
+  home_physical=$(CDPATH= cd -- "$home" 2>/dev/null && pwd -P) || exit 1
+  probe=$candidate
+  while [ ! -e "$probe" ] && [ ! -L "$probe" ]; do
+    parent=${probe%/*}
+    [ -n "$parent" ] || parent=/
+    [ "$parent" != "$probe" ] || exit 1
+    probe=$parent
+  done
+  [ -d "$probe" ] || exit 1
+  probe_physical=$(CDPATH= cd -- "$probe" 2>/dev/null && pwd -P) || exit 1
+  case "$probe_physical" in
+    "$home_physical"|"$home_physical"/*) exit 0 ;;
+    *) exit 1 ;;
+  esac
+)
+
+resolve_desktop_dir() {
+  home="$1"
+  xdg_config="$2"
+  cr=$(printf '\r')
+  if command -v xdg-user-dir >/dev/null 2>&1; then
+    candidate=$(xdg-user-dir DESKTOP 2>/dev/null || printf '')
+    case "$candidate" in
+      /*)
+        case "$candidate" in
+          *"$cr"*|*"
+"*) ;;
+          *) [ -d "$candidate" ] && { printf '%s\n' "$candidate"; return 0; } ;;
+        esac
+        ;;
+    esac
+  fi
+  user_dirs="$xdg_config/user-dirs.dirs"
+  if [ -f "$user_dirs" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        XDG_DESKTOP_DIR=\"*\")
+          candidate=${line#XDG_DESKTOP_DIR=\"}
+          candidate=${candidate%\"}
+          case "$candidate" in
+            *'$('*|*'${'*|*'`'*|*"$cr"*|*"
+"*) continue ;;
+            '$HOME') candidate=$home ;;
+            '$HOME/'*) suffix=${candidate#\$HOME}; candidate=$home$suffix ;;
+            /*) ;;
+            *) continue ;;
+          esac
+          [ -d "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+          ;;
+      esac
+    done < "$user_dirs"
+  fi
+  if [ -d "$home/Desktop" ]; then
+    printf '%s\n' "$home/Desktop"
+  fi
+  return 0
+}
+
+legacy_is_owned() {
+  entry="$1"
+  [ -f "$entry" ] || return 1
+  [ ! -L "$entry" ] || return 1
+  grep -Eq '^Name=Wakezilla( Tray)?[[:space:]]*$' "$entry" 2>/dev/null || return 1
+  grep -Eq "^Exec=.*wakezilla-tray([[:space:]\"']|$)" "$entry" 2>/dev/null || \
+    grep -Eq "^Exec=.*wakezilla[\"']?[[:space:]]+tray([[:space:]]|$)" "$entry" 2>/dev/null
+}
+
+atomic_copy() (
+  source_file="$1"
+  target_file="$2"
+  file_mode="$3"
+  target_dir=${target_file%/*}
+  target_name=${target_file##*/}
+  [ ! -d "$target_file" ] || exit 1
+  temp_file=$(mktemp "$target_dir/.${target_name}.tmp.XXXXXX") || exit 1
+  trap 'rm -f "$temp_file"' 0 1 2 15
+  cp "$source_file" "$temp_file" || exit 1
+  chmod "$file_mode" "$temp_file" || exit 1
+  mv -f "$temp_file" "$target_file" || exit 1
+  temp_file=
+)
+
+for staged_file in application.desktop autostart.desktop icon-48.png icon-128.png icon-256.png; do
+  [ -f "$stage_dir/$staged_file" ] || exit 1
+  [ ! -L "$stage_dir/$staged_file" ] || exit 1
+done
+
+for destination_dir in \
+  "$app_dir" \
+  "$autostart_dir" \
+  "$data_home/icons/hicolor/48x48/apps" \
+  "$data_home/icons/hicolor/128x128/apps" \
+  "$data_home/icons/hicolor/256x256/apps"; do
+  profile_path_is_safe "$destination_dir" "$profile_home" || exit 1
+done
+
+desktop_dir=$(resolve_desktop_dir "$profile_home" "$config_home")
+if [ -n "$desktop_dir" ] && ! profile_path_is_safe "$desktop_dir" "$profile_home"; then
+  desktop_dir=
+fi
+
+mkdir -p "$app_dir" "$autostart_dir" \
+  "$data_home/icons/hicolor/48x48/apps" \
+  "$data_home/icons/hicolor/128x128/apps" \
+  "$data_home/icons/hicolor/256x256/apps"
+
+for destination_dir in \
+  "$app_dir" \
+  "$autostart_dir" \
+  "$data_home/icons/hicolor/48x48/apps" \
+  "$data_home/icons/hicolor/128x128/apps" \
+  "$data_home/icons/hicolor/256x256/apps"; do
+  profile_path_is_safe "$destination_dir" "$profile_home" || exit 1
+done
+
+atomic_copy "$stage_dir/application.desktop" "$app_dir/$app_id.desktop" 0644
+atomic_copy "$stage_dir/autostart.desktop" "$autostart_dir/dev.wakezilla.tray.desktop" 0644
+atomic_copy "$stage_dir/icon-48.png" "$data_home/icons/hicolor/48x48/apps/$icon_name" 0644
+atomic_copy "$stage_dir/icon-128.png" "$data_home/icons/hicolor/128x128/apps/$icon_name" 0644
+atomic_copy "$stage_dir/icon-256.png" "$data_home/icons/hicolor/256x256/apps/$icon_name" 0644
+
+if [ -n "$desktop_dir" ]; then
+  desktop_entry="$desktop_dir/$app_id.desktop"
+  atomic_copy "$stage_dir/application.desktop" "$desktop_entry" 0755
+  if command -v gio >/dev/null 2>&1; then
+    gio set "$desktop_entry" metadata::trusted true >/dev/null 2>&1 || true
+  fi
+fi
+
+legacy_entry="$autostart_dir/wakezilla-tray.desktop"
+if legacy_is_owned "$legacy_entry"; then
+  rm -f "$legacy_entry"
+fi
+APPLY_HELPER
+  chmod 0700 "$apply_helper_path"
+}
+
+apply_linux_profile_as_user() {
+  apply_stage="$1"
+  apply_data_home="$2"
+  apply_config_home="$3"
+  apply_home="$4"
+  apply_user="$5"
+  apply_uid="$6"
+  apply_gid="$7"
+
+  apply_chown=
+  apply_env=
+  apply_shell=
+  apply_runner=
+  apply_runner_kind=
+  if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
+    apply_chown=$(command -v chown 2>/dev/null || printf '')
+    apply_env=$(command -v env 2>/dev/null || printf '')
+    apply_shell=$(command -v sh 2>/dev/null || printf '')
+    if apply_runner=$(command -v sudo 2>/dev/null); then
+      apply_runner_kind=sudo
+    elif apply_runner=$(command -v runuser 2>/dev/null); then
+      apply_runner_kind=runuser
+    fi
+  else
+    for apply_chown_candidate in /usr/sbin/chown /usr/bin/chown /bin/chown; do
+      if [ -x "$apply_chown_candidate" ]; then
+        apply_chown=$apply_chown_candidate
+        break
+      fi
+    done
+    [ -x /usr/bin/env ] && apply_env=/usr/bin/env
+    [ -x /bin/sh ] && apply_shell=/bin/sh
+    if [ -x /usr/bin/sudo ]; then
+      apply_runner=/usr/bin/sudo
+      apply_runner_kind=sudo
+    elif [ -x /usr/sbin/runuser ]; then
+      apply_runner=/usr/sbin/runuser
+      apply_runner_kind=runuser
+    elif [ -x /usr/bin/runuser ]; then
+      apply_runner=/usr/bin/runuser
+      apply_runner_kind=runuser
+    fi
+  fi
+
+  if [ -z "$apply_chown" ] || [ -z "$apply_env" ] || [ -z "$apply_shell" ]; then
+    warn "cannot apply Linux desktop integration as $apply_user: required system tools are unavailable"
+    return 125
+  fi
+  "$apply_chown" -R "$apply_uid:$apply_gid" "$apply_stage" || return 1
+  if [ "$apply_runner_kind" = "sudo" ]; then
+    "$apply_runner" -u "$apply_user" -- \
+      "$apply_env" -i \
+      HOME="$apply_home" \
+      XDG_DATA_HOME="$apply_data_home" \
+      XDG_CONFIG_HOME="$apply_config_home" \
+      PATH=/usr/local/bin:/usr/bin:/bin \
+      "$apply_shell" "$apply_stage/apply-profile.sh" \
+      "$apply_stage" "$apply_data_home" "$apply_config_home" "$apply_home"
+    return $?
+  fi
+  if [ "$apply_runner_kind" = "runuser" ]; then
+    "$apply_runner" -u "$apply_user" -- \
+      "$apply_env" -i \
+      HOME="$apply_home" \
+      XDG_DATA_HOME="$apply_data_home" \
+      XDG_CONFIG_HOME="$apply_config_home" \
+      PATH=/usr/local/bin:/usr/bin:/bin \
+      "$apply_shell" "$apply_stage/apply-profile.sh" \
+      "$apply_stage" "$apply_data_home" "$apply_config_home" "$apply_home"
+    return $?
+  fi
+  warn "cannot apply Linux desktop integration as $apply_user: sudo or runuser is unavailable"
+  return 125
+}
 
 install_linux_desktop_integration() (
   linux_extract_dir="$1"
@@ -826,13 +1098,6 @@ install_linux_desktop_integration() (
     warn "target profile contains an unsafe path; refusing Linux desktop integration"
     exit 1
   fi
-  linux_desktop_dir=$(resolve_linux_desktop_dir "$integration_home" "$linux_config_home")
-  if [ "$integration_root" = "yes" ]; then
-    if [ -n "$linux_desktop_dir" ] && \
-       ! linux_root_profile_path_is_safe "$linux_desktop_dir" "$integration_home"; then
-      linux_desktop_dir=
-    fi
-  fi
   linux_stage=$(mktemp -d 2>/dev/null || mktemp -d -t wakezilla-linux-integration) || {
     warn "failed to create a temporary directory for Linux desktop integration"
     exit 1
@@ -856,6 +1121,38 @@ install_linux_desktop_integration() (
   } > "$linux_stage/application.desktop" || exit 1
   cp "$linux_stage/application.desktop" "$linux_stage/autostart.desktop" || exit 1
 
+  if [ "$integration_root" = "yes" ]; then
+    for linux_size in 48 128 256; do
+      cp "$linux_extract_dir/icons/hicolor/${linux_size}x${linux_size}/apps/$linux_icon_name" \
+        "$linux_stage/icon-$linux_size.png" || exit 1
+      chmod 0644 "$linux_stage/icon-$linux_size.png" || exit 1
+    done
+    write_linux_profile_apply_helper "$linux_stage/apply-profile.sh" || exit 1
+    set +e
+    apply_linux_profile_as_user \
+      "$linux_stage" \
+      "$linux_data_home" \
+      "$linux_config_home" \
+      "$integration_home" \
+      "$integration_user" \
+      "$integration_uid" \
+      "$integration_gid"
+    linux_apply_status=$?
+    set -e
+    case "$linux_apply_status" in
+      0)
+        info "Linux desktop integration installed; the Wakezilla tray will start at the next graphical login"
+        exit 0
+        ;;
+      125)
+        exit 0
+        ;;
+      *) exit "$linux_apply_status" ;;
+    esac
+  fi
+
+  linux_desktop_dir=$(resolve_linux_desktop_dir "$integration_home" "$linux_config_home")
+
   mkdir -p "$linux_app_dir" "$linux_autostart_dir" || {
     warn "failed to create Linux desktop integration directories"
     exit 1
@@ -864,25 +1161,8 @@ install_linux_desktop_integration() (
     mkdir -p "$linux_data_home/icons/hicolor/${linux_size}x${linux_size}/apps" || exit 1
   done
 
-  if [ "$integration_chown" = "yes" ]; then
-    chown_linux_profile_dirs "$linux_app_dir" "$integration_home" \
-      "$integration_uid" "$integration_gid" || exit 1
-    chown_linux_profile_dirs "$linux_data_home/icons/hicolor/48x48/apps" "$integration_home" \
-      "$integration_uid" "$integration_gid" || exit 1
-    chown_linux_profile_dirs "$linux_data_home/icons/hicolor/128x128/apps" "$integration_home" \
-      "$integration_uid" "$integration_gid" || exit 1
-    chown_linux_profile_dirs "$linux_data_home/icons/hicolor/256x256/apps" "$integration_home" \
-      "$integration_uid" "$integration_gid" || exit 1
-    chown_linux_profile_dirs "$linux_autostart_dir" "$integration_home" \
-      "$integration_uid" "$integration_gid" || exit 1
-  fi
-
   linux_install_file() {
-    if [ "$integration_chown" = "yes" ]; then
-      atomic_install_file "$1" "$2" "$3" "$integration_uid" "$integration_gid"
-    else
-      atomic_install_file "$1" "$2" "$3"
-    fi
+    atomic_install_file "$1" "$2" "$3"
   }
 
   linux_install_file "$linux_stage/application.desktop" \
@@ -908,9 +1188,7 @@ install_linux_desktop_integration() (
     rm -f "$linux_legacy_entry" || exit 1
   fi
 
-  if [ "$integration_root" = "yes" ]; then
-    info "Linux desktop integration installed; the Wakezilla tray will start at the next graphical login"
-  elif [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
     if command -v nohup >/dev/null 2>&1; then
       (
         nohup "$linux_helper" </dev/null >/dev/null 2>&1 &
