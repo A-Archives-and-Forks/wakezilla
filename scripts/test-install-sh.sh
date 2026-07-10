@@ -1798,6 +1798,72 @@ SH
   rm -rf "$temp_dir"
 }
 
+test_linux_integration_privilege_failures_are_fatal() {
+  temp_dir=$(mktemp -d)
+  user_home="$temp_dir/user-home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  partial_marker="$temp_dir/partial-attempt"
+  privilege_log="$temp_dir/privilege.log"
+  test_uid=$(id -u)
+  test_gid=$(id -g)
+  mkdir -p "$user_home" "$bin_dir" "$temp_dir/stub-bin"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  write_fake_chown "$temp_dir/stub-bin/chown"
+
+  for failure_mode in exit_125 no_runner; do
+    rm -rf "$user_home/.local" "$user_home/.config"
+    : > "$privilege_log"
+    rm -f "$partial_marker"
+    case "$failure_mode" in
+      exit_125)
+        cat > "$temp_dir/stub-bin/sudo" <<'SH'
+#!/usr/bin/env sh
+: > "$WAKEZILLA_PARTIAL_MARKER"
+exit 125
+SH
+        no_runner=
+        ;;
+      no_runner)
+        cat > "$temp_dir/stub-bin/sudo" <<'SH'
+#!/usr/bin/env sh
+printf 'runner should not be invoked\n' >> "$WAKEZILLA_PRIVILEGE_LOG"
+exit 0
+SH
+        no_runner=1
+        ;;
+    esac
+    chmod 755 "$temp_dir/stub-bin/sudo"
+
+    set +e
+    output=$(HOME=/root WAKEZILLA_EUID=0 WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+      WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
+      WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
+      WAKEZILLA_TEST_SUDO_HOME="$user_home" \
+      WAKEZILLA_TEST_NO_PRIVILEGE_RUNNER="$no_runner" \
+      WAKEZILLA_PARTIAL_MARKER="$partial_marker" \
+      WAKEZILLA_PRIVILEGE_LOG="$privilege_log" WAKEZILLA_CHOWN_LOG="$temp_dir/chown.log" \
+      DISPLAY= WAYLAND_DISPLAY= PATH="$temp_dir/stub-bin:$PATH" \
+      install_linux_desktop_integration "$extract_dir" "$bin_dir" 2>&1)
+    install_status=$?
+    set -e
+
+    if [ "$install_status" -eq 0 ]; then
+      fail "sudo $failure_mode failure: expected nonzero integration status"
+    fi
+    assert_not_contains "$output" "Linux desktop integration installed" "sudo $failure_mode no success message"
+    if [ "$failure_mode" = "exit_125" ] && [ ! -e "$partial_marker" ]; then
+      fail "sudo exit 125 failure: expected partial-attempt marker"
+    fi
+    if [ "$failure_mode" = "no_runner" ]; then
+      assert_contains "$output" "sudo or runuser is unavailable" "sudo missing runner warning"
+      assert_eq "" "$(cat "$privilege_log")" "sudo missing runner is not invoked"
+    fi
+  done
+  rm -rf "$temp_dir"
+}
+
 test_resolve_linux_integration_user_rejects_unsafe_sudo_homes() {
   temp_dir=$(mktemp -d)
   safe_home="$temp_dir/safe-home"
@@ -2139,6 +2205,7 @@ if test_linux_desktop_integration_helpers_defined; then
   test_linux_integration_root_without_valid_sudo_user_skips_everything
   test_linux_integration_euid_override_is_test_mode_only
   test_linux_integration_valid_sudo_user_applies_as_target_user
+  test_linux_integration_privilege_failures_are_fatal
   test_resolve_linux_integration_user_rejects_unsafe_sudo_homes
   test_linux_integration_ignores_test_sudo_overrides_outside_test_mode
   test_linux_integration_root_discards_desktop_outside_target_home

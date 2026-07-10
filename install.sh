@@ -983,10 +983,12 @@ apply_linux_profile_as_user() {
     apply_chown=$(command -v chown 2>/dev/null || printf '')
     apply_env=$(command -v env 2>/dev/null || printf '')
     apply_shell=$(command -v sh 2>/dev/null || printf '')
-    if apply_runner=$(command -v sudo 2>/dev/null); then
-      apply_runner_kind=sudo
-    elif apply_runner=$(command -v runuser 2>/dev/null); then
-      apply_runner_kind=runuser
+    if [ -z "${WAKEZILLA_TEST_NO_PRIVILEGE_RUNNER:-}" ]; then
+      if apply_runner=$(command -v sudo 2>/dev/null); then
+        apply_runner_kind=sudo
+      elif apply_runner=$(command -v runuser 2>/dev/null); then
+        apply_runner_kind=runuser
+      fi
     fi
   else
     for apply_chown_candidate in /usr/sbin/chown /usr/bin/chown /bin/chown; do
@@ -1142,9 +1144,6 @@ install_linux_desktop_integration() (
     case "$linux_apply_status" in
       0)
         info "Linux desktop integration installed; the Wakezilla tray will start at the next graphical login"
-        exit 0
-        ;;
-      125)
         exit 0
         ;;
       *) exit "$linux_apply_status" ;;
