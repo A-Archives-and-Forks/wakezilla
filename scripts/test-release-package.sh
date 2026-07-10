@@ -84,6 +84,16 @@ assert_directory_empty() {
     fi
 }
 
+assert_no_package_temps() {
+    temp_output_dir=$1
+
+    for temp_path in "$temp_output_dir"/.wakezilla-package.*; do
+        if [ -d "$temp_path" ] || [ -f "$temp_path" ]; then
+            fail "temporary package path remains after failure: $temp_path"
+        fi
+    done
+}
+
 make_unix_build() {
     fixture_dir=$1
 
@@ -290,5 +300,36 @@ case $missing_message in
 esac
 assert_directory_empty "$missing_output"
 printf 'ok - missing artifacts are rejected\n'
+
+directory_build=$TMP_ROOT/archive\ destination\ build
+directory_output=$TMP_ROOT/archive\ destination\ output
+directory_target=x86_64-unknown-linux-gnu
+directory_archive_name=wakezilla-$VERSION-$directory_target.tar.gz
+make_unix_build "$directory_build"
+mkdir -p "$directory_output"
+directory_output=$(CDPATH= cd "$directory_output" && pwd)
+directory_archive=$directory_output/$directory_archive_name
+directory_sentinel=$directory_archive/preexisting\ sentinel.txt
+mkdir "$directory_archive"
+printf 'preserve this directory\n' > "$directory_sentinel"
+if directory_message=$(
+    cd "$FOREIGN_CWD"
+    sh "$PACKAGER" "$VERSION" "$directory_target" \
+        "$directory_build" "$directory_output" 2>&1
+); then
+    fail 'archive destination directory unexpectedly succeeded'
+fi
+case $directory_message in
+    *'archive destination is a directory:'*"$directory_archive"*) ;;
+    *) fail "archive destination error was not clear: $directory_message" ;;
+esac
+[ -d "$directory_archive" ] || fail 'preexisting archive directory was removed'
+assert_equal 'preserve this directory' "$(sed -n '1p' "$directory_sentinel")" \
+    'preexisting archive directory sentinel was changed'
+[ ! -f "$directory_archive/$directory_archive_name" ] || \
+    fail 'archive was nested inside the preexisting destination directory'
+assert_no_package_temps "$directory_output"
+assert_only_archive_output "$directory_output" "$directory_archive_name"
+printf 'ok - archive destination directories are rejected\n'
 
 printf 'All release package tests passed.\n'

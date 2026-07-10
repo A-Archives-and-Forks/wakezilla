@@ -105,6 +105,8 @@ mkdir -p "$OUTPUT_DIR" || die "could not create output directory: $OUTPUT_DIR"
 OUTPUT_DIR=$(CDPATH= cd "$OUTPUT_DIR" && pwd)
 ARCHIVE_NAME=wakezilla-$VERSION-$TARGET.tar.gz
 FINAL_ARCHIVE=$OUTPUT_DIR/$ARCHIVE_NAME
+[ ! -d "$FINAL_ARCHIVE" ] || \
+    die "archive destination is a directory: $FINAL_ARCHIVE"
 TEMP_DIR=
 
 cleanup() {
