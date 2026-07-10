@@ -3,6 +3,10 @@ use anyhow::{anyhow, Context, Result};
 #[cfg(target_os = "windows")]
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use std::io::Cursor;
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -73,42 +77,148 @@ struct TrayApp {
 }
 
 struct TrayInstanceGuard {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     _instance: single_instance::SingleInstance,
+    #[cfg(target_os = "macos")]
+    _lock_file: std::fs::File,
 }
 
 impl TrayInstanceGuard {
     fn acquire_named(name: &str) -> Result<Option<Self>> {
-        #[cfg(target_os = "macos")]
-        let backend_name = {
-            let file_name = name
-                .chars()
-                .map(|character| {
-                    if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
-                        character
-                    } else {
-                        '_'
-                    }
-                })
-                .collect::<String>();
-            std::env::temp_dir()
-                .join(format!("{file_name}.lock"))
-                .to_str()
-                .context("macOS temporary directory is not valid UTF-8")?
-                .to_owned()
-        };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        let backend_name = linux_backend_name(name, effective_uid());
+        #[cfg(target_os = "windows")]
         let backend_name = name.to_owned();
 
-        let instance = single_instance::SingleInstance::new(&backend_name)
-            .with_context(|| format!("failed to acquire tray instance lock `{name}`"))?;
-        if !instance.is_single() {
-            return Ok(None);
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            let instance =
+                single_instance::SingleInstance::new(&backend_name).with_context(|| {
+                    format!("failed to acquire tray instance lock `{name}` as `{backend_name}`")
+                })?;
+            if !instance.is_single() {
+                return Ok(None);
+            }
+
+            Ok(Some(Self {
+                _instance: instance,
+            }))
         }
 
-        Ok(Some(Self {
-            _instance: instance,
-        }))
+        #[cfg(target_os = "macos")]
+        {
+            Self::acquire_macos(name)
+        }
     }
+
+    #[cfg(target_os = "macos")]
+    fn acquire_macos(name: &str) -> Result<Option<Self>> {
+        let lock_path = macos_lock_path(name)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        options.mode(0o600);
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let lock_file = options
+            .open(&lock_path)
+            .with_context(|| format!("failed to open tray lock {}", lock_path.display()))?;
+        lock_file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to secure tray lock {}", lock_path.display()))?;
+
+        // SAFETY: lock_file owns a valid descriptor for this call, and flock does not retain it
+        // or access Rust-managed memory.
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let errno = if rc == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
+
+        match classify_macos_flock_result(rc, errno)
+            .with_context(|| format!("failed to lock tray instance file {}", lock_path.display()))?
+        {
+            MacosFlockOutcome::Acquired => Ok(Some(Self {
+                _lock_file: lock_file,
+            })),
+            MacosFlockOutcome::Contended => Ok(None),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn effective_uid() -> libc::uid_t {
+    // SAFETY: geteuid has no preconditions and does not dereference any pointers.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_backend_name(name: &str, euid: libc::uid_t) -> String {
+    format!("{name}.uid-{euid}")
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Eq, PartialEq)]
+enum MacosFlockOutcome {
+    Acquired,
+    Contended,
+}
+
+#[cfg(target_os = "macos")]
+fn classify_macos_flock_result(
+    rc: libc::c_int,
+    errno: libc::c_int,
+) -> std::io::Result<MacosFlockOutcome> {
+    if rc == 0 {
+        Ok(MacosFlockOutcome::Acquired)
+    } else if errno == libc::EWOULDBLOCK {
+        Ok(MacosFlockOutcome::Contended)
+    } else {
+        Err(std::io::Error::from_raw_os_error(errno))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_lock_path(name: &str) -> Result<PathBuf> {
+    let temp_dir = std::env::temp_dir()
+        .canonicalize()
+        .context("failed to resolve the per-user temporary directory")?;
+    let lock_dir = temp_dir.join("Wakezilla");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(&lock_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create {}", lock_dir.display()));
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(&lock_dir)
+        .with_context(|| format!("failed to inspect {}", lock_dir.display()))?;
+    if !metadata.file_type().is_dir() {
+        anyhow::bail!(
+            "tray lock directory is not a directory: {}",
+            lock_dir.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o7777 != 0o700 {
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure {}", lock_dir.display()))?;
+    }
+
+    let file_name = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    Ok(lock_dir.join(format!("instance-{file_name}.lock")))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -966,6 +1076,16 @@ mod tests {
 
     #[test]
     fn tray_instance_rejects_a_second_guard() {
+        const CHILD_ENV: &str = "WAKEZILLA_TEST_TRAY_INSTANCE_CHILD";
+
+        if let Some(name) = std::env::var_os(CHILD_ENV) {
+            let name = name.to_string_lossy();
+            assert!(TrayInstanceGuard::acquire_named(&name)
+                .expect("child acquire")
+                .is_none());
+            return;
+        }
+
         let name = format!("dev.wakezilla.tray.test.{}", std::process::id());
         let first = TrayInstanceGuard::acquire_named(&name)
             .expect("first acquire")
@@ -975,11 +1095,58 @@ mod tests {
             .expect("second acquire")
             .is_none());
 
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tray::desktop::tests::tray_instance_rejects_a_second_guard",
+            ])
+            .env(CHILD_ENV, &name)
+            .status()
+            .expect("run child test process");
+        assert!(child.success(), "child should observe the held guard");
+
         drop(first);
 
         assert!(TrayInstanceGuard::acquire_named(&name)
             .expect("acquire after drop")
             .is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tray_instance_linux_backend_name_is_scoped_by_euid() {
+        let first_user = linux_backend_name(TRAY_INSTANCE_NAME, 1000);
+        let second_user = linux_backend_name(TRAY_INSTANCE_NAME, 1001);
+
+        assert_eq!(first_user, "dev.wakezilla.tray.uid-1000");
+        assert_ne!(first_user, second_user);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_instance_flock_success_is_acquired() {
+        assert_eq!(
+            classify_macos_flock_result(0, 0).expect("successful flock"),
+            MacosFlockOutcome::Acquired
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_instance_flock_would_block_is_duplicate() {
+        assert_eq!(
+            classify_macos_flock_result(-1, libc::EWOULDBLOCK).expect("contended flock"),
+            MacosFlockOutcome::Contended
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_instance_flock_other_errno_is_error() {
+        let error = classify_macos_flock_result(-1, libc::EINVAL)
+            .expect_err("unexpected flock errno must fail closed");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]

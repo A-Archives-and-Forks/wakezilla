@@ -8,6 +8,7 @@ desktop-tray = [
     "dep:arboard",
     "dep:base64",
     "dep:gtk",
+    "dep:libc",
     "dep:open",
     "dep:png",
     "dep:single-instance",
@@ -98,9 +99,14 @@ base64 = { version = "0.22.1", optional = true }
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"], optional = true }
 open = { version = "5.3.6", optional = true }
 png = { version = "0.18", optional = true }
-single-instance = { version = "0.3.3", optional = true }
 tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"], optional = true }
 winit = { version = "0.30", optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+single-instance = { version = "0.3.3", optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18.2", optional = true }
