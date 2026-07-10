@@ -10,6 +10,8 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     Icon, TrayIcon, TrayIconBuilder,
 };
+#[cfg(target_os = "macos")]
+use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::{
     application::ApplicationHandler,
     event::{StartCause, WindowEvent},
@@ -17,6 +19,7 @@ use winit::{
     window::WindowId,
 };
 
+const TRAY_INSTANCE_NAME: &str = "dev.wakezilla.tray";
 const OPEN_DASHBOARD_ID: &str = "open_dashboard";
 const COPY_DASHBOARD_URL_ID: &str = "copy_dashboard_url";
 const SETUP_ID: &str = "setup_services";
@@ -69,6 +72,45 @@ struct TrayApp {
     status_refresh_in_flight: bool,
 }
 
+struct TrayInstanceGuard {
+    _instance: single_instance::SingleInstance,
+}
+
+impl TrayInstanceGuard {
+    fn acquire_named(name: &str) -> Result<Option<Self>> {
+        #[cfg(target_os = "macos")]
+        let backend_name = {
+            let file_name = name
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            std::env::temp_dir()
+                .join(format!("{file_name}.lock"))
+                .to_str()
+                .context("macOS temporary directory is not valid UTF-8")?
+                .to_owned()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let backend_name = name.to_owned();
+
+        let instance = single_instance::SingleInstance::new(&backend_name)
+            .with_context(|| format!("failed to acquire tray instance lock `{name}`"))?;
+        if !instance.is_single() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            _instance: instance,
+        }))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ServiceStatuses {
     proxy: ModeStatus,
@@ -82,13 +124,20 @@ struct ModeStatus {
 }
 
 pub fn run() -> Result<()> {
+    let Some(_instance_guard) = TrayInstanceGuard::acquire_named(TRAY_INSTANCE_NAME)? else {
+        return Ok(());
+    };
+
     #[cfg(target_os = "linux")]
     gtk::init().context("failed to initialize GTK")?;
 
     let config = config::Config::load();
     let dashboard_url = dashboard_url(&config);
 
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    #[cfg(target_os = "macos")]
+    builder.with_activation_policy(ActivationPolicy::Accessory);
+    let event_loop = builder
         .build()
         .context("failed to create tray event loop")?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -914,6 +963,24 @@ fn powershell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_instance_rejects_a_second_guard() {
+        let name = format!("dev.wakezilla.tray.test.{}", std::process::id());
+        let first = TrayInstanceGuard::acquire_named(&name)
+            .expect("first acquire")
+            .expect("first instance");
+
+        assert!(TrayInstanceGuard::acquire_named(&name)
+            .expect("second acquire")
+            .is_none());
+
+        drop(first);
+
+        assert!(TrayInstanceGuard::acquire_named(&name)
+            .expect("acquire after drop")
+            .is_some());
+    }
 
     #[test]
     fn dashboard_url_uses_proxy_port_from_config() {
