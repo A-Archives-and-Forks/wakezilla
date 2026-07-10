@@ -76,6 +76,7 @@ jobs:
           for script in \
             install.sh \
             scripts/test-install-sh.sh \
+            scripts/test-install-linux-real.sh \
             scripts/release/package_archive.sh \
             scripts/test-release-package.sh
           do
@@ -84,6 +85,14 @@ jobs:
 
       - name: Run installer tests
         run: scripts/test-install-sh.sh
+
+      - name: Install Linux desktop integration test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y desktop-file-utils libglib2.0-bin util-linux
+
+      - name: Test installer with a real secondary user and GLib
+        run: sudo env WAKEZILLA_CI_REQUIRED=1 sh scripts/test-install-linux-real.sh
 
       - name: Run release package tests
         run: sh scripts/test-release-package.sh
