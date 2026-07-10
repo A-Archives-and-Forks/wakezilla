@@ -432,7 +432,7 @@ function Get-RegularReleaseFile {
 
     $candidate = Join-Path $Root $Name
     $item = Get-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
-    if (-not $item -or $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    if (-not $item -or $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
         Stop-Install "archive" "release archive is missing regular file $Name"
     }
     $item.FullName
@@ -511,7 +511,7 @@ function Install-WakezillaDesktopIntegration {
     $cliSource = Get-RegularReleaseFile -Root $ExtractDir -Name "wakezilla.exe"
     $installRoot = Split-Path -Parent $BinDir
     $existingBin = Get-Item -LiteralPath $BinDir -Force -ErrorAction SilentlyContinue
-    if ($existingBin -and ($existingBin.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    if ($existingBin -and ($existingBin.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
         Stop-Install "install" "refusing a reparse-point install directory: $BinDir"
     }
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
