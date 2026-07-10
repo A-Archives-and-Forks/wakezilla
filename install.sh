@@ -1771,7 +1771,7 @@ macos_xml_escape() {
     -e 's/</\&lt;/g' \
     -e 's/>/\&gt;/g' \
     -e 's/"/\&quot;/g' \
-    -e "s/'/\\\&apos;/g"
+    -e "s/'/\&apos;/g"
   printf '\n'
 }
 
@@ -1857,6 +1857,53 @@ macos_launchctl_failure_is_absent() {
     *'Could not find service'*|*'Could not find domain'*|*'No such process'*) return 0 ;;
   esac
   return 1
+}
+
+macos_path_identity() {
+  macos_identity_path="$1"
+  macos_identity_stat=
+  if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
+    macos_identity_stat=$(command -v stat 2>/dev/null || printf '')
+  else
+    for macos_identity_candidate in /usr/bin/stat /bin/stat; do
+      if [ -x "$macos_identity_candidate" ]; then
+        macos_identity_stat=$macos_identity_candidate
+        break
+      fi
+    done
+  fi
+  [ -n "$macos_identity_stat" ] || return 1
+  if macos_identity_value=$("$macos_identity_stat" -f '%d:%i' \
+    "$macos_identity_path" 2>/dev/null); then
+    :
+  elif macos_identity_value=$("$macos_identity_stat" -c '%d:%i' -- \
+    "$macos_identity_path" 2>/dev/null); then
+    :
+  else
+    return 1
+  fi
+  case "$macos_identity_value" in
+    *[!0-9:]*|:*|*:|*:*:*) return 1 ;;
+  esac
+  printf '%s\n' "$macos_identity_value"
+}
+
+macos_directory_has_identity() {
+  macos_identity_directory="$1"
+  macos_expected_identity="$2"
+  [ -n "$macos_expected_identity" ] && \
+    [ -d "$macos_identity_directory" ] && [ ! -L "$macos_identity_directory" ] || return 1
+  macos_actual_identity=$(macos_path_identity "$macos_identity_directory") || return 1
+  [ "$macos_actual_identity" = "$macos_expected_identity" ]
+}
+
+macos_file_has_identity() {
+  macos_identity_file="$1"
+  macos_expected_identity="$2"
+  [ -n "$macos_expected_identity" ] && \
+    [ -f "$macos_identity_file" ] && [ ! -L "$macos_identity_file" ] || return 1
+  macos_actual_identity=$(macos_path_identity "$macos_identity_file") || return 1
+  [ "$macos_actual_identity" = "$macos_expected_identity" ]
 }
 
 validate_macos_home_for_uid() (
@@ -1973,6 +2020,7 @@ install_macos_desktop_integration_at() (
     exit 1
   fi
   macos_existing_bundle=no
+  macos_existing_bundle_identity=
   if [ -e "$macos_app" ]; then
     [ -d "$macos_app" ] || {
       warn "refusing non-bundle destination at $macos_app"
@@ -1994,6 +2042,10 @@ install_macos_desktop_integration_at() (
       warn "refusing foreign existing Wakezilla.app"
       exit 1
     }
+    macos_existing_bundle_identity=$(macos_path_identity "$macos_app") || {
+      warn "cannot identify existing Wakezilla.app"
+      exit 1
+    }
     macos_existing_bundle=yes
   fi
 
@@ -2009,39 +2061,109 @@ install_macos_desktop_integration_at() (
     exit 1
   fi
 
+  macos_state_dir=
+  macos_state_dir_identity=
+  macos_stage_bundle=
+  macos_stage_bundle_identity=
+  macos_bundle_nested_stage=
+  macos_stage_agent=
+  macos_stage_agent_identity=
+  macos_agent_nested_stage=
+  macos_backup_bundle=
+  macos_backup_placeholder_identity=
+  macos_lock_dir="$macos_home_physical/.wakezilla-macos-install.lock"
+  macos_lock_identity=
   umask 077
+  if ! mkdir "$macos_lock_dir" 2>/dev/null; then
+    warn "another macOS Wakezilla installation is already in progress"
+    exit 1
+  fi
+  macos_lock_identity=$(macos_path_identity "$macos_lock_dir") || {
+    warn "cannot identify the macOS installer lock"
+    rmdir "$macos_lock_dir" 2>/dev/null || true
+    exit 1
+  }
+  macos_lock_is_owned() {
+    macos_directory_has_identity "$macos_lock_dir" "$macos_lock_identity"
+  }
+  macos_release_lock() {
+    if macos_lock_is_owned; then
+      rmdir "$macos_lock_dir"
+    elif [ -e "$macos_lock_dir" ] || [ -L "$macos_lock_dir" ]; then
+      return 1
+    fi
+  }
+  macos_setup_cleanup() {
+    macos_setup_status=$?
+    trap - 0 1 2 15
+    if [ -n "${macos_stage_bundle:-}" ]; then
+      if [ -n "${macos_stage_bundle_identity:-}" ] && \
+         macos_directory_has_identity "$macos_stage_bundle" "$macos_stage_bundle_identity"; then
+        rm -rf "$macos_stage_bundle" || macos_setup_status=1
+      elif [ -e "$macos_stage_bundle" ] || [ -L "$macos_stage_bundle" ]; then
+        macos_setup_status=1
+      fi
+    fi
+    if [ -n "${macos_stage_agent:-}" ]; then
+      if [ -n "${macos_stage_agent_identity:-}" ] && \
+         macos_file_has_identity "$macos_stage_agent" "$macos_stage_agent_identity"; then
+        rm -f "$macos_stage_agent" || macos_setup_status=1
+      elif [ -e "$macos_stage_agent" ] || [ -L "$macos_stage_agent" ]; then
+        macos_setup_status=1
+      fi
+    fi
+    if [ -n "${macos_backup_bundle:-}" ] && \
+       { [ -e "$macos_backup_bundle" ] || [ -L "$macos_backup_bundle" ]; }; then
+      if [ -n "${macos_backup_placeholder_identity:-}" ] && \
+         macos_directory_has_identity \
+           "$macos_backup_bundle" "$macos_backup_placeholder_identity"; then
+        rm -rf "$macos_backup_bundle" || macos_setup_status=1
+      else
+        macos_setup_status=1
+      fi
+    fi
+    if [ -n "${macos_state_dir:-}" ] && \
+       { [ -e "$macos_state_dir" ] || [ -L "$macos_state_dir" ]; }; then
+      if [ -n "${macos_state_dir_identity:-}" ] && \
+         macos_directory_has_identity "$macos_state_dir" "$macos_state_dir_identity"; then
+        rm -rf "$macos_state_dir" || macos_setup_status=1
+      else
+        macos_setup_status=1
+      fi
+    fi
+    if ! macos_release_lock; then
+      warn "macOS installer lock changed during setup; preserving the foreign lock"
+      macos_setup_status=1
+    fi
+    exit "$macos_setup_status"
+  }
+  trap macos_setup_cleanup 0
+  trap 'exit 1' 1 2 15
   mkdir -p "$macos_applications" || exit 1
   macos_validate_profile_directory "$macos_applications" || exit 1
   mkdir -p "$macos_home_physical/Library" || exit 1
   macos_validate_profile_directory "$macos_home_physical/Library" || exit 1
   mkdir -p "$macos_launch_agents" || exit 1
   macos_validate_profile_directory "$macos_launch_agents" || exit 1
-  macos_state_dir=
-  macos_stage_bundle=
-  macos_stage_agent=
-  macos_backup_bundle=
-  macos_setup_cleanup() {
-    macos_setup_status=$?
-    trap - 0 1 2 15
-    [ -z "${macos_stage_bundle:-}" ] || rm -rf "$macos_stage_bundle"
-    [ -z "${macos_stage_agent:-}" ] || rm -f "$macos_stage_agent"
-    [ -z "${macos_backup_bundle:-}" ] || rm -rf "$macos_backup_bundle"
-    [ -z "${macos_state_dir:-}" ] || rm -rf "$macos_state_dir"
-    exit "$macos_setup_status"
-  }
-  trap macos_setup_cleanup 0
-  trap 'exit 1' 1 2 15
   macos_state_dir=$(mktemp -d "$macos_home_physical/.wakezilla-macos-install.XXXXXX") || exit 1
+  macos_state_dir_identity=$(macos_path_identity "$macos_state_dir") || exit 1
   macos_stage_bundle=$(mktemp -d "$macos_applications/.Wakezilla.app.stage.XXXXXX") || exit 1
+  macos_stage_bundle_identity=$(macos_path_identity "$macos_stage_bundle") || exit 1
+  macos_bundle_nested_stage="$macos_app/${macos_stage_bundle##*/}"
   macos_stage_agent=$(mktemp "$macos_launch_agents/.dev.wakezilla.tray.plist.stage.XXXXXX") || exit 1
+  macos_stage_agent_identity=$(macos_path_identity "$macos_stage_agent") || exit 1
+  macos_agent_nested_stage="$macos_agent/${macos_stage_agent##*/}"
   macos_backup_bundle=$(mktemp -d "$macos_applications/.Wakezilla.app.backup.XXXXXX") || exit 1
+  macos_backup_placeholder_identity=$(macos_path_identity "$macos_backup_bundle") || exit 1
   rmdir "$macos_backup_bundle" || exit 1
 
   macos_transaction_active=no
-  macos_bundle_published=no
+  macos_transaction_committed=no
   macos_cli_touched=no
   macos_helper_touched=no
-  macos_agent_touched=no
+  macos_agent_initial_identity=
+  macos_agent_displaced="$macos_state_dir/agent.displaced"
+  macos_agent_prior_restored=no
   macos_new_agent_bootstrap_attempted=no
   macos_old_agent_loaded=no
   macos_old_agent_unloaded=no
@@ -2080,6 +2202,28 @@ install_macos_desktop_integration_at() (
     fi
   }
 
+  macos_remove_owned_directory() {
+    macos_owned_directory="$1"
+    macos_owned_identity="$2"
+    if macos_directory_has_identity "$macos_owned_directory" "$macos_owned_identity"; then
+      rm -rf "$macos_owned_directory" || return 1
+      [ ! -e "$macos_owned_directory" ] && [ ! -L "$macos_owned_directory" ]
+    elif [ -e "$macos_owned_directory" ] || [ -L "$macos_owned_directory" ]; then
+      return 1
+    fi
+  }
+
+  macos_remove_owned_file() {
+    macos_owned_file="$1"
+    macos_owned_identity="$2"
+    if macos_file_has_identity "$macos_owned_file" "$macos_owned_identity"; then
+      rm -f "$macos_owned_file" || return 1
+      [ ! -e "$macos_owned_file" ] && [ ! -L "$macos_owned_file" ]
+    elif [ -e "$macos_owned_file" ] || [ -L "$macos_owned_file" ]; then
+      return 1
+    fi
+  }
+
   macos_restore_leaf() {
     macos_restore_key="$1"
     macos_restore_path="$2"
@@ -2107,27 +2251,57 @@ install_macos_desktop_integration_at() (
           macos_rollback_failed=yes
       fi
     fi
-    [ "$macos_agent_touched" = no ] || \
-      macos_restore_leaf agent "$macos_agent" || macos_rollback_failed=yes
+    if macos_file_has_identity "$macos_agent" "$macos_stage_agent_identity"; then
+      macos_remove_owned_file "$macos_agent" "$macos_stage_agent_identity" || \
+        macos_rollback_failed=yes
+    fi
+    if macos_file_has_identity "$macos_agent_nested_stage" "$macos_stage_agent_identity"; then
+      macos_remove_owned_file "$macos_agent_nested_stage" "$macos_stage_agent_identity" || \
+        macos_rollback_failed=yes
+    fi
+    if [ -n "$macos_agent_initial_identity" ]; then
+      if macos_file_has_identity "$macos_agent" "$macos_agent_initial_identity"; then
+        macos_agent_prior_restored=yes
+      elif macos_file_has_identity "$macos_agent_displaced" "$macos_agent_initial_identity" && \
+           [ ! -e "$macos_agent" ] && [ ! -L "$macos_agent" ]; then
+        mv "$macos_agent_displaced" "$macos_agent" || macos_rollback_failed=yes
+        if macos_file_has_identity "$macos_agent" "$macos_agent_initial_identity"; then
+          macos_agent_prior_restored=yes
+        else
+          macos_rollback_failed=yes
+        fi
+      else
+        macos_rollback_failed=yes
+      fi
+    fi
     [ "$macos_helper_touched" = no ] || \
       macos_restore_leaf helper "$macos_loose_helper" || macos_rollback_failed=yes
     [ "$macos_cli_touched" = no ] || \
       macos_restore_leaf cli "$macos_cli_link" || macos_rollback_failed=yes
-    if [ "$macos_bundle_published" = yes ]; then
-      rm -rf "$macos_app" || macos_rollback_failed=yes
+    if macos_directory_has_identity "$macos_app" "$macos_stage_bundle_identity"; then
+      macos_remove_owned_directory "$macos_app" "$macos_stage_bundle_identity" || \
+        macos_rollback_failed=yes
+    fi
+    if macos_directory_has_identity \
+      "$macos_bundle_nested_stage" "$macos_stage_bundle_identity"; then
+      macos_remove_owned_directory \
+        "$macos_bundle_nested_stage" "$macos_stage_bundle_identity" || \
+        macos_rollback_failed=yes
     fi
     if [ -n "${macos_backup_bundle:-}" ] && [ -d "$macos_backup_bundle" ]; then
-      if [ -e "$macos_app" ] || [ -L "$macos_app" ]; then
-        rm -rf "$macos_app" || macos_rollback_failed=yes
-      fi
-      if [ -e "$macos_app" ] || [ -L "$macos_app" ]; then
+      if ! macos_directory_has_identity \
+        "$macos_backup_bundle" "$macos_existing_bundle_identity"; then
+        macos_rollback_failed=yes
+      elif [ -e "$macos_app" ] || [ -L "$macos_app" ]; then
         macos_rollback_failed=yes
       else
         mv "$macos_backup_bundle" "$macos_app" || macos_rollback_failed=yes
+        macos_directory_has_identity "$macos_app" "$macos_existing_bundle_identity" || \
+          macos_rollback_failed=yes
       fi
     fi
     if [ "$macos_gui_domain" = yes ] && [ "$macos_old_agent_unloaded" = yes ] && \
-       [ -f "$macos_agent" ]; then
+       [ "$macos_agent_prior_restored" = yes ]; then
       "$macos_launchctl" bootstrap "$macos_domain" "$macos_agent" >/dev/null 2>&1 || \
         macos_rollback_failed=yes
     fi
@@ -2147,8 +2321,26 @@ install_macos_desktop_integration_at() (
         macos_preserve_recovery=yes
       fi
     fi
-    [ -z "${macos_stage_bundle:-}" ] || rm -rf "$macos_stage_bundle"
-    [ -z "${macos_stage_agent:-}" ] || rm -f "$macos_stage_agent"
+    if [ "${macos_transaction_committed:-no}" = yes ] && \
+       { ! macos_directory_has_identity "$macos_app" "$macos_stage_bundle_identity" || \
+         ! macos_file_has_identity "$macos_agent" "$macos_stage_agent_identity"; }; then
+      warn "published macOS artifacts changed before cleanup; preserving recovery state"
+      macos_cleanup_status=1
+      macos_preserve_recovery=yes
+    fi
+    [ -z "${macos_stage_bundle:-}" ] || \
+      macos_remove_owned_directory "$macos_stage_bundle" "$macos_stage_bundle_identity" || \
+      macos_cleanup_status=1
+    [ -z "${macos_bundle_nested_stage:-}" ] || \
+      macos_remove_owned_directory \
+        "$macos_bundle_nested_stage" "$macos_stage_bundle_identity" || \
+      macos_cleanup_status=1
+    [ -z "${macos_stage_agent:-}" ] || \
+      macos_remove_owned_file "$macos_stage_agent" "$macos_stage_agent_identity" || \
+      macos_cleanup_status=1
+    [ -z "${macos_agent_nested_stage:-}" ] || \
+      macos_remove_owned_file "$macos_agent_nested_stage" "$macos_stage_agent_identity" || \
+      macos_cleanup_status=1
     if [ "$macos_preserve_recovery" = yes ]; then
       if [ -n "${macos_backup_bundle:-}" ] && [ -d "$macos_backup_bundle" ]; then
         warn "previous Wakezilla.app preserved for recovery at $macos_backup_bundle"
@@ -2157,11 +2349,29 @@ install_macos_desktop_integration_at() (
         warn "macOS integration snapshots preserved for recovery at $macos_state_dir"
       fi
     else
-      [ -z "${macos_state_dir:-}" ] || rm -rf "$macos_state_dir"
+      if [ -n "${macos_state_dir:-}" ] && \
+         { [ -e "$macos_state_dir" ] || [ -L "$macos_state_dir" ]; }; then
+        if macos_directory_has_identity "$macos_state_dir" "$macos_state_dir_identity"; then
+          rm -rf "$macos_state_dir" || macos_cleanup_status=1
+        else
+          warn "unexpected recovery state retained at $macos_state_dir"
+          macos_cleanup_status=1
+        fi
+      fi
     fi
     if [ "$macos_preserve_recovery" = no ] && \
        [ -n "${macos_backup_bundle:-}" ] && [ -d "$macos_backup_bundle" ]; then
-      rm -rf "$macos_backup_bundle"
+      if macos_directory_has_identity \
+        "$macos_backup_bundle" "$macos_existing_bundle_identity"; then
+        rm -rf "$macos_backup_bundle" || macos_cleanup_status=1
+      else
+        warn "unexpected bundle retained at $macos_backup_bundle"
+        macos_cleanup_status=1
+      fi
+    fi
+    if ! macos_release_lock; then
+      warn "macOS installer lock changed during cleanup; preserving the foreign lock"
+      macos_cleanup_status=1
     fi
     exit "$macos_cleanup_status"
   }
@@ -2184,7 +2394,15 @@ install_macos_desktop_integration_at() (
 
   macos_snapshot_leaf cli "$macos_cli_link" || exit 1
   macos_snapshot_leaf helper "$macos_loose_helper" || exit 1
+  if [ -f "$macos_agent" ] && [ ! -L "$macos_agent" ]; then
+    macos_agent_initial_identity=$(macos_path_identity "$macos_agent") || exit 1
+  fi
   macos_snapshot_leaf agent "$macos_agent" || exit 1
+  if [ -n "$macos_agent_initial_identity" ]; then
+    macos_file_has_identity "$macos_agent" "$macos_agent_initial_identity" || exit 1
+  elif [ -e "$macos_agent" ] || [ -L "$macos_agent" ]; then
+    exit 1
+  fi
 
   if macos_domain_output=$("$macos_launchctl" print "$macos_domain" 2>&1); then
     macos_gui_domain=yes
@@ -2212,21 +2430,48 @@ install_macos_desktop_integration_at() (
 
   macos_transaction_active=yes
   if [ "$macos_existing_bundle" = yes ]; then
+    macos_lock_is_owned || exit 1
+    macos_directory_has_identity "$macos_app" "$macos_existing_bundle_identity" || exit 1
     mv "$macos_app" "$macos_backup_bundle" || exit 1
+    macos_directory_has_identity \
+      "$macos_backup_bundle" "$macos_existing_bundle_identity" || exit 1
   fi
-  macos_bundle_published=yes
-  mv "$macos_stage_bundle" "$macos_app" || exit 1
-  macos_stage_bundle=
+  macos_lock_is_owned || exit 1
+  mv -n "$macos_stage_bundle" "$macos_app" || exit 1
+  if macos_directory_has_identity "$macos_app" "$macos_stage_bundle_identity"; then
+    :
+  elif macos_directory_has_identity \
+    "$macos_bundle_nested_stage" "$macos_stage_bundle_identity"; then
+    warn "Wakezilla.app appeared concurrently during bundle publication"
+    exit 1
+  else
+    warn "failed to publish the staged Wakezilla.app at its exact destination"
+    exit 1
+  fi
 
   macos_cli_touched=yes
   macos_atomic_symlink "$macos_app/Contents/MacOS/wakezilla" "$macos_cli_link" || exit 1
   macos_helper_touched=yes
   rm -f "$macos_loose_helper" || exit 1
-  macos_agent_touched=yes
-  mv -f "$macos_stage_agent" "$macos_agent" || exit 1
-  macos_stage_agent=
+  macos_lock_is_owned || exit 1
+  if [ -n "$macos_agent_initial_identity" ]; then
+    macos_file_has_identity "$macos_agent" "$macos_agent_initial_identity" || exit 1
+    mv "$macos_agent" "$macos_agent_displaced" || exit 1
+    macos_file_has_identity "$macos_agent_displaced" "$macos_agent_initial_identity" || exit 1
+  elif [ -e "$macos_agent" ] || [ -L "$macos_agent" ]; then
+    warn "LaunchAgent appeared concurrently before publication"
+    exit 1
+  fi
+  macos_lock_is_owned || exit 1
+  ln "$macos_stage_agent" "$macos_agent" || exit 1
+  if ! macos_file_has_identity "$macos_agent" "$macos_stage_agent_identity"; then
+    warn "LaunchAgent appeared concurrently during publication"
+    exit 1
+  fi
+  macos_remove_owned_file "$macos_stage_agent" "$macos_stage_agent_identity" || exit 1
 
   if [ "$macos_gui_domain" = yes ]; then
+    macos_lock_is_owned || exit 1
     if [ "$macos_old_agent_loaded" = yes ]; then
       macos_old_agent_unloaded=yes
       if ! "$macos_launchctl" bootout "$macos_domain" "$macos_agent" >/dev/null; then
@@ -2237,10 +2482,16 @@ install_macos_desktop_integration_at() (
     macos_new_agent_bootstrap_attempted=yes
     "$macos_launchctl" bootstrap "$macos_domain" "$macos_agent" >/dev/null || exit 1
     "$macos_launchctl" kickstart -k "$macos_domain/dev.wakezilla.tray" >/dev/null || exit 1
+  fi
+  macos_lock_is_owned || exit 1
+  macos_directory_has_identity "$macos_app" "$macos_stage_bundle_identity" || exit 1
+  macos_file_has_identity "$macos_agent" "$macos_stage_agent_identity" || exit 1
+  if [ "$macos_gui_domain" = yes ]; then
     info "macOS desktop integration installed; Wakezilla tray launch requested"
   else
     warn "macOS desktop integration installed; the Wakezilla tray will start at the next graphical login"
   fi
+  macos_transaction_committed=yes
   macos_transaction_active=no
 )
 

@@ -3352,7 +3352,7 @@ test_macos_bundle_version_normalization() {
 
 test_macos_bundle_contract_and_gui_activation() {
   temp_dir=$(mktemp -d)
-  home_dir="$temp_dir/Home & <Primary>"
+  home_dir="$temp_dir/Home's & <Primary>"
   extract_dir="$temp_dir/extract"
   bin_dir="$temp_dir/bin with spaces"
   tools_dir="$temp_dir/tools"
@@ -3421,7 +3421,7 @@ Contents/Resources/Wakezilla.icns'
     '<key>LimitLoadToSessionType</key>' '<string>Aqua</string>' \
     '<key>ProcessType</key>' '<string>Interactive</string>' \
     '<key>AssociatedBundleIdentifiers</key>' \
-    '<string>dev.wakezilla.Wakezilla</string>' '&amp;' '&lt;'; do
+    '<string>dev.wakezilla.Wakezilla</string>' '&amp;' '&lt;' '&apos;'; do
     assert_contains "$launch_contents" "$launch_contract" \
       "macOS LaunchAgent contract $launch_contract"
   done
@@ -3429,6 +3429,8 @@ Contents/Resources/Wakezilla.icns'
     "macOS LaunchAgent omits KeepAlive"
   assert_not_contains "$launch_contents" 'Terminal' "macOS LaunchAgent omits Terminal"
   assert_not_contains "$launch_contents" '/bin/sh' "macOS LaunchAgent omits shell"
+  assert_not_contains "$launch_contents" '\&apos;' \
+    "macOS LaunchAgent apostrophe escape omits literal backslash"
   assert_contains "$launch_contents" '<key>RunAtLoad</key>
   <true/>' "macOS LaunchAgent RunAtLoad boolean"
   assert_contains "$launch_contents" '<key>AssociatedBundleIdentifiers</key>
@@ -3836,8 +3838,141 @@ SH
   temporary_count=$(find "$home_dir" \
     \( -name '.wakezilla-macos-install.*' -o -name '.Wakezilla.app.stage.*' \
        -o -name '.Wakezilla.app.backup.*' -o -name '.dev.wakezilla.tray.plist.stage.*' \) \
+    ! -name '.wakezilla-macos-install.lock' \
     -print | wc -l | tr -d ' ')
   assert_eq "0" "$temporary_count" "macOS setup mktemp failure cleans staged siblings"
+  if [ -e "$home_dir/.wakezilla-macos-install.lock" ]; then
+    fail "macOS setup mktemp failure: installer lock remained"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_macos_install_lock_contention_fails_without_removing_owner() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  lock_dir="$home_dir/.wakezilla-macos-install.lock"
+  mkdir -p "$lock_dir" "$bin_dir" "$tools_dir"
+  printf 'concurrent installer owns lock\n' > "$lock_dir/owner-sentinel"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  test_uid=$(id -u)
+
+  if WAKEZILLA_MACOS_GUI_DOMAIN=absent install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS installer lock contention: expected fatal status"
+  fi
+  assert_eq "concurrent installer owns lock" "$(cat "$lock_dir/owner-sentinel")" \
+    "macOS installer lock contention preserves owner"
+  if [ -e "$home_dir/Applications" ] || [ -e "$home_dir/Library" ]; then
+    fail "macOS installer lock contention: published profile artifacts"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_macos_bundle_publication_race_preserves_foreign_app() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  test_uid=$(id -u)
+  home_physical=$(CDPATH= cd -- "$home_dir" && pwd -P)
+  app="$home_physical/Applications/Wakezilla.app"
+  real_mv=$(command -v mv)
+  cat > "$tools_dir/mv" <<SH
+#!/usr/bin/env sh
+case "\${1:-}" in
+  -*) source_path="\${2:-}"; destination_path="\${3:-}" ;;
+  *) source_path="\${1:-}"; destination_path="\${2:-}" ;;
+esac
+case "\$source_path" in
+  */.Wakezilla.app.stage.*)
+    if [ "\$destination_path" = "\$WAKEZILLA_TEST_RACE_BUNDLE" ]; then
+      mkdir -p "\$destination_path"
+      printf 'concurrent foreign app\n' > "\$destination_path/foreign-sentinel"
+    fi
+    ;;
+esac
+exec '$real_mv' "\$@"
+SH
+  chmod 0755 "$tools_dir/mv"
+
+  if PATH="$tools_dir:$PATH" WAKEZILLA_TEST_RACE_BUNDLE="$app" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=absent install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS bundle publication race: expected fatal status"
+  fi
+  assert_eq "concurrent foreign app" "$(cat "$app/foreign-sentinel" 2>/dev/null || printf '')" \
+    "macOS bundle publication race preserves foreign app"
+  nested_count=$(find "$app" -maxdepth 1 -name '.Wakezilla.app.stage.*' -print \
+    2>/dev/null | wc -l | tr -d ' ')
+  assert_eq "0" "$nested_count" "macOS bundle publication race removes only nested own stage"
+  if [ -e "$bin_dir/wakezilla" ] || [ -e "$home_physical/Library/LaunchAgents/dev.wakezilla.tray.plist" ]; then
+    fail "macOS bundle publication race: published CLI or LaunchAgent"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_macos_agent_publication_race_preserves_foreign_agent() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  test_uid=$(id -u)
+  home_physical=$(CDPATH= cd -- "$home_dir" && pwd -P)
+  app="$home_physical/Applications/Wakezilla.app"
+  agent="$home_physical/Library/LaunchAgents/dev.wakezilla.tray.plist"
+  real_ln=$(command -v ln)
+  cat > "$tools_dir/ln" <<SH
+#!/usr/bin/env sh
+source_path="\${1:-}"
+destination_path="\${2:-}"
+case "\$source_path" in
+  */.dev.wakezilla.tray.plist.stage.*)
+    if [ "\$destination_path" = "\$WAKEZILLA_TEST_RACE_AGENT" ]; then
+      mkdir -p "\$destination_path"
+      printf 'concurrent foreign agent directory\n' > "\$destination_path/foreign-sentinel"
+    fi
+    ;;
+esac
+exec '$real_ln' "\$@"
+SH
+  chmod 0755 "$tools_dir/ln"
+
+  if PATH="$tools_dir:$PATH" WAKEZILLA_TEST_RACE_AGENT="$agent" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=absent install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS LaunchAgent publication race: expected fatal status"
+  fi
+  assert_eq "concurrent foreign agent directory" \
+    "$(cat "$agent/foreign-sentinel" 2>/dev/null || printf '')" \
+    "macOS LaunchAgent publication race preserves foreign agent directory"
+  nested_count=$(find "$agent" -maxdepth 1 -name '.dev.wakezilla.tray.plist.stage.*' \
+    -print 2>/dev/null | wc -l | tr -d ' ')
+  assert_eq "0" "$nested_count" \
+    "macOS LaunchAgent publication race removes only nested owned hard link"
+  if [ -e "$app" ] || [ -L "$bin_dir/wakezilla" ]; then
+    fail "macOS LaunchAgent publication race: failed to roll back owned bundle or CLI"
+  fi
+  if [ -e "$home_dir/.wakezilla-macos-install.lock" ]; then
+    fail "macOS LaunchAgent publication race: installer lock remained"
+  fi
   rm -rf "$temp_dir"
 }
 
@@ -3976,6 +4111,9 @@ if test_macos_integration_helpers_defined; then
   test_macos_failed_existing_bundle_move_preserves_original
   test_macos_incomplete_bundle_restore_preserves_recovery_backup
   test_macos_setup_failure_cleans_staged_siblings
+  test_macos_install_lock_contention_fails_without_removing_owner
+  test_macos_bundle_publication_race_preserves_foreign_app
+  test_macos_agent_publication_race_preserves_foreign_agent
   test_macos_reinstall_is_idempotent_and_rolls_back_late_failure
 fi
 
