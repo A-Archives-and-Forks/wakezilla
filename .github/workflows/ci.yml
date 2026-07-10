@@ -57,6 +57,9 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked --features desktop-tray -- -D warnings
 
+      - name: Test desktop icon assets
+        run: cargo test -p wakezilla --locked --features desktop-tray --test desktop_assets
+
       - name: Test desktop tray startup
         run: xvfb-run -a cargo test -p wakezilla --locked --features desktop-tray --test tray_startup
 

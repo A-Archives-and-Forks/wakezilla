@@ -1,5 +1,6 @@
 #![cfg(feature = "desktop-tray")]
 
+use std::collections::BTreeSet;
 use std::io::Cursor;
 
 const MASTER_PNG: &[u8] = include_bytes!("../assets/desktop/wakezilla-1024.png");
@@ -11,6 +12,39 @@ const HICOLOR_128: &[u8] =
     include_bytes!("../assets/desktop/hicolor/128x128/apps/dev.wakezilla.Wakezilla.png");
 const HICOLOR_256: &[u8] =
     include_bytes!("../assets/desktop/hicolor/256x256/apps/dev.wakezilla.Wakezilla.png");
+
+#[derive(Clone, Copy, Debug)]
+struct AlphaCoverageBounds {
+    visible_min: f64,
+    visible_max: f64,
+    opaque_min: f64,
+    opaque_max: f64,
+}
+
+const MASTER_ALPHA_BOUNDS: AlphaCoverageBounds = AlphaCoverageBounds {
+    visible_min: 0.10,
+    visible_max: 0.70,
+    opaque_min: 0.08,
+    opaque_max: 0.70,
+};
+const DERIVED_ALPHA_BOUNDS: AlphaCoverageBounds = AlphaCoverageBounds {
+    visible_min: 0.05,
+    visible_max: 0.85,
+    opaque_min: 0.03,
+    opaque_max: 0.85,
+};
+const EXPECTED_ICNS_REPRESENTATIONS: [([u8; 4], u32); 10] = [
+    (*b"ic04", 16),
+    (*b"ic05", 32),
+    (*b"ic07", 128),
+    (*b"ic08", 256),
+    (*b"ic09", 512),
+    (*b"ic10", 1024),
+    (*b"ic11", 32),
+    (*b"ic12", 64),
+    (*b"ic13", 256),
+    (*b"ic14", 512),
+];
 
 #[derive(Debug)]
 struct DecodedPng {
@@ -52,26 +86,105 @@ fn decode_png(bytes: &[u8], label: &str) -> DecodedPng {
     }
 }
 
-fn assert_rgba_png(bytes: &[u8], label: &str, expected_size: u32) -> DecodedPng {
+fn validate_decoded_rgba_icon(
+    decoded: &DecodedPng,
+    label: &str,
+    expected_size: u32,
+    bounds: AlphaCoverageBounds,
+) -> Result<(), String> {
+    if (decoded.width, decoded.height) != (expected_size, expected_size) {
+        return Err(format!(
+            "{label} must be {expected_size}x{expected_size}, got {}x{}",
+            decoded.width, decoded.height
+        ));
+    }
+    if decoded.source_color_type != png::ColorType::Rgba {
+        return Err(format!(
+            "{label} must be stored as RGBA, got {:?}",
+            decoded.source_color_type
+        ));
+    }
+    if decoded.source_bit_depth != png::BitDepth::Eight {
+        return Err(format!(
+            "{label} must use eight-bit channels, got {:?}",
+            decoded.source_bit_depth
+        ));
+    }
+
+    let expected_bytes = expected_size as usize * expected_size as usize * 4;
+    if decoded.pixels.len() != expected_bytes {
+        return Err(format!(
+            "{label} decoded RGBA byte count must be {expected_bytes}, got {}",
+            decoded.pixels.len()
+        ));
+    }
+
+    let width = decoded.width as usize;
+    let height = decoded.height as usize;
+    let alpha_at = |x: usize, y: usize| decoded.pixels[(y * width + x) * 4 + 3];
+    for (x, y) in [
+        (0, 0),
+        (width - 1, 0),
+        (0, height - 1),
+        (width - 1, height - 1),
+    ] {
+        let alpha = alpha_at(x, y);
+        if alpha != 0 {
+            return Err(format!(
+                "{label} corner ({x}, {y}) must be transparent, got alpha {alpha}"
+            ));
+        }
+    }
+
+    let pixel_count = width * height;
+    let visible_count = decoded
+        .pixels
+        .chunks_exact(4)
+        .filter(|pixel| pixel[3] != 0)
+        .count();
+    let opaque_count = decoded
+        .pixels
+        .chunks_exact(4)
+        .filter(|pixel| pixel[3] >= 250)
+        .count();
+    let visible_coverage = visible_count as f64 / pixel_count as f64;
+    let opaque_coverage = opaque_count as f64 / pixel_count as f64;
+
+    if !(bounds.visible_min..=bounds.visible_max).contains(&visible_coverage) {
+        return Err(format!(
+            "{label} visible alpha coverage {visible_coverage:.3} must be within {:.3}..={:.3}",
+            bounds.visible_min, bounds.visible_max
+        ));
+    }
+    if !(bounds.opaque_min..=bounds.opaque_max).contains(&opaque_coverage) {
+        return Err(format!(
+            "{label} opaque alpha coverage {opaque_coverage:.3} must be within {:.3}..={:.3}",
+            bounds.opaque_min, bounds.opaque_max
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_rgba_icon(
+    bytes: &[u8],
+    label: &str,
+    expected_size: u32,
+    bounds: AlphaCoverageBounds,
+) -> Result<DecodedPng, String> {
     let decoded = decode_png(bytes, label);
-    assert_eq!(decoded.width, expected_size, "{label} width");
-    assert_eq!(decoded.height, expected_size, "{label} height");
-    assert_eq!(
-        decoded.source_color_type,
-        png::ColorType::Rgba,
-        "{label} must be stored as RGBA"
-    );
-    assert_eq!(
-        decoded.source_bit_depth,
-        png::BitDepth::Eight,
-        "{label} must use eight-bit channels"
-    );
-    assert_eq!(
-        decoded.pixels.len(),
-        expected_size as usize * expected_size as usize * 4,
-        "{label} decoded RGBA byte count"
-    );
-    decoded
+    validate_decoded_rgba_icon(&decoded, label, expected_size, bounds)?;
+    Ok(decoded)
+}
+
+fn assert_rgba_icon(
+    bytes: &[u8],
+    label: &str,
+    expected_size: u32,
+    bounds: AlphaCoverageBounds,
+) -> DecodedPng {
+    validate_rgba_icon(bytes, label, expected_size, bounds)
+        .unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn little_endian_u16(bytes: &[u8], offset: usize) -> u16 {
@@ -100,166 +213,262 @@ fn big_endian_u32(bytes: &[u8], offset: usize) -> u32 {
 
 #[test]
 fn master_icon_is_a_transparent_1024_pixel_rgba_png() {
-    let decoded = assert_rgba_png(MASTER_PNG, "master icon", 1024);
-    let width = decoded.width as usize;
-    let height = decoded.height as usize;
-    let alpha_at = |x: usize, y: usize| decoded.pixels[(y * width + x) * 4 + 3];
-
-    for (x, y) in [
-        (0, 0),
-        (width - 1, 0),
-        (0, height - 1),
-        (width - 1, height - 1),
-    ] {
-        assert_eq!(alpha_at(x, y), 0, "master corner ({x}, {y})");
-    }
-
-    let pixel_count = width * height;
-    let visible_count = decoded
-        .pixels
-        .chunks_exact(4)
-        .filter(|pixel| pixel[3] != 0)
-        .count();
-    let opaque_count = decoded
-        .pixels
-        .chunks_exact(4)
-        .filter(|pixel| pixel[3] >= 250)
-        .count();
-    let visible_coverage = visible_count as f64 / pixel_count as f64;
-    let opaque_coverage = opaque_count as f64 / pixel_count as f64;
-
-    assert!(
-        (0.10..=0.70).contains(&visible_coverage),
-        "master visible alpha coverage {visible_coverage:.3} must leave generous padding"
-    );
-    assert!(
-        (0.08..=0.70).contains(&opaque_coverage),
-        "master opaque alpha coverage {opaque_coverage:.3} must contain a substantial subject"
-    );
+    assert_rgba_icon(MASTER_PNG, "master icon", 1024, MASTER_ALPHA_BOUNDS);
 }
 
 #[test]
 fn linux_hicolor_icons_are_square_rgba_pngs_at_required_sizes() {
     for (bytes, size) in [(HICOLOR_48, 48), (HICOLOR_128, 128), (HICOLOR_256, 256)] {
         let label = format!("Linux hicolor {size}x{size} icon");
-        assert_rgba_png(bytes, &label, size);
+        assert_rgba_icon(bytes, &label, size, DERIVED_ALPHA_BOUNDS);
     }
+}
+
+fn validate_windows_icon(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < 6 {
+        return Err("ICO header must be present".to_string());
+    }
+    if &bytes[..4] != b"\0\0\x01\0" {
+        return Err("ICO magic must be 00 00 01 00".to_string());
+    }
+
+    let entry_count = little_endian_u16(bytes, 4) as usize;
+    if entry_count != 4 {
+        return Err(format!(
+            "ICO must contain exactly four images, got {entry_count}"
+        ));
+    }
+    let table_end = entry_count
+        .checked_mul(16)
+        .and_then(|size| size.checked_add(6))
+        .ok_or_else(|| "ICO directory size must not overflow".to_string())?;
+    if table_end > bytes.len() {
+        return Err("ICO directory must fit inside the file".to_string());
+    }
+
+    let mut sizes = Vec::with_capacity(entry_count);
+    let mut expected_payload_offset = table_end;
+    for index in 0..entry_count {
+        let entry = 6 + index * 16;
+        let width = match bytes[entry] {
+            0 => 256,
+            value => u32::from(value),
+        };
+        let height = match bytes[entry + 1] {
+            0 => 256,
+            value => u32::from(value),
+        };
+        if width != height {
+            return Err(format!("ICO entry {index} must be square"));
+        }
+        if bytes[entry + 2] != 0 {
+            return Err(format!("ICO entry {index} color count must be zero"));
+        }
+        if bytes[entry + 3] != 0 {
+            return Err(format!("ICO entry {index} reserved byte must be zero"));
+        }
+        if little_endian_u16(bytes, entry + 4) != 1 {
+            return Err(format!("ICO entry {index} color planes must be one"));
+        }
+        if little_endian_u16(bytes, entry + 6) != 32 {
+            return Err(format!("ICO entry {index} bits per pixel must be 32"));
+        }
+
+        let payload_size = little_endian_u32(bytes, entry + 8) as usize;
+        let payload_offset = little_endian_u32(bytes, entry + 12) as usize;
+        if payload_size <= 8 {
+            return Err(format!("ICO entry {index} payload is trivial"));
+        }
+        if payload_offset != expected_payload_offset {
+            return Err(format!(
+                "ICO entry {index} payload ranges must be exactly contiguous: expected offset {expected_payload_offset}, got {payload_offset}"
+            ));
+        }
+        let payload_end = payload_offset
+            .checked_add(payload_size)
+            .ok_or_else(|| format!("ICO entry {index} payload end must not overflow"))?;
+        if payload_end > bytes.len() {
+            return Err(format!(
+                "ICO entry {index} payload must fit inside the file"
+            ));
+        }
+
+        let label = format!("ICO {width}x{height} payload");
+        validate_rgba_icon(
+            &bytes[payload_offset..payload_end],
+            &label,
+            width,
+            DERIVED_ALPHA_BOUNDS,
+        )?;
+        sizes.push(width);
+        expected_payload_offset = payload_end;
+    }
+
+    sizes.sort_unstable();
+    if sizes != [16, 32, 48, 256] {
+        return Err(format!(
+            "ICO image sizes must be 16/32/48/256, got {sizes:?}"
+        ));
+    }
+    if expected_payload_offset != bytes.len() {
+        return Err(format!(
+            "ICO final payload must end at EOF {}, got {expected_payload_offset}",
+            bytes.len()
+        ));
+    }
+
+    Ok(())
 }
 
 #[test]
 fn windows_icon_contains_valid_png_entries_at_required_sizes() {
-    assert!(WINDOWS_ICO.len() >= 6, "ICO header must be present");
-    assert_eq!(&WINDOWS_ICO[..4], b"\0\0\x01\0", "ICO magic");
-
-    let entry_count = little_endian_u16(WINDOWS_ICO, 4) as usize;
-    assert_eq!(entry_count, 4, "ICO must contain exactly four images");
-    let table_end = 6 + entry_count * 16;
-    assert!(table_end <= WINDOWS_ICO.len(), "ICO directory must fit");
-
-    let mut sizes = Vec::with_capacity(entry_count);
-    let mut ranges = Vec::with_capacity(entry_count);
-    for index in 0..entry_count {
-        let entry = 6 + index * 16;
-        let width = match WINDOWS_ICO[entry] {
-            0 => 256,
-            value => u32::from(value),
-        };
-        let height = match WINDOWS_ICO[entry + 1] {
-            0 => 256,
-            value => u32::from(value),
-        };
-        assert_eq!(width, height, "ICO entry {index} must be square");
-        assert_eq!(
-            little_endian_u16(WINDOWS_ICO, entry + 4),
-            1,
-            "ICO entry {index} color planes"
-        );
-        assert_eq!(
-            little_endian_u16(WINDOWS_ICO, entry + 6),
-            32,
-            "ICO entry {index} bits per pixel"
-        );
-
-        let payload_size = little_endian_u32(WINDOWS_ICO, entry + 8) as usize;
-        let payload_offset = little_endian_u32(WINDOWS_ICO, entry + 12) as usize;
-        let payload_end = payload_offset
-            .checked_add(payload_size)
-            .expect("ICO payload end must not overflow");
-        assert!(payload_size > 8, "ICO entry {index} payload is trivial");
-        assert!(
-            payload_offset >= table_end && payload_end <= WINDOWS_ICO.len(),
-            "ICO entry {index} payload must be inside the file"
-        );
-
-        let label = format!("ICO {width}x{height} payload");
-        let decoded = decode_png(&WINDOWS_ICO[payload_offset..payload_end], &label);
-        assert_eq!((decoded.width, decoded.height), (width, height), "{label}");
-        sizes.push(width);
-        ranges.push(payload_offset..payload_end);
-    }
-
-    sizes.sort_unstable();
-    assert_eq!(sizes, [16, 32, 48, 256], "ICO image sizes");
-    ranges.sort_unstable_by_key(|range| range.start);
-    for pair in ranges.windows(2) {
-        assert!(
-            pair[0].end <= pair[1].start,
-            "ICO payload ranges must not overlap"
-        );
-    }
+    validate_windows_icon(WINDOWS_ICO).unwrap_or_else(|error| panic!("{error}"));
 }
 
-#[test]
-fn macos_icon_has_a_well_formed_1024_pixel_representation() {
-    assert!(MACOS_ICNS.len() >= 8, "ICNS header must be present");
-    assert_eq!(&MACOS_ICNS[..4], b"icns", "ICNS magic");
-    assert_eq!(
-        big_endian_u32(MACOS_ICNS, 4) as usize,
-        MACOS_ICNS.len(),
-        "ICNS declared length"
-    );
+fn validate_macos_icon(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < 8 {
+        return Err("ICNS header must be present".to_string());
+    }
+    if &bytes[..4] != b"icns" {
+        return Err("ICNS magic must be icns".to_string());
+    }
+    let declared_length = big_endian_u32(bytes, 4) as usize;
+    if declared_length != bytes.len() {
+        return Err(format!(
+            "ICNS declared length {declared_length} must equal file length {}",
+            bytes.len()
+        ));
+    }
 
     let mut offset = 8;
-    let mut chunk_count = 0;
-    let mut has_1024_representation = false;
-    while offset < MACOS_ICNS.len() {
-        assert!(
-            offset + 8 <= MACOS_ICNS.len(),
-            "ICNS chunk {chunk_count} header must fit"
-        );
-        let kind = &MACOS_ICNS[offset..offset + 4];
-        let chunk_size = big_endian_u32(MACOS_ICNS, offset + 4) as usize;
-        assert!(chunk_size > 8, "ICNS chunk {chunk_count} is trivial");
+    let mut seen_representations = BTreeSet::new();
+    while offset < bytes.len() {
+        if offset + 8 > bytes.len() {
+            return Err("ICNS chunk header must fit inside the file".to_string());
+        }
+        let kind: [u8; 4] = bytes[offset..offset + 4]
+            .try_into()
+            .expect("four-byte ICNS chunk type");
+        let kind_label = String::from_utf8_lossy(&kind);
+        let chunk_size = big_endian_u32(bytes, offset + 4) as usize;
+        if chunk_size <= 8 {
+            return Err(format!("ICNS {kind_label} chunk is trivial"));
+        }
         let chunk_end = offset
             .checked_add(chunk_size)
-            .expect("ICNS chunk end must not overflow");
-        assert!(
-            chunk_end <= MACOS_ICNS.len(),
-            "ICNS chunk {chunk_count} must fit inside the file"
-        );
-
-        if kind == b"ic10" {
-            let decoded = decode_png(&MACOS_ICNS[offset + 8..chunk_end], "ICNS ic10 payload");
-            assert_eq!(
-                (decoded.width, decoded.height),
-                (1024, 1024),
-                "ICNS ic10 representation"
-            );
-            has_1024_representation = true;
+            .ok_or_else(|| format!("ICNS {kind_label} chunk end must not overflow"))?;
+        if chunk_end > bytes.len() {
+            return Err(format!("ICNS {kind_label} chunk must fit inside the file"));
         }
 
-        chunk_count += 1;
+        if let Some((_, expected_size)) = EXPECTED_ICNS_REPRESENTATIONS
+            .iter()
+            .find(|(expected_kind, _)| expected_kind == &kind)
+        {
+            if !seen_representations.insert(kind) {
+                return Err(format!(
+                    "ICNS {kind_label} representation must not be duplicated"
+                ));
+            }
+            let payload = &bytes[offset + 8..chunk_end];
+            if matches!(&kind, b"ic04" | b"ic05") {
+                if !payload.starts_with(b"ARGB") {
+                    return Err(format!(
+                        "ICNS {kind_label} legacy representation must start with ARGB"
+                    ));
+                }
+            } else {
+                let label = format!("ICNS {kind_label} {expected_size}x{expected_size} payload");
+                validate_rgba_icon(payload, &label, *expected_size, DERIVED_ALPHA_BOUNDS)?;
+            }
+        } else if kind == *b"info" {
+            if !bytes[offset + 8..chunk_end].starts_with(b"bplist00") {
+                return Err("ICNS info metadata must be a binary plist".to_string());
+            }
+        } else {
+            return Err(format!(
+                "ICNS chunk type {kind_label} is not emitted by the canonical generator"
+            ));
+        }
+
         offset = chunk_end;
     }
 
-    assert_eq!(
-        offset,
-        MACOS_ICNS.len(),
-        "ICNS chunks must consume the file"
-    );
-    assert!(chunk_count >= 4, "ICNS must contain several icon chunks");
-    assert!(
-        has_1024_representation,
-        "ICNS must contain an ic10 1024x1024 representation"
-    );
+    for (kind, _) in EXPECTED_ICNS_REPRESENTATIONS {
+        if !seen_representations.contains(&kind) {
+            return Err(format!(
+                "ICNS is missing required {} representation",
+                String::from_utf8_lossy(&kind)
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn macos_icon_contains_all_canonical_png_representations() {
+    validate_macos_icon(MACOS_ICNS).unwrap_or_else(|error| panic!("{error}"));
+}
+
+fn icns_without_chunk(bytes: &[u8], removed_kind: &[u8; 4]) -> Vec<u8> {
+    let mut rebuilt = bytes[..8].to_vec();
+    let mut offset = 8;
+    while offset < bytes.len() {
+        let chunk_size = big_endian_u32(bytes, offset + 4) as usize;
+        let chunk_end = offset + chunk_size;
+        if &bytes[offset..offset + 4] != removed_kind {
+            rebuilt.extend_from_slice(&bytes[offset..chunk_end]);
+        }
+        offset = chunk_end;
+    }
+    let rebuilt_size = u32::try_from(rebuilt.len()).expect("ICNS fixture must fit in u32");
+    rebuilt[4..8].copy_from_slice(&rebuilt_size.to_be_bytes());
+    rebuilt
+}
+
+#[test]
+fn semantic_icon_validator_rejects_a_fully_transparent_fixture() {
+    let mut decoded = decode_png(MASTER_PNG, "transparent fixture");
+    for pixel in decoded.pixels.chunks_exact_mut(4) {
+        pixel[3] = 0;
+    }
+
+    let error =
+        validate_decoded_rgba_icon(&decoded, "transparent fixture", 1024, MASTER_ALPHA_BOUNDS)
+            .expect_err("a fully transparent icon must be rejected");
+    assert!(error.contains("visible alpha coverage"), "{error}");
+}
+
+#[test]
+fn semantic_icon_validator_rejects_an_opaque_rgb_fixture() {
+    let mut decoded = decode_png(MASTER_PNG, "opaque RGB fixture");
+    decoded.source_color_type = png::ColorType::Rgb;
+    for pixel in decoded.pixels.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+
+    let error =
+        validate_decoded_rgba_icon(&decoded, "opaque RGB fixture", 1024, MASTER_ALPHA_BOUNDS)
+            .expect_err("an opaque RGB icon must be rejected");
+    assert!(error.contains("RGBA"), "{error}");
+}
+
+#[test]
+fn windows_icon_validator_rejects_a_payload_gap() {
+    let mut corrupted = WINDOWS_ICO.to_vec();
+    let table_end = 6 + little_endian_u16(&corrupted, 4) as usize * 16;
+    corrupted[18..22].copy_from_slice(&(table_end as u32 + 1).to_le_bytes());
+
+    let error = validate_windows_icon(&corrupted).expect_err("ICO payload gaps must be rejected");
+    assert!(error.contains("contiguous"), "{error}");
+}
+
+#[test]
+fn macos_icon_validator_rejects_a_missing_representation() {
+    let incomplete = icns_without_chunk(MACOS_ICNS, b"ic10");
+
+    let error = validate_macos_icon(&incomplete)
+        .expect_err("an ICNS missing its 1024 representation must be rejected");
+    assert!(error.contains("ic10"), "{error}");
 }
