@@ -70,19 +70,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            . frontend
-
-      - name: Cache Cargo bin directory
-        uses: actions/cache@v4
-        id: cache-cargo-bin
-        with:
-          path: ~/.cargo/bin
-          key: ${{ runner.os }}-cargo-bin-v1
-          restore-keys: |
-            ${{ runner.os }}-cargo-bin-
+            .
+            frontend
 
       - name: Install Trunk
-        if: steps.cache-cargo-bin.outputs.cache-hit != 'true'
         shell: bash
         run: |
           if ! command -v trunk &> /dev/null; then
