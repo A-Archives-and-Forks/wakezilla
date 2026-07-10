@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use wakezilla::service::{self, Mode};
 
 #[test]
@@ -69,24 +71,111 @@ fn service_log_file_names_are_stable_per_mode() {
 }
 
 #[test]
-fn systemd_unit_contains_exec_start_with_exe_and_subcommand() {
-    let unit = service::generate_systemd_unit(Mode::Proxy, "/usr/local/bin/wakezilla");
-    assert!(unit.contains("ExecStart=/usr/local/bin/wakezilla --no-update-check proxy-server"));
-    assert!(unit.contains("[Service]"));
-    assert!(unit.contains("WantedBy=multi-user.target"));
+fn protected_service_binary_paths_are_fixed_per_platform_and_mode() {
+    assert_eq!(
+        service::linux_service_binary_path(Mode::Proxy),
+        Path::new("/usr/local/libexec/wakezilla/wakezilla-proxy")
+    );
+    assert_eq!(
+        service::linux_service_binary_path(Mode::Client),
+        Path::new("/usr/local/libexec/wakezilla/wakezilla-client")
+    );
+    assert_eq!(
+        service::macos_service_binary_path(Mode::Proxy),
+        Path::new("/Library/PrivilegedHelperTools/dev.wakezilla.proxy")
+    );
+    assert_eq!(
+        service::macos_service_binary_path(Mode::Client),
+        Path::new("/Library/PrivilegedHelperTools/dev.wakezilla.client")
+    );
+
+    let program_files = Path::new("C:/Program Files");
+    assert_eq!(
+        service::windows_service_binary_path_in(program_files, Mode::Proxy),
+        Path::new("C:/Program Files/Wakezilla/Service/wakezilla-proxy.exe")
+    );
+    assert_eq!(
+        service::windows_service_binary_path_in(program_files, Mode::Client),
+        Path::new("C:/Program Files/Wakezilla/Service/wakezilla-client.exe")
+    );
 }
 
 #[test]
-fn launchd_plist_contains_label_exe_and_subcommand() {
-    let plist = service::generate_launchd_plist(Mode::Client, "/usr/local/bin/wakezilla");
+fn systemd_unit_uses_only_the_fixed_protected_binary() {
+    let unit = service::generate_systemd_unit(Mode::Proxy);
+    assert!(unit.contains(
+        "ExecStart=/usr/local/libexec/wakezilla/wakezilla-proxy --no-update-check proxy-server"
+    ));
+    assert!(unit.contains("[Service]"));
+    assert!(unit.contains("WantedBy=multi-user.target"));
+    assert!(service::systemd_unit_uses_protected_binary(
+        Mode::Proxy,
+        &unit
+    ));
+
+    let legacy = unit.replace(
+        "/usr/local/libexec/wakezilla/wakezilla-proxy",
+        "/home/alice/.local/bin/wakezilla",
+    );
+    assert!(!service::systemd_unit_uses_protected_binary(
+        Mode::Proxy,
+        &legacy
+    ));
+}
+
+#[test]
+fn launchd_plist_uses_only_the_fixed_protected_binary() {
+    let plist = service::generate_launchd_plist(Mode::Client);
     assert!(plist.contains("dev.wakezilla.client"));
-    assert!(plist.contains("/usr/local/bin/wakezilla"));
+    assert!(plist.contains("/Library/PrivilegedHelperTools/dev.wakezilla.client"));
     assert!(plist.contains("<string>--no-update-check</string>"));
     assert!(plist.contains("<string>client-server</string>"));
     assert!(plist.contains("<key>RunAtLoad</key>"));
     assert!(plist.contains("<key>StandardErrorPath</key>"));
     assert!(plist.contains("<key>StandardOutPath</key>"));
     assert!(plist.contains("/Library/Logs/wakezilla/dev.wakezilla.client.err.log"));
+    assert!(service::launchd_plist_uses_protected_binary(
+        Mode::Client,
+        &plist
+    ));
+
+    let legacy = plist.replace(
+        "/Library/PrivilegedHelperTools/dev.wakezilla.client",
+        "/Users/alice/Applications/Wakezilla.app/Contents/MacOS/wakezilla",
+    );
+    assert!(!service::launchd_plist_uses_protected_binary(
+        Mode::Client,
+        &legacy
+    ));
+}
+
+#[test]
+fn windows_image_path_validation_rejects_user_writable_legacy_binary() {
+    let program_files = Path::new("C:/Program Files");
+    let protected = service::windows_service_binary_path_in(program_files, Mode::Proxy);
+    assert!(service::windows_image_path_uses_protected_binary(
+        program_files,
+        Mode::Proxy,
+        &protected
+    ));
+    assert!(!service::windows_image_path_uses_protected_binary(
+        program_files,
+        Mode::Proxy,
+        Path::new(r"C:\Users\alice\AppData\Local\Wakezilla\wakezilla.exe")
+    ));
+}
+
+#[test]
+fn windows_protected_acl_contract_allows_only_system_and_administrators() {
+    let directory = service::windows_service_directory_sddl();
+    let file = service::windows_service_file_sddl();
+
+    assert_eq!(directory, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+    assert_eq!(file, "D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+    for unsafe_sid in [";;;BU", ";;;AU", ";;;WD"] {
+        assert!(!directory.contains(unsafe_sid));
+        assert!(!file.contains(unsafe_sid));
+    }
 }
 
 #[test]

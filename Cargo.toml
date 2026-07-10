@@ -8,7 +8,6 @@ desktop-tray = [
     "dep:arboard",
     "dep:base64",
     "dep:gtk",
-    "dep:libc",
     "dep:open",
     "dep:png",
     "dep:single-instance",
@@ -104,9 +103,17 @@ winit = { version = "0.30", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 single-instance = { version = "0.3.3", optional = true }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18.2", optional = true }

@@ -5846,6 +5846,7 @@ dependencies = [
  "wakezilla-common",
  "which",
  "windows-service",
+ "windows-sys 0.61.0",
  "winit",
 ]
 
