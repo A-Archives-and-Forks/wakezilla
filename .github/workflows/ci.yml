@@ -57,6 +57,9 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked --features desktop-tray -- -D warnings
 
+      - name: Run desktop tray library tests
+        run: xvfb-run -a cargo test -p wakezilla --locked --features desktop-tray --lib
+
       - name: Test desktop icon assets
         run: cargo test -p wakezilla --locked --features desktop-tray --test desktop_assets
 
@@ -96,6 +99,37 @@ jobs:
 
       - name: Run release package tests
         run: sh scripts/test-release-package.sh
+
+  macos-install-preflight:
+    name: macOS installer preflight
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check installer shell syntax with BSD userland
+        run: |
+          for script in \
+            install.sh \
+            scripts/test-install-sh.sh \
+            scripts/test-install-linux-real.sh
+          do
+            sh -n "$script"
+          done
+
+      - name: Run installer tests with BSD tar
+        run: sh scripts/test-install-sh.sh
+
+      - name: Prepare frontend assets for focused runtime tests
+        run: |
+          mkdir -p target/frontend-dist
+          printf '<!doctype html><html><head><title>wakezilla</title></head><body></body></html>\n' > target/frontend-dist/index.html
+
+      - name: Run focused Linux desktop runtime tests
+        run: cargo test -p wakezilla --locked --features desktop-tray --lib tray::desktop::tests::linux_
 
   windows:
     name: windows

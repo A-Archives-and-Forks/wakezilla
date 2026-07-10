@@ -77,6 +77,7 @@ done
 
 export WAKEZILLA_INSTALL_SH_TEST_MODE=1
 . "$ROOT_DIR/install.sh"
+unset WAKEZILLA_INSTALL_SH_TEST_MODE
 
 HOME=/root \
 SUDO_USER="$test_user" \

@@ -886,17 +886,35 @@ fn install_tray_autostart() -> Result<std::path::PathBuf> {
             )
         })?
     };
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
-        })
-        .context("HOME or XDG_CONFIG_HOME is required to install tray autostart")?;
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
+    let config_home = resolve_linux_config_home(xdg_config_home.as_deref(), home.as_deref())?;
     install_linux_tray_autostart_at(&config_home, &helper)
 }
 
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn resolve_linux_config_home(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    if let Some(path) = xdg_config_home
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+    {
+        return Ok(path.to_path_buf());
+    }
+    let home = home
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+        .context("absolute HOME or XDG_CONFIG_HOME is required to install tray autostart")?;
+    Ok(home.join(".config"))
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn install_linux_tray_autostart_at(config_home: &Path, helper: &Path) -> Result<PathBuf> {
+    let helper = helper
+        .to_str()
+        .context("wakezilla-tray path must be valid UTF-8 for a desktop entry")?;
     let autostart_dir = config_home.join("autostart");
     let mut directory_builder = std::fs::DirBuilder::new();
     directory_builder.recursive(true).mode(0o700);
@@ -914,20 +932,20 @@ fn install_linux_tray_autostart_at(config_home: &Path, helper: &Path) -> Result<
          Icon=dev.wakezilla.Wakezilla\n\
          Terminal=false\n\
          StartupNotify=false\n",
-        desktop_string_escape(&helper.to_string_lossy())?,
-        desktop_entry_quote(&helper.to_string_lossy())?,
+        desktop_string_escape(helper)?,
+        desktop_entry_quote(helper)?,
     );
     atomic_write_linux_autostart(&canonical, content.as_bytes())?;
 
     let legacy = autostart_dir.join("wakezilla-tray.desktop");
     if let Ok(metadata) = std::fs::symlink_metadata(&legacy) {
-        if metadata.file_type().is_file() {
-            let legacy_content = std::fs::read_to_string(&legacy)
-                .with_context(|| format!("failed to inspect {}", legacy.display()))?;
-            if linux_legacy_autostart_is_owned(&legacy_content) {
-                std::fs::remove_file(&legacy)
-                    .with_context(|| format!("failed to remove {}", legacy.display()))?;
-            }
+        if metadata.file_type().is_file()
+            && std::fs::read(&legacy).is_ok_and(|legacy_content| {
+                std::str::from_utf8(&legacy_content).is_ok_and(linux_legacy_autostart_is_owned)
+            })
+        {
+            std::fs::remove_file(&legacy)
+                .with_context(|| format!("failed to remove {}", legacy.display()))?;
         }
     }
     Ok(canonical)
@@ -1691,5 +1709,97 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(existing_mode, 0o755);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_config_home_requires_an_absolute_path_with_home_fallback() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            resolve_linux_config_home(Some(OsStr::new("/xdg/config")), Some(OsStr::new("/home/u")))
+                .expect("absolute XDG config home"),
+            PathBuf::from("/xdg/config")
+        );
+        for invalid_xdg in ["", "relative/config"] {
+            assert_eq!(
+                resolve_linux_config_home(
+                    Some(OsStr::new(invalid_xdg)),
+                    Some(OsStr::new("/home/u"))
+                )
+                .expect("absolute HOME fallback"),
+                PathBuf::from("/home/u/.config")
+            );
+        }
+        assert!(resolve_linux_config_home(None, Some(OsStr::new("relative-home"))).is_err());
+        assert!(resolve_linux_config_home(None, None).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_autostart_rejects_non_utf8_helper_before_publish() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let temp = tempfile::tempdir().expect("temporary config home");
+        let helper = temp.path().join(std::ffi::OsString::from_vec(vec![
+            b'w', b'a', b'k', b'e', b'z', b'i', b'l', b'l', b'a', b'-', 0xff,
+        ]));
+
+        assert!(install_linux_tray_autostart_at(temp.path(), &helper).is_err());
+        assert!(!temp
+            .path()
+            .join("autostart/dev.wakezilla.tray.desktop")
+            .exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_autostart_preserves_non_utf8_legacy_as_foreign() {
+        let temp = tempfile::tempdir().expect("temporary config home");
+        let helper = temp.path().join("wakezilla-tray");
+        std::fs::write(&helper, b"helper").expect("write helper fixture");
+        let autostart = temp.path().join("autostart");
+        std::fs::create_dir_all(&autostart).expect("create autostart fixture");
+        let legacy = autostart.join("wakezilla-tray.desktop");
+        let foreign = b"[Desktop Entry]\nType=Application\nName=Wakezilla Tray\nExec=/old/wakezilla-tray\n\xff";
+        std::fs::write(&legacy, foreign).expect("write non-UTF-8 legacy entry");
+
+        let canonical = install_linux_tray_autostart_at(temp.path(), &helper)
+            .expect("install with foreign non-UTF-8 legacy");
+
+        assert!(canonical.is_file());
+        assert_eq!(
+            std::fs::read(&legacy).expect("read preserved legacy"),
+            foreign
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_autostart_preserves_unreadable_legacy_as_foreign() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temporary config home");
+        let helper = temp.path().join("wakezilla-tray");
+        std::fs::write(&helper, b"helper").expect("write helper fixture");
+        let autostart = temp.path().join("autostart");
+        std::fs::create_dir_all(&autostart).expect("create autostart fixture");
+        let legacy = autostart.join("wakezilla-tray.desktop");
+        std::fs::write(
+            &legacy,
+            b"[Desktop Entry]\nType=Application\nName=Wakezilla Tray\nExec=/old/wakezilla-tray\n",
+        )
+        .expect("write legacy entry");
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o000))
+            .expect("make legacy unreadable");
+        if std::fs::read(&legacy).is_ok() {
+            return;
+        }
+
+        let canonical = install_linux_tray_autostart_at(temp.path(), &helper)
+            .expect("install with unreadable foreign legacy");
+
+        assert!(canonical.is_file());
+        assert!(legacy.exists());
     }
 }
