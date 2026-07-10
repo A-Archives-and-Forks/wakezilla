@@ -3,12 +3,14 @@ use anyhow::{anyhow, Context, Result};
 #[cfg(target_os = "windows")]
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use std::io::Cursor;
-#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::Write as _;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::MetadataExt;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -843,7 +845,7 @@ fn wakezilla_cli_exe() -> Result<PathBuf> {
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 fn wakezilla_tray_command() -> Result<(PathBuf, Vec<&'static str>)> {
     let exe = std::env::current_exe().context("failed to resolve wakezilla executable")?;
     if is_wakezilla_tray_exe(&exe) {
@@ -1107,36 +1109,225 @@ fn linux_desktop_exec_tokens(value: &str, limit: usize) -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 fn install_tray_autostart() -> Result<std::path::PathBuf> {
-    let (exe, args) = wakezilla_tray_command()?;
+    let executable = std::env::current_exe().context("failed to resolve wakezilla executable")?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .context("HOME is required to install tray autostart")?;
-    let launch_agents = home.join("Library/LaunchAgents");
-    std::fs::create_dir_all(&launch_agents)
-        .with_context(|| format!("failed to create {}", launch_agents.display()))?;
+    install_macos_tray_autostart_at(&home, &executable)
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_tray_autostart_at(home: &Path, executable: &Path) -> Result<PathBuf> {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    install_macos_tray_autostart_for_uid(home, executable, effective_uid)
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_tray_autostart_for_uid(
+    home: &Path,
+    executable: &Path,
+    effective_uid: libc::uid_t,
+) -> Result<PathBuf> {
+    if effective_uid == 0 {
+        anyhow::bail!("macOS tray autostart must be installed without sudo");
+    }
+    if !home.is_absolute() {
+        anyhow::bail!("HOME must be absolute to install macOS tray autostart");
+    }
+    let home_metadata = std::fs::symlink_metadata(home)
+        .with_context(|| format!("failed to inspect HOME {}", home.display()))?;
+    if !home_metadata.file_type().is_dir() || home_metadata.file_type().is_symlink() {
+        anyhow::bail!("HOME must be a real, non-symlink directory");
+    }
+    if home_metadata.uid() != effective_uid {
+        anyhow::bail!("HOME is not owned by the effective user");
+    }
+    let home = home
+        .canonicalize()
+        .with_context(|| format!("failed to resolve HOME {}", home.display()))?;
+    let bundle = macos_bundle_from_executable(executable)?;
+    let content = macos_launch_agent_content(&bundle)?;
+
+    let library = home.join("Library");
+    ensure_macos_profile_directory(&home, &library, effective_uid)?;
+    let launch_agents = library.join("LaunchAgents");
+    ensure_macos_profile_directory(&home, &launch_agents, effective_uid)?;
     let path = launch_agents.join("dev.wakezilla.tray.plist");
-    let content = format!(
+    atomic_write_macos_launch_agent(&path, content.as_bytes())?;
+    Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_from_executable(executable: &Path) -> Result<PathBuf> {
+    let executable = executable
+        .canonicalize()
+        .with_context(|| format!("failed to resolve executable {}", executable.display()))?;
+    if !executable.is_file() || !is_wakezilla_tray_exe(&executable) {
+        anyhow::bail!(
+            "macOS tray autostart requires a wakezilla-tray executable inside Wakezilla.app"
+        );
+    }
+    let macos = executable
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "MacOS"))
+        .context("wakezilla-tray is not inside a bundle Contents/MacOS directory")?;
+    let contents = macos
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "Contents"))
+        .context("wakezilla-tray is not inside a bundle Contents/MacOS directory")?;
+    let bundle = contents
+        .parent()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "app"))
+        .context("wakezilla-tray is not inside a macOS application bundle")?;
+    if !bundle.is_dir() {
+        anyhow::bail!("macOS application bundle is not a directory");
+    }
+    Ok(bundle.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_content(bundle: &Path) -> Result<String> {
+    let bundle = bundle
+        .to_str()
+        .context("Wakezilla.app path must be valid UTF-8 for a LaunchAgent")?;
+    let bundle = xml_escape(bundle)?;
+    Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\">\n\
          <dict>\n\
-         \t<key>Label</key>\n\
-         \t<string>dev.wakezilla.tray</string>\n\
-         \t<key>ProgramArguments</key>\n\
-         \t<array>\n\
-         \t\t<string>{}</string>\n\
-         {}\
-         \t</array>\n\
-         \t<key>RunAtLoad</key>\n\
-         \t<true/>\n\
+           <key>Label</key>\n\
+           <string>dev.wakezilla.tray</string>\n\
+           <key>ProgramArguments</key>\n\
+           <array>\n\
+             <string>/usr/bin/open</string>\n\
+             <string>-g</string>\n\
+             <string>{bundle}</string>\n\
+           </array>\n\
+           <key>RunAtLoad</key>\n\
+           <true/>\n\
+           <key>LimitLoadToSessionType</key>\n\
+           <string>Aqua</string>\n\
+           <key>ProcessType</key>\n\
+           <string>Interactive</string>\n\
+           <key>AssociatedBundleIdentifiers</key>\n\
+           <array>\n\
+             <string>dev.wakezilla.Wakezilla</string>\n\
+           </array>\n\
          </dict>\n\
-         </plist>\n",
-        xml_escape(&exe.to_string_lossy()),
-        plist_args(&args),
-    );
-    std::fs::write(&path, content)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(path)
+         </plist>\n"
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_profile_directory(
+    home: &Path,
+    directory: &Path,
+    effective_uid: libc::uid_t,
+) -> Result<()> {
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                anyhow::bail!("unsafe macOS profile directory: {}", directory.display());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(directory)
+                .with_context(|| format!("failed to create {}", directory.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", directory.display()));
+        }
+    }
+    let canonical = directory
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", directory.display()))?;
+    if !canonical.starts_with(home) || canonical == home {
+        anyhow::bail!(
+            "macOS profile directory escaped HOME: {}",
+            directory.display()
+        );
+    }
+    let owner = std::fs::metadata(&canonical)
+        .with_context(|| format!("failed to inspect {}", canonical.display()))?
+        .uid();
+    if owner != effective_uid {
+        anyhow::bail!(
+            "macOS profile directory is not owned by the effective user: {}",
+            directory.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct MacosAtomicTemp(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosAtomicTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn atomic_write_macos_launch_agent(path: &Path, content: &[u8]) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                anyhow::bail!(
+                    "refusing unsafe LaunchAgent destination: {}",
+                    path.display()
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    }
+    let directory = path.parent().context("LaunchAgent path has no parent")?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("LaunchAgent file name must be valid UTF-8")?;
+    let mut temporary = None;
+    let mut file = None;
+    for attempt in 0..100_u32 {
+        let candidate =
+            directory.join(format!(".{file_name}.tmp.{}.{attempt}", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(&candidate) {
+            Ok(opened) => {
+                temporary = Some(MacosAtomicTemp(candidate));
+                file = Some(opened);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to stage {}", path.display()));
+            }
+        }
+    }
+    let mut file = file.context("failed to allocate a unique LaunchAgent staging file")?;
+    let mut temporary = temporary.context("LaunchAgent staging path was not recorded")?;
+    file.write_all(content)
+        .with_context(|| format!("failed to stage {}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("failed to set mode on staged {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync staged {}", path.display()))?;
+    drop(file);
+    std::fs::rename(&temporary.0, path)
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    temporary.0 = PathBuf::new();
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1190,20 +1381,16 @@ fn reject_desktop_controls(value: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn plist_args(args: &[&str]) -> String {
-    args.iter()
-        .map(|arg| format!("\t\t<string>{}</string>\n", xml_escape(arg)))
-        .collect()
-}
-
-#[cfg(target_os = "macos")]
-fn xml_escape(value: &str) -> String {
-    value
+fn xml_escape(value: &str) -> Result<String> {
+    if value.chars().any(|character| character.is_ascii_control()) {
+        anyhow::bail!("LaunchAgent value contains an ASCII control character");
+    }
+    Ok(value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+        .replace('\'', "&apos;"))
 }
 
 #[cfg(target_os = "windows")]
@@ -1539,6 +1726,148 @@ mod tests {
             .expect_err("unexpected flock errno must fail closed");
 
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_autostart_uses_canonical_bundle_and_native_open_contract() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temporary macOS home parent");
+        let home = temp.path().join("Home & <Primary>");
+        let executable = home.join("Applications/Wakezilla.app/Contents/MacOS/wakezilla-tray");
+        std::fs::create_dir_all(executable.parent().expect("bundle executable parent"))
+            .expect("create bundle fixture");
+        std::fs::write(&executable, b"tray executable fixture")
+            .expect("write bundle executable fixture");
+
+        let installed = install_macos_tray_autostart_at(&home, &executable)
+            .expect("install native macOS LaunchAgent");
+        let canonical_home = home.canonicalize().expect("canonical fixture HOME");
+        assert_eq!(
+            installed,
+            canonical_home.join("Library/LaunchAgents/dev.wakezilla.tray.plist")
+        );
+        let bundle = executable
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("bundle fixture path")
+            .canonicalize()
+            .expect("canonical bundle fixture");
+        let content = std::fs::read_to_string(&installed).expect("read LaunchAgent");
+        for required in [
+            "<key>Label</key>",
+            "<string>dev.wakezilla.tray</string>",
+            "<key>ProgramArguments</key>",
+            "<string>/usr/bin/open</string>",
+            "<string>-g</string>",
+            "<key>RunAtLoad</key>\n<true/>",
+            "<key>LimitLoadToSessionType</key>",
+            "<string>Aqua</string>",
+            "<key>ProcessType</key>",
+            "<string>Interactive</string>",
+            "<key>AssociatedBundleIdentifiers</key>\n<array>\n<string>dev.wakezilla.Wakezilla</string>\n</array>",
+        ] {
+            assert!(content.contains(required), "missing contract: {required}");
+        }
+        assert!(content.contains(
+            &xml_escape(bundle.to_str().expect("UTF-8 bundle fixture"))
+                .expect("escape bundle path")
+        ));
+        assert!(!content.contains("KeepAlive"));
+        assert!(!content.contains("Terminal"));
+        assert!(!content.contains("wakezilla-tray</string>"));
+        assert!(!content.contains("/bin/sh"));
+        assert_eq!(
+            std::fs::metadata(&installed)
+                .expect("LaunchAgent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        let lint = std::process::Command::new("/usr/bin/plutil")
+            .args(["-lint"])
+            .arg(&installed)
+            .status()
+            .expect("run real plutil against runtime LaunchAgent");
+        assert!(
+            lint.success(),
+            "real plutil must accept runtime LaunchAgent"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_autostart_rejects_nonbundle_and_control_paths_before_publish() {
+        let temp = tempfile::tempdir().expect("temporary macOS fixture");
+        let home = temp.path().join("home");
+        std::fs::create_dir(&home).expect("create fixture HOME");
+        let loose_helper = temp.path().join("wakezilla-tray");
+        std::fs::write(&loose_helper, b"loose helper").expect("write loose helper");
+
+        assert!(install_macos_tray_autostart_at(&home, &loose_helper).is_err());
+        assert!(!home.join("Library").exists());
+        assert!(
+            install_macos_tray_autostart_at(Path::new("relative-home"), &loose_helper).is_err()
+        );
+        assert!(xml_escape("bad\npath").is_err());
+        assert!(xml_escape("bad\u{1b}path").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_autostart_rejects_root_and_wrong_owner_before_publish() {
+        let temp = tempfile::tempdir().expect("temporary macOS fixture");
+        let home = temp.path().join("home");
+        let executable = home.join("Applications/Wakezilla.app/Contents/MacOS/wakezilla-tray");
+        std::fs::create_dir_all(executable.parent().expect("bundle executable parent"))
+            .expect("create bundle fixture");
+        std::fs::write(&executable, b"tray executable fixture")
+            .expect("write bundle executable fixture");
+        let owner = std::fs::metadata(&home).expect("HOME metadata").uid();
+
+        assert!(install_macos_tray_autostart_for_uid(&home, &executable, 0).is_err());
+        assert!(!home.join("Library").exists());
+        assert!(install_macos_tray_autostart_for_uid(&home, &executable, owner + 1).is_err());
+        assert!(!home.join("Library").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_autostart_replaces_atomically_and_rejects_symlink_destination() {
+        let temp = tempfile::tempdir().expect("temporary macOS fixture");
+        let home = temp.path().join("home");
+        let executable = home.join("Applications/Wakezilla.app/Contents/MacOS/wakezilla-tray");
+        std::fs::create_dir_all(executable.parent().expect("bundle executable parent"))
+            .expect("create bundle fixture");
+        std::fs::write(&executable, b"tray executable fixture")
+            .expect("write bundle executable fixture");
+        let launch_agents = home.join("Library/LaunchAgents");
+        std::fs::create_dir_all(&launch_agents).expect("create LaunchAgents fixture");
+        let destination = launch_agents.join("dev.wakezilla.tray.plist");
+        std::fs::write(&destination, b"old contents").expect("write prior LaunchAgent");
+
+        install_macos_tray_autostart_at(&home, &executable)
+            .expect("atomically replace LaunchAgent");
+        let temporary_count = std::fs::read_dir(&launch_agents)
+            .expect("read LaunchAgents")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(temporary_count, 0);
+
+        std::fs::remove_file(&destination).expect("remove installed LaunchAgent");
+        let foreign = temp.path().join("foreign-agent");
+        std::fs::write(&foreign, b"foreign contents").expect("write foreign agent");
+        std::os::unix::fs::symlink(&foreign, &destination)
+            .expect("create LaunchAgent symlink fixture");
+        assert!(install_macos_tray_autostart_at(&home, &executable).is_err());
+        assert_eq!(
+            std::fs::read(&foreign).expect("read preserved foreign agent"),
+            b"foreign contents"
+        );
     }
 
     #[test]

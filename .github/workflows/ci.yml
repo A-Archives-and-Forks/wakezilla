@@ -112,24 +112,45 @@ jobs:
 
       - name: Check installer shell syntax with BSD userland
         run: |
-          for script in \
-            install.sh \
-            scripts/test-install-sh.sh \
-            scripts/test-install-linux-real.sh
-          do
-            sh -n "$script"
-          done
+          sh -n install.sh
+          sh -n scripts/test-install-sh.sh
+          sh -n scripts/test-install-linux-real.sh
+          sh -n scripts/release/package_archive.sh
+          sh -n scripts/test-release-package.sh
 
       - name: Run installer tests with BSD tar
         run: sh scripts/test-install-sh.sh
+
+      - name: Run release package tests with BSD tar
+        run: sh scripts/test-release-package.sh
+
+      - name: Validate generated macOS plists with real plutil
+        run: |
+          fixture=$(mktemp -d "$RUNNER_TEMP/wakezilla-plists.XXXXXX")
+          trap 'rm -rf "$fixture"' EXIT
+          WAKEZILLA_INSTALL_SH_TEST_MODE=1 . ./install.sh
+          versions=$(macos_bundle_versions 1.2.3-beta.4+ci.1)
+          short_version=$(printf '%s\n' "$versions" | sed -n '1p')
+          bundle_version=$(printf '%s\n' "$versions" | sed -n '2p')
+          write_macos_info_plist "$fixture/Info.plist" "$short_version" "$bundle_version"
+          write_macos_launch_agent_plist "$fixture/LaunchAgent.plist" \
+            "$fixture/Home & Team/Applications/Wakezilla.app"
+          /usr/bin/plutil -lint "$fixture/Info.plist"
+          /usr/bin/plutil -lint "$fixture/LaunchAgent.plist"
 
       - name: Prepare frontend assets for focused runtime tests
         run: |
           mkdir -p target/frontend-dist
           printf '<!doctype html><html><head><title>wakezilla</title></head><body></body></html>\n' > target/frontend-dist/index.html
 
-      - name: Run focused Linux desktop runtime tests
-        run: cargo test -p wakezilla --locked --features desktop-tray --lib tray::desktop::tests::linux_
+      - name: Run focused macOS desktop runtime tests
+        run: cargo test -p wakezilla --locked --features desktop-tray --lib tray::desktop::tests::macos_
+
+      - name: Check both macOS executables
+        run: cargo check -p wakezilla --locked --features desktop-tray --bin wakezilla --bin wakezilla-tray
+
+      - name: Build both macOS executables
+        run: cargo build -p wakezilla --locked --features desktop-tray --bin wakezilla --bin wakezilla-tray
 
   windows:
     name: windows

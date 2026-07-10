@@ -1707,13 +1707,572 @@ install_linux_desktop_integration() (
   fi
 )
 
-if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
-  return 0 2>/dev/null || exit 0
-fi
+macos_bundle_versions() (
+  macos_release_version="$1"
+  macos_without_build=${macos_release_version%%+*}
+  macos_numeric_version=${macos_without_build%%-*}
+  macos_prerelease=
+  case "$macos_without_build" in
+    *-*) macos_prerelease=${macos_without_build#*-} ;;
+  esac
+
+  macos_old_ifs=$IFS
+  IFS=.
+  set -- $macos_numeric_version
+  IFS=$macos_old_ifs
+  [ "$#" -eq 3 ] || exit 1
+  for macos_component do
+    case "$macos_component" in
+      ''|*[!0-9]*) exit 1 ;;
+    esac
+  done
+  macos_short_version="$1.$2.$3"
+  macos_bundle_version=$macos_short_version
+
+  if [ -n "$macos_prerelease" ]; then
+    macos_prerelease_name=${macos_prerelease%%.*}
+    macos_prerelease_tail=
+    case "$macos_prerelease" in
+      *.*) macos_prerelease_tail=${macos_prerelease#*.} ;;
+    esac
+    macos_prerelease_name=$(printf '%s' "$macos_prerelease_name" | tr '[:upper:]' '[:lower:]')
+    case "$macos_prerelease_name" in
+      a|alpha) macos_prerelease_suffix=a ;;
+      b|beta) macos_prerelease_suffix=b ;;
+      rc) macos_prerelease_suffix=fc ;;
+      *) macos_prerelease_suffix=d ;;
+    esac
+    macos_prerelease_number=${macos_prerelease_tail%%.*}
+    case "$macos_prerelease_number" in
+      ''|*[!0-9]*) macos_prerelease_number=1 ;;
+    esac
+    if [ "$macos_prerelease_number" -lt 1 ] || \
+       [ "$macos_prerelease_number" -gt 255 ]; then
+      macos_prerelease_number=1
+    fi
+    macos_bundle_version="${macos_short_version}${macos_prerelease_suffix}${macos_prerelease_number}"
+  fi
+
+  printf '%s\n%s\n' "$macos_short_version" "$macos_bundle_version"
+)
+
+macos_xml_escape() {
+  macos_xml_value="$1"
+  macos_xml_cr=$(printf '\r')
+  case "$macos_xml_value" in
+    *"$macos_xml_cr"*|*"
+"*) return 1 ;;
+  esac
+  if printf '%s' "$macos_xml_value" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+    return 1
+  fi
+  printf '%s' "$macos_xml_value" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\\\&apos;/g"
+  printf '\n'
+}
+
+write_macos_info_plist() {
+  macos_info_path="$1"
+  macos_short_version="$2"
+  macos_bundle_version="$3"
+  cat > "$macos_info_path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>Wakezilla</string>
+  <key>CFBundleExecutable</key>
+  <string>wakezilla-tray</string>
+  <key>CFBundleIconFile</key>
+  <string>Wakezilla.icns</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.wakezilla.Wakezilla</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>Wakezilla</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>$macos_short_version</string>
+  <key>CFBundleVersion</key>
+  <string>$macos_bundle_version</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.utilities</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+EOF
+  chmod 0644 "$macos_info_path"
+}
+
+write_macos_launch_agent_plist() {
+  macos_agent_path="$1"
+  macos_app_path="$2"
+  macos_escaped_app=$(macos_xml_escape "$macos_app_path") || return 1
+  cat > "$macos_agent_path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.wakezilla.tray</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/open</string>
+    <string>-g</string>
+    <string>$macos_escaped_app</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>dev.wakezilla.Wakezilla</string>
+  </array>
+</dict>
+</plist>
+EOF
+  chmod 0644 "$macos_agent_path"
+}
+
+macos_launchctl_failure_is_absent() {
+  macos_absent_status="$1"
+  macos_absent_output="$2"
+  [ "$macos_absent_status" -eq 113 ] && return 0
+  case "$macos_absent_output" in
+    *'Could not find service'*|*'Could not find domain'*|*'No such process'*) return 0 ;;
+  esac
+  return 1
+}
+
+validate_macos_home_for_uid() (
+  macos_validate_home="$1"
+  macos_validate_uid="$2"
+  case "$macos_validate_uid" in
+    0|''|*[!0-9]*) exit 1 ;;
+  esac
+  case "$macos_validate_home" in
+    /*) ;;
+    *) exit 1 ;;
+  esac
+  [ -d "$macos_validate_home" ] && [ ! -L "$macos_validate_home" ] || exit 1
+  macos_validate_physical=$(CDPATH= cd -- "$macos_validate_home" 2>/dev/null && pwd -P) || \
+    exit 1
+  macos_validate_owner=$(path_owner_uid "$macos_validate_physical") || exit 1
+  [ "$macos_validate_owner" = "$macos_validate_uid" ] || exit 1
+  printf '%s\n' "$macos_validate_physical"
+)
+
+install_macos_desktop_integration_at() (
+  macos_extract_dir="$1"
+  macos_bin_dir="$2"
+  macos_release_version="$3"
+  macos_home="$4"
+  macos_uid="$5"
+  macos_plutil="$6"
+  macos_launchctl="$7"
+
+  if [ "$macos_uid" = 0 ]; then
+    warn "macOS desktop installation must run without sudo; rerun as the target user"
+    exit 1
+  fi
+  macos_home_physical=$(validate_macos_home_for_uid "$macos_home" "$macos_uid") || {
+    warn "HOME must be absolute, physical, non-symlink, and owned by the current macOS user"
+    exit 1
+  }
+  case "$macos_bin_dir" in
+    /*) ;;
+    *) warn "BIN_DIR must be absolute for macOS desktop installation"; exit 1 ;;
+  esac
+  [ -d "$macos_bin_dir" ] && [ ! -L "$macos_bin_dir" ] || {
+    warn "BIN_DIR must be a real directory for macOS desktop installation"
+    exit 1
+  }
+  macos_bin_physical=$(CDPATH= cd -- "$macos_bin_dir" 2>/dev/null && pwd -P) || exit 1
+  macos_bin_owner=$(path_owner_uid "$macos_bin_physical") || {
+    warn "cannot verify BIN_DIR ownership for macOS desktop installation"
+    exit 1
+  }
+  [ "$macos_bin_owner" = "$macos_uid" ] || {
+    warn "BIN_DIR is not owned by the current macOS user"
+    exit 1
+  }
+  [ -x "$macos_plutil" ] && [ -x "$macos_launchctl" ] || {
+    warn "plutil and launchctl are required for macOS desktop installation"
+    exit 1
+  }
+
+  macos_cli_source="$macos_extract_dir/wakezilla"
+  macos_tray_source="$macos_extract_dir/wakezilla-tray"
+  macos_icon_source="$macos_extract_dir/Wakezilla.icns"
+  for macos_executable_source in "$macos_cli_source" "$macos_tray_source"; do
+    [ -f "$macos_executable_source" ] && [ ! -L "$macos_executable_source" ] && \
+      [ -x "$macos_executable_source" ] || {
+      warn "release archive lacks a regular executable macOS bundle binary"
+      exit 1
+    }
+  done
+  [ -f "$macos_icon_source" ] && [ ! -L "$macos_icon_source" ] || {
+    warn "release archive lacks Wakezilla.icns"
+    exit 1
+  }
+
+  macos_versions=$(macos_bundle_versions "$macos_release_version") || {
+    warn "release version cannot be represented in a macOS bundle"
+    exit 1
+  }
+  macos_short_version=$(printf '%s\n' "$macos_versions" | sed -n '1p')
+  macos_bundle_version=$(printf '%s\n' "$macos_versions" | sed -n '2p')
+  macos_applications="$macos_home_physical/Applications"
+  macos_launch_agents="$macos_home_physical/Library/LaunchAgents"
+  macos_app="$macos_applications/Wakezilla.app"
+  macos_agent="$macos_launch_agents/dev.wakezilla.tray.plist"
+  macos_cli_link="$macos_bin_physical/wakezilla"
+  macos_loose_helper="$macos_bin_physical/wakezilla-tray"
+
+  macos_validate_profile_directory() {
+    macos_profile_directory="$1"
+    [ -d "$macos_profile_directory" ] && [ ! -L "$macos_profile_directory" ] || return 1
+    macos_profile_physical=$(CDPATH= cd -- "$macos_profile_directory" 2>/dev/null && pwd -P) || \
+      return 1
+    case "$macos_profile_physical" in
+      "$macos_home_physical"/*) ;;
+      *) return 1 ;;
+    esac
+    macos_profile_owner=$(path_owner_uid "$macos_profile_physical") || return 1
+    [ "$macos_profile_owner" = "$macos_uid" ]
+  }
+
+  for macos_existing_profile_directory in \
+    "$macos_applications" "$macos_home_physical/Library" "$macos_launch_agents"; do
+    if [ -e "$macos_existing_profile_directory" ] || \
+       [ -L "$macos_existing_profile_directory" ]; then
+      macos_validate_profile_directory "$macos_existing_profile_directory" || {
+        warn "refusing unsafe macOS profile directory: $macos_existing_profile_directory"
+        exit 1
+      }
+    fi
+  done
+
+  if [ -L "$macos_app" ]; then
+    warn "refusing symlink destination at $macos_app"
+    exit 1
+  fi
+  macos_existing_bundle=no
+  if [ -e "$macos_app" ]; then
+    [ -d "$macos_app" ] || {
+      warn "refusing non-bundle destination at $macos_app"
+      exit 1
+    }
+    macos_existing_info="$macos_app/Contents/Info.plist"
+    [ -f "$macos_existing_info" ] && [ ! -L "$macos_existing_info" ] || {
+      warn "refusing unidentifiable existing Wakezilla.app"
+      exit 1
+    }
+    if macos_existing_id=$("$macos_plutil" -extract CFBundleIdentifier raw -o - \
+      "$macos_existing_info" 2>/dev/null); then
+      :
+    else
+      warn "refusing unidentifiable existing Wakezilla.app"
+      exit 1
+    fi
+    [ "$macos_existing_id" = dev.wakezilla.Wakezilla ] || {
+      warn "refusing foreign existing Wakezilla.app"
+      exit 1
+    }
+    macos_existing_bundle=yes
+  fi
+
+  for macos_leaf_target in "$macos_cli_link" "$macos_loose_helper" "$macos_agent"; do
+    if [ -e "$macos_leaf_target" ] && [ ! -f "$macos_leaf_target" ] && \
+       [ ! -L "$macos_leaf_target" ]; then
+      warn "refusing non-file macOS integration destination: $macos_leaf_target"
+      exit 1
+    fi
+  done
+  if [ -L "$macos_agent" ]; then
+    warn "refusing symlink LaunchAgent destination at $macos_agent"
+    exit 1
+  fi
+
+  umask 077
+  mkdir -p "$macos_applications" || exit 1
+  macos_validate_profile_directory "$macos_applications" || exit 1
+  mkdir -p "$macos_home_physical/Library" || exit 1
+  macos_validate_profile_directory "$macos_home_physical/Library" || exit 1
+  mkdir -p "$macos_launch_agents" || exit 1
+  macos_validate_profile_directory "$macos_launch_agents" || exit 1
+  macos_state_dir=
+  macos_stage_bundle=
+  macos_stage_agent=
+  macos_backup_bundle=
+  macos_setup_cleanup() {
+    macos_setup_status=$?
+    trap - 0 1 2 15
+    [ -z "${macos_stage_bundle:-}" ] || rm -rf "$macos_stage_bundle"
+    [ -z "${macos_stage_agent:-}" ] || rm -f "$macos_stage_agent"
+    [ -z "${macos_backup_bundle:-}" ] || rm -rf "$macos_backup_bundle"
+    [ -z "${macos_state_dir:-}" ] || rm -rf "$macos_state_dir"
+    exit "$macos_setup_status"
+  }
+  trap macos_setup_cleanup 0
+  trap 'exit 1' 1 2 15
+  macos_state_dir=$(mktemp -d "$macos_home_physical/.wakezilla-macos-install.XXXXXX") || exit 1
+  macos_stage_bundle=$(mktemp -d "$macos_applications/.Wakezilla.app.stage.XXXXXX") || exit 1
+  macos_stage_agent=$(mktemp "$macos_launch_agents/.dev.wakezilla.tray.plist.stage.XXXXXX") || exit 1
+  macos_backup_bundle=$(mktemp -d "$macos_applications/.Wakezilla.app.backup.XXXXXX") || exit 1
+  rmdir "$macos_backup_bundle" || exit 1
+
+  macos_transaction_active=no
+  macos_bundle_published=no
+  macos_cli_touched=no
+  macos_helper_touched=no
+  macos_agent_touched=no
+  macos_new_agent_bootstrap_attempted=no
+  macos_old_agent_loaded=no
+  macos_old_agent_unloaded=no
+  macos_gui_domain=no
+  macos_domain="gui/$macos_uid"
+
+  macos_snapshot_leaf() {
+    macos_snapshot_key="$1"
+    macos_snapshot_path="$2"
+    if [ -L "$macos_snapshot_path" ]; then
+      printf '%s' "$(readlink "$macos_snapshot_path")" > \
+        "$macos_state_dir/$macos_snapshot_key.link" || return 1
+    elif [ -f "$macos_snapshot_path" ]; then
+      cp -p "$macos_snapshot_path" "$macos_state_dir/$macos_snapshot_key.file" || return 1
+    elif [ -e "$macos_snapshot_path" ]; then
+      return 1
+    else
+      : > "$macos_state_dir/$macos_snapshot_key.missing" || return 1
+    fi
+  }
+
+  macos_atomic_symlink() {
+    macos_link_target="$1"
+    macos_link_path="$2"
+    macos_link_dir=${macos_link_path%/*}
+    macos_link_name=${macos_link_path##*/}
+    macos_link_temp=$(mktemp "$macos_link_dir/.${macos_link_name}.link.XXXXXX") || return 1
+    rm -f "$macos_link_temp" || return 1
+    if ! ln -s "$macos_link_target" "$macos_link_temp"; then
+      rm -f "$macos_link_temp"
+      return 1
+    fi
+    if ! mv -f "$macos_link_temp" "$macos_link_path"; then
+      rm -f "$macos_link_temp"
+      return 1
+    fi
+  }
+
+  macos_restore_leaf() {
+    macos_restore_key="$1"
+    macos_restore_path="$2"
+    if [ -f "$macos_state_dir/$macos_restore_key.file" ]; then
+      atomic_restore_file "$macos_state_dir/$macos_restore_key.file" "$macos_restore_path"
+    elif [ -f "$macos_state_dir/$macos_restore_key.link" ]; then
+      macos_atomic_symlink "$(cat "$macos_state_dir/$macos_restore_key.link")" \
+        "$macos_restore_path"
+    else
+      rm -f "$macos_restore_path"
+    fi
+  }
+
+  macos_rollback() {
+    macos_rollback_failed=no
+    set +e
+    if [ "$macos_new_agent_bootstrap_attempted" = yes ]; then
+      if macos_rollback_bootout_output=$("$macos_launchctl" bootout \
+        "$macos_domain" "$macos_agent" 2>&1); then
+        :
+      else
+        macos_rollback_bootout_status=$?
+        macos_launchctl_failure_is_absent \
+          "$macos_rollback_bootout_status" "$macos_rollback_bootout_output" || \
+          macos_rollback_failed=yes
+      fi
+    fi
+    [ "$macos_agent_touched" = no ] || \
+      macos_restore_leaf agent "$macos_agent" || macos_rollback_failed=yes
+    [ "$macos_helper_touched" = no ] || \
+      macos_restore_leaf helper "$macos_loose_helper" || macos_rollback_failed=yes
+    [ "$macos_cli_touched" = no ] || \
+      macos_restore_leaf cli "$macos_cli_link" || macos_rollback_failed=yes
+    if [ "$macos_bundle_published" = yes ]; then
+      rm -rf "$macos_app" || macos_rollback_failed=yes
+    fi
+    if [ -n "${macos_backup_bundle:-}" ] && [ -d "$macos_backup_bundle" ]; then
+      if [ -e "$macos_app" ] || [ -L "$macos_app" ]; then
+        rm -rf "$macos_app" || macos_rollback_failed=yes
+      fi
+      if [ -e "$macos_app" ] || [ -L "$macos_app" ]; then
+        macos_rollback_failed=yes
+      else
+        mv "$macos_backup_bundle" "$macos_app" || macos_rollback_failed=yes
+      fi
+    fi
+    if [ "$macos_gui_domain" = yes ] && [ "$macos_old_agent_unloaded" = yes ] && \
+       [ -f "$macos_agent" ]; then
+      "$macos_launchctl" bootstrap "$macos_domain" "$macos_agent" >/dev/null 2>&1 || \
+        macos_rollback_failed=yes
+    fi
+    set -e
+    [ "$macos_rollback_failed" = no ]
+  }
+
+  macos_cleanup() {
+    macos_cleanup_status=$?
+    macos_preserve_recovery=no
+    trap - 0 1 2 15
+    if [ "${macos_transaction_active:-no}" = yes ]; then
+      warn "macOS desktop installation failed; rolling back bundle and startup files"
+      if ! macos_rollback; then
+        warn "macOS rollback incomplete; manual recovery may be required"
+        macos_cleanup_status=1
+        macos_preserve_recovery=yes
+      fi
+    fi
+    [ -z "${macos_stage_bundle:-}" ] || rm -rf "$macos_stage_bundle"
+    [ -z "${macos_stage_agent:-}" ] || rm -f "$macos_stage_agent"
+    if [ "$macos_preserve_recovery" = yes ]; then
+      if [ -n "${macos_backup_bundle:-}" ] && [ -d "$macos_backup_bundle" ]; then
+        warn "previous Wakezilla.app preserved for recovery at $macos_backup_bundle"
+      fi
+      if [ -n "${macos_state_dir:-}" ] && [ -d "$macos_state_dir" ]; then
+        warn "macOS integration snapshots preserved for recovery at $macos_state_dir"
+      fi
+    else
+      [ -z "${macos_state_dir:-}" ] || rm -rf "$macos_state_dir"
+    fi
+    if [ "$macos_preserve_recovery" = no ] && \
+       [ -n "${macos_backup_bundle:-}" ] && [ -d "$macos_backup_bundle" ]; then
+      rm -rf "$macos_backup_bundle"
+    fi
+    exit "$macos_cleanup_status"
+  }
+  trap macos_cleanup 0
+  trap 'exit 1' 1 2 15
+
+  mkdir -p "$macos_stage_bundle/Contents/MacOS" \
+    "$macos_stage_bundle/Contents/Resources" || exit 1
+  cp "$macos_cli_source" "$macos_stage_bundle/Contents/MacOS/wakezilla" || exit 1
+  cp "$macos_tray_source" "$macos_stage_bundle/Contents/MacOS/wakezilla-tray" || exit 1
+  cp "$macos_icon_source" "$macos_stage_bundle/Contents/Resources/Wakezilla.icns" || exit 1
+  chmod 0755 "$macos_stage_bundle/Contents/MacOS/wakezilla" \
+    "$macos_stage_bundle/Contents/MacOS/wakezilla-tray" || exit 1
+  chmod 0644 "$macos_stage_bundle/Contents/Resources/Wakezilla.icns" || exit 1
+  write_macos_info_plist "$macos_stage_bundle/Contents/Info.plist" \
+    "$macos_short_version" "$macos_bundle_version" || exit 1
+  write_macos_launch_agent_plist "$macos_stage_agent" "$macos_app" || exit 1
+  "$macos_plutil" -lint "$macos_stage_bundle/Contents/Info.plist" >/dev/null || exit 1
+  "$macos_plutil" -lint "$macos_stage_agent" >/dev/null || exit 1
+
+  macos_snapshot_leaf cli "$macos_cli_link" || exit 1
+  macos_snapshot_leaf helper "$macos_loose_helper" || exit 1
+  macos_snapshot_leaf agent "$macos_agent" || exit 1
+
+  if macos_domain_output=$("$macos_launchctl" print "$macos_domain" 2>&1); then
+    macos_gui_domain=yes
+  else
+    macos_domain_status=$?
+    if macos_launchctl_failure_is_absent "$macos_domain_status" "$macos_domain_output"; then
+      macos_gui_domain=no
+    else
+      warn "failed to inspect the macOS GUI launchd domain"
+      exit 1
+    fi
+  fi
+  if [ "$macos_gui_domain" = yes ]; then
+    if macos_service_output=$("$macos_launchctl" print \
+      "$macos_domain/dev.wakezilla.tray" 2>&1); then
+      macos_old_agent_loaded=yes
+    else
+      macos_service_status=$?
+      if ! macos_launchctl_failure_is_absent "$macos_service_status" "$macos_service_output"; then
+        warn "failed to inspect the existing Wakezilla LaunchAgent"
+        exit 1
+      fi
+    fi
+  fi
+
+  macos_transaction_active=yes
+  if [ "$macos_existing_bundle" = yes ]; then
+    mv "$macos_app" "$macos_backup_bundle" || exit 1
+  fi
+  macos_bundle_published=yes
+  mv "$macos_stage_bundle" "$macos_app" || exit 1
+  macos_stage_bundle=
+
+  macos_cli_touched=yes
+  macos_atomic_symlink "$macos_app/Contents/MacOS/wakezilla" "$macos_cli_link" || exit 1
+  macos_helper_touched=yes
+  rm -f "$macos_loose_helper" || exit 1
+  macos_agent_touched=yes
+  mv -f "$macos_stage_agent" "$macos_agent" || exit 1
+  macos_stage_agent=
+
+  if [ "$macos_gui_domain" = yes ]; then
+    if [ "$macos_old_agent_loaded" = yes ]; then
+      macos_old_agent_unloaded=yes
+      if ! "$macos_launchctl" bootout "$macos_domain" "$macos_agent" >/dev/null; then
+        macos_old_agent_unloaded=no
+        exit 1
+      fi
+    fi
+    macos_new_agent_bootstrap_attempted=yes
+    "$macos_launchctl" bootstrap "$macos_domain" "$macos_agent" >/dev/null || exit 1
+    "$macos_launchctl" kickstart -k "$macos_domain/dev.wakezilla.tray" >/dev/null || exit 1
+    info "macOS desktop integration installed; Wakezilla tray launch requested"
+  else
+    warn "macOS desktop integration installed; the Wakezilla tray will start at the next graphical login"
+  fi
+  macos_transaction_active=no
+)
+
+install_macos_desktop_integration() {
+  macos_install_extract="$1"
+  macos_install_bin="$2"
+  macos_install_version="$3"
+  macos_install_uid=$(id -u 2>/dev/null || printf '')
+  install_macos_desktop_integration_at \
+    "$macos_install_extract" "$macos_install_bin" "$macos_install_version" \
+    "${HOME:-}" "$macos_install_uid" /usr/bin/plutil /bin/launchctl
+}
+
+run_installer_main_at() (
+installer_main_uid="$1"
+installer_macos_plutil="$2"
+installer_macos_launchctl="$3"
+shift 3
 
 parse_args "$@"
 check_dependencies
 target=$(detect_target)
+case "$target" in
+  *-apple-darwin)
+    case "$installer_main_uid" in
+      0) err "install" "macOS installation must run without sudo; rerun as your user" ;;
+      ''|*[!0-9]*) err "install" "cannot resolve the current macOS user ID" ;;
+    esac
+    validate_macos_home_for_uid "${HOME:-}" "$installer_main_uid" >/dev/null || \
+      err "install" "HOME must be absolute, physical, non-symlink, and owned by the current macOS user"
+    ;;
+esac
 requested_bin_dir=$(resolve_bin_dir)
 bin_dir=$(canonicalize_bin_dir "$requested_bin_dir") || \
   err "install" "failed to create or canonicalize install directory: $requested_bin_dir"
@@ -1797,10 +2356,18 @@ binary_rollback() {
   [ "$binary_rollback_failed" = no ]
 }
 
-binary_snapshot_target cli "$binary_cli_target" || \
-  err "install" "cannot snapshot existing CLI destination"
-binary_snapshot_target helper "$binary_helper_target" || \
-  err "install" "cannot snapshot existing tray helper destination"
+case "$target" in
+  *-apple-darwin)
+    # The bundle transaction snapshots and publishes the CLI symlink and stale
+    # helper. Never expose the archive binaries as loose macOS executables.
+    ;;
+  *)
+    binary_snapshot_target cli "$binary_cli_target" || \
+      err "install" "cannot snapshot existing CLI destination"
+    binary_snapshot_target helper "$binary_helper_target" || \
+      err "install" "cannot snapshot existing tray helper destination"
+    ;;
+esac
 
 if download_and_stage_target "$target"; then
   stage_status=0
@@ -1850,27 +2417,33 @@ INSTALLED_ASSET_URL=$STAGED_ASSET_URL
 FINAL_EXTRACT_DIR=$STAGED_EXTRACT_DIR
 installed_version=$STAGED_VERSION
 
-binary_transaction_active=yes
-binary_touched_targets="helper $binary_touched_targets"
-if [ -n "$STAGED_HELPER_FILE" ]; then
-  install_bin "$STAGED_HELPER_FILE" "$binary_helper_target" || \
-    err "install" "failed to install binary to $binary_helper_target"
-else
-  rm -f "$binary_helper_target" || \
-    err "install" "failed to remove stale tray helper at $binary_helper_target"
-fi
-binary_touched_targets="cli $binary_touched_targets"
-install_bin "$STAGED_BIN_FILE" "$binary_cli_target" || \
-  err "install" "failed to install binary to $binary_cli_target"
-
 case "$target" in
+  *-apple-darwin)
+    if ! install_macos_desktop_integration_at \
+      "$FINAL_EXTRACT_DIR" "$bin_dir" "$release_version" "${HOME:-}" \
+      "$installer_main_uid" "$installer_macos_plutil" "$installer_macos_launchctl"; then
+      err "integration" "failed to install macOS desktop integration"
+    fi
+    ;;
   *-unknown-linux-gnu|*-unknown-linux-musl)
+    binary_transaction_active=yes
+    binary_touched_targets="helper $binary_touched_targets"
+    if [ -n "$STAGED_HELPER_FILE" ]; then
+      install_bin "$STAGED_HELPER_FILE" "$binary_helper_target" || \
+        err "install" "failed to install binary to $binary_helper_target"
+    else
+      rm -f "$binary_helper_target" || \
+        err "install" "failed to remove stale tray helper at $binary_helper_target"
+    fi
+    binary_touched_targets="cli $binary_touched_targets"
+    install_bin "$STAGED_BIN_FILE" "$binary_cli_target" || \
+      err "install" "failed to install binary to $binary_cli_target"
     if ! install_linux_desktop_integration "$FINAL_EXTRACT_DIR" "$bin_dir"; then
       err "integration" "failed to install Linux desktop integration"
     fi
+    binary_transaction_active=no
     ;;
 esac
-binary_transaction_active=no
 
 if [ -n "$installed_version" ]; then
   info "installed $BIN_NAME v$installed_version to $bin_dir/$BIN_NAME"
@@ -1882,4 +2455,20 @@ info "resolved $BIN_NAME v$release_version"
 info "asset: $INSTALLED_ASSET_URL"
 info "install dir: $bin_dir"
 path_guidance "$bin_dir"
-offer_sudo_symlink "$bin_dir"
+case "$target" in
+  *-apple-darwin) ;;
+  *) offer_sudo_symlink "$bin_dir" ;;
+esac
+)
+
+run_installer_main() {
+  installer_euid=$(id -u 2>/dev/null || printf '')
+  run_installer_main_at \
+    "$installer_euid" /usr/bin/plutil /bin/launchctl "$@"
+}
+
+if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+run_installer_main "$@"

@@ -198,6 +198,109 @@ write_linux_integration_fixture() {
   done
 }
 
+write_macos_integration_fixture() {
+  extract_dir="$1"
+  mkdir -p "$extract_dir"
+  printf 'macos cli bytes\n' > "$extract_dir/wakezilla"
+  printf 'macos tray bytes\n' > "$extract_dir/wakezilla-tray"
+  printf 'macos icon bytes\n' > "$extract_dir/Wakezilla.icns"
+  chmod 0755 "$extract_dir/wakezilla" "$extract_dir/wakezilla-tray"
+  chmod 0644 "$extract_dir/Wakezilla.icns"
+}
+
+write_fake_plutil() {
+  command_path="$1"
+  cat > "$command_path" <<'SH'
+#!/usr/bin/env sh
+set -eu
+if [ -n "${WAKEZILLA_MACOS_PLUTIL_LOG:-}" ]; then
+  first=yes
+  for argument do
+    if [ "$first" = yes ]; then
+      printf '%s' "$argument" >> "$WAKEZILLA_MACOS_PLUTIL_LOG"
+      first=no
+    else
+      printf '|%s' "$argument" >> "$WAKEZILLA_MACOS_PLUTIL_LOG"
+    fi
+  done
+  printf '\n' >> "$WAKEZILLA_MACOS_PLUTIL_LOG"
+fi
+case "${1:-}" in
+  -lint)
+    plist_path="$2"
+    grep -F '<plist version="1.0">' "$plist_path" >/dev/null
+    grep -F '</plist>' "$plist_path" >/dev/null
+    ;;
+  -extract)
+    key="$2"
+    shift 5
+    plist_path="$1"
+    awk -v wanted="<key>$key</key>" '
+      index($0, wanted) {
+        if (getline <= 0) exit 1
+        value = $0
+        sub(/^.*<string>/, "", value)
+        sub(/<\/string>.*$/, "", value)
+        print value
+        found = 1
+        exit 0
+      }
+      END { if (!found) exit 1 }
+    ' "$plist_path"
+    ;;
+  *) exit 91 ;;
+esac
+SH
+  chmod 0755 "$command_path"
+}
+
+write_fake_launchctl() {
+  command_path="$1"
+  cat > "$command_path" <<'SH'
+#!/usr/bin/env sh
+set -eu
+action="${1:-}"
+if [ -n "${WAKEZILLA_MACOS_LAUNCHCTL_LOG:-}" ]; then
+  printf '%s' "$action" >> "$WAKEZILLA_MACOS_LAUNCHCTL_LOG"
+  shift
+  for argument do
+    printf '|%s' "$argument" >> "$WAKEZILLA_MACOS_LAUNCHCTL_LOG"
+  done
+  printf '\n' >> "$WAKEZILLA_MACOS_LAUNCHCTL_LOG"
+  set -- "$action" "$@"
+fi
+case "$action" in
+  print)
+    case "${2:-}" in
+      */dev.wakezilla.tray)
+        if [ "${WAKEZILLA_MACOS_OLD_AGENT_LOADED:-no}" = yes ]; then
+          exit 0
+        fi
+        printf '%s\n' 'Could not find service' >&2
+        exit 113
+        ;;
+      gui/*)
+        case "${WAKEZILLA_MACOS_GUI_DOMAIN:-present}" in
+          present) exit 0 ;;
+          absent) printf '%s\n' 'Could not find domain' >&2; exit 113 ;;
+          *) printf '%s\n' 'unexpected launchctl domain failure' >&2; exit 70 ;;
+        esac
+        ;;
+    esac
+    ;;
+  bootout|bootstrap|kickstart)
+    if [ "${WAKEZILLA_MACOS_FAIL_LAUNCHCTL:-}" = "$action" ]; then
+      printf 'injected %s failure\n' "$action" >&2
+      exit 72
+    fi
+    exit 0
+    ;;
+esac
+exit 90
+SH
+  chmod 0755 "$command_path"
+}
+
 write_linux_release_archive() {
   archive_path="$1"
   version_status="$2"
@@ -420,6 +523,202 @@ EOF
     fi
   done
 
+  rm -rf "$temp_dir"
+}
+
+test_end_to_end_macos_main_publishes_bundle_transaction_only() {
+  temp_dir=$(mktemp -d)
+  tools_dir="$temp_dir/tools"
+  archive_dir="$temp_dir/archive"
+  home_dir="$temp_dir/home"
+  bin_dir="$temp_dir/install-bin"
+  curl_log="$temp_dir/curl.log"
+  launchctl_log="$temp_dir/launchctl.log"
+  plutil_log="$temp_dir/plutil.log"
+  mkdir -p "$tools_dir" "$archive_dir" "$home_dir" "$bin_dir"
+  test_uid=$(id -u)
+  write_install_dependency_stubs "$tools_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+
+  cat > "$archive_dir/wakezilla" <<'SH'
+#!/usr/bin/env sh
+if [ "$#" -eq 1 ] && [ "${1:-}" = "--version" ]; then
+  printf 'wakezilla 0.1.49\n'
+  exit 0
+fi
+exit 97
+SH
+  printf '#!/usr/bin/env sh\nexit 0\n' > "$archive_dir/wakezilla-tray"
+  printf 'macos e2e icon bytes\n' > "$archive_dir/Wakezilla.icns"
+  chmod 0755 "$archive_dir/wakezilla" "$archive_dir/wakezilla-tray"
+  archive="$temp_dir/wakezilla-0.1.49-aarch64-apple-darwin.tar.gz"
+  tar -C "$archive_dir" -czf "$archive" wakezilla wakezilla-tray Wakezilla.icns
+  checksum=$(sha256_file "$archive") || {
+    printf 'SKIP: macOS end-to-end fixture requires sha256sum or shasum\n'
+    rm -rf "$temp_dir"
+    return 0
+  }
+  printf '%s  %s\n' "$checksum" "${archive##*/}" > "$temp_dir/SHA256SUMS"
+  cat > "$temp_dir/release.json" <<'EOF'
+{
+  "tag_name": "v0.1.49",
+  "assets": [
+    {
+      "name": "wakezilla-0.1.49-aarch64-apple-darwin.tar.gz",
+      "browser_download_url": "https://example.test/wakezilla-0.1.49-aarch64-apple-darwin.tar.gz"
+    }
+  ]
+}
+EOF
+  cat > "$tools_dir/curl" <<SH
+#!/usr/bin/env sh
+set -eu
+out=
+url=
+while [ "\$#" -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    -H) shift 2 ;;
+    -*) shift ;;
+    *) url="\$1"; shift ;;
+  esac
+done
+printf '%s\n' "\$url" >> '$curl_log'
+case "\$url" in
+  https://api.github.com/repos/guibeira/wakezilla/releases/tags/v0.1.49)
+    cat '$temp_dir/release.json' ;;
+  https://example.test/wakezilla-0.1.49-aarch64-apple-darwin.tar.gz)
+    cp '$archive' "\$out" ;;
+  https://github.com/guibeira/wakezilla/releases/download/v0.1.49/SHA256SUMS)
+    cp '$temp_dir/SHA256SUMS' "\$out" ;;
+  *) exit 91 ;;
+esac
+SH
+  chmod 0755 "$tools_dir/curl"
+
+  : > "$curl_log"
+  root_output="$temp_dir/root-output"
+  set +e
+  PATH="$tools_dir:$PATH" HOME="$home_dir" BIN_DIR="$temp_dir/root-bin" \
+    TARGET=aarch64-apple-darwin WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    sh -c '. "$1"; run_installer_main_at "$2" "$3" "$4" "$5"' \
+      sh "$SCRIPT" 0 "$tools_dir/plutil" "$tools_dir/launchctl" 0.1.49 \
+      > "$root_output" 2>&1
+  root_status=$?
+  set -e
+  if [ "$root_status" -eq 0 ]; then
+    fail "macOS main root refusal: expected fatal status"
+  fi
+  assert_contains "$(cat "$root_output")" 'without sudo' \
+    "macOS main root refusal guidance"
+  assert_eq "" "$(cat "$curl_log")" "macOS main root refusal happens before download"
+  if [ -e "$temp_dir/root-bin" ]; then
+    fail "macOS main root refusal: created BIN_DIR before rejection"
+  fi
+
+  real_home="$temp_dir/real-home"
+  linked_home="$temp_dir/linked-home"
+  mkdir -p "$real_home"
+  ln -s "$real_home" "$linked_home"
+  : > "$curl_log"
+  set +e
+  PATH="$tools_dir:$PATH" HOME="$linked_home" BIN_DIR= \
+    TARGET=aarch64-apple-darwin WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    sh -c '. "$1"; run_installer_main_at "$2" "$3" "$4" "$5"' \
+      sh "$SCRIPT" "$(id -u)" "$tools_dir/plutil" "$tools_dir/launchctl" 0.1.49 \
+      > "$temp_dir/symlink-home-output" 2>&1
+  unsafe_home_status=$?
+  set -e
+  if [ "$unsafe_home_status" -eq 0 ]; then
+    fail "macOS main symlink HOME: expected fatal status"
+  fi
+  if [ -e "$real_home/.local" ]; then
+    fail "macOS main symlink HOME: wrote default BIN_DIR before rejection"
+  fi
+  assert_eq "" "$(cat "$curl_log")" "macOS main symlink HOME rejected before download"
+
+  : > "$curl_log"
+  wrong_uid=$((test_uid + 1))
+  set +e
+  PATH="$tools_dir:$PATH" HOME="$home_dir" BIN_DIR= \
+    TARGET=aarch64-apple-darwin WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    sh -c '. "$1"; run_installer_main_at "$2" "$3" "$4" "$5"' \
+      sh "$SCRIPT" "$wrong_uid" "$tools_dir/plutil" "$tools_dir/launchctl" 0.1.49 \
+      > "$temp_dir/owner-home-output" 2>&1
+  unsafe_home_status=$?
+  set -e
+  if [ "$unsafe_home_status" -eq 0 ]; then
+    fail "macOS main unowned HOME: expected fatal status"
+  fi
+  if [ -e "$home_dir/.local" ]; then
+    fail "macOS main unowned HOME: wrote default BIN_DIR before rejection"
+  fi
+  assert_eq "" "$(cat "$curl_log")" "macOS main unowned HOME rejected before download"
+
+  : > "$curl_log"
+  : > "$launchctl_log"
+  : > "$plutil_log"
+  output_file="$temp_dir/install-output"
+  set +e
+  PATH="$tools_dir:$PATH" HOME="$home_dir" BIN_DIR="$bin_dir" \
+    TARGET=aarch64-apple-darwin WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    WAKEZILLA_MACOS_PLUTIL_LOG="$plutil_log" \
+    WAKEZILLA_MACOS_LAUNCHCTL_LOG="$launchctl_log" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=present WAKEZILLA_SUDO_SYMLINK=no \
+    sh -c '. "$1"; run_installer_main_at "$2" "$3" "$4" "$5"' \
+      sh "$SCRIPT" "$test_uid" "$tools_dir/plutil" "$tools_dir/launchctl" 0.1.49 \
+      > "$output_file" 2>&1
+  install_status=$?
+  set -e
+  assert_eq "0" "$install_status" "macOS main end-to-end exit status"
+  home_physical=$(CDPATH= cd -- "$home_dir" && pwd -P)
+  bin_physical=$(CDPATH= cd -- "$bin_dir" && pwd -P)
+  app="$home_physical/Applications/Wakezilla.app"
+  agent="$home_physical/Library/LaunchAgents/dev.wakezilla.tray.plist"
+  if [ ! -d "$app" ] || [ ! -f "$agent" ]; then
+    fail "macOS main end-to-end: expected bundle and LaunchAgent"
+  fi
+  if [ ! -L "$bin_physical/wakezilla" ]; then
+    fail "macOS main end-to-end: CLI endpoint must be a symlink, not a loose binary"
+  else
+    assert_eq "$app/Contents/MacOS/wakezilla" "$(readlink "$bin_physical/wakezilla")" \
+      "macOS main end-to-end bundle CLI endpoint"
+  fi
+  if [ -e "$bin_physical/wakezilla-tray" ] || [ -L "$bin_physical/wakezilla-tray" ]; then
+    fail "macOS main end-to-end: loose tray helper remained"
+  fi
+  launch_contents=$(cat "$agent" 2>/dev/null || printf '')
+  assert_contains "$launch_contents" '<string>/usr/bin/open</string>' \
+    "macOS main end-to-end graphical opener"
+  assert_contains "$launch_contents" '<string>-g</string>' \
+    "macOS main end-to-end background launch"
+  assert_not_contains "$launch_contents" 'Terminal' \
+    "macOS main end-to-end never opens Terminal"
+  assert_contains "$(cat "$output_file")" 'installed wakezilla v0.1.49' \
+    "macOS main end-to-end installed version"
+
+  reinstall_output="$temp_dir/reinstall-output"
+  set +e
+  PATH="$tools_dir:$PATH" HOME="$home_dir" BIN_DIR="$bin_dir" \
+    TARGET=aarch64-apple-darwin WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    WAKEZILLA_MACOS_PLUTIL_LOG="$plutil_log" \
+    WAKEZILLA_MACOS_LAUNCHCTL_LOG="$launchctl_log" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=present WAKEZILLA_MACOS_OLD_AGENT_LOADED=yes \
+    WAKEZILLA_SUDO_SYMLINK=no \
+    sh -c '. "$1"; run_installer_main_at "$2" "$3" "$4" "$5"' \
+      sh "$SCRIPT" "$test_uid" "$tools_dir/plutil" "$tools_dir/launchctl" 0.1.49 \
+      > "$reinstall_output" 2>&1
+  reinstall_status=$?
+  set -e
+  assert_eq "0" "$reinstall_status" "macOS full-main reinstall accepts bundle CLI symlink"
+  assert_eq "$app/Contents/MacOS/wakezilla" "$(readlink "$bin_physical/wakezilla")" \
+    "macOS full-main reinstall preserves bundle CLI endpoint"
+  if [ -e "$bin_physical/wakezilla-tray" ] || [ -L "$bin_physical/wakezilla-tray" ]; then
+    fail "macOS full-main reinstall: loose tray helper remained"
+  fi
+  assert_contains "$(cat "$launchctl_log")" \
+    "bootout|gui/$test_uid|$agent" "macOS full-main reinstall unloads prior agent"
   rm -rf "$temp_dir"
 }
 
@@ -900,6 +1199,7 @@ test_mode_sources_cleanly() {
 test_help_includes_required_docs
 test_no_args_resolves_release_metadata
 test_end_to_end_install_with_fake_curl
+test_end_to_end_macos_main_publishes_bundle_transaction_only
 test_linux_integration_uses_final_musl_fallback_extract_once
 test_linux_fallback_rejects_unrunnable_musl_without_publication
 test_end_to_end_rejects_malicious_archive_before_extracting
@@ -3027,6 +3327,605 @@ test_atomic_install_file_rejects_directory_destination() {
   rm -rf "$temp_dir"
 }
 
+test_macos_integration_helpers_defined() {
+  missing=0
+  assert_command_exists macos_bundle_versions "macOS bundle version normalizer" || missing=1
+  assert_command_exists install_macos_desktop_integration_at \
+    "macOS desktop integration helper" || missing=1
+  [ "$missing" -eq 0 ]
+}
+
+test_macos_bundle_version_normalization() {
+  versions=$(macos_bundle_versions 1.2.3-beta.4+build.9)
+  short_version=$(printf '%s\n' "$versions" | sed -n '1p')
+  bundle_version=$(printf '%s\n' "$versions" | sed -n '2p')
+  assert_eq "1.2.3" "$short_version" "macOS prerelease short version"
+  assert_eq "1.2.3b4" "$bundle_version" "macOS prerelease bundle version"
+
+  versions=$(macos_bundle_versions 2.0.0-rc.7)
+  assert_eq "2.0.0fc7" "$(printf '%s\n' "$versions" | sed -n '2p')" \
+    "macOS release-candidate bundle version"
+  versions=$(macos_bundle_versions 3.4.5)
+  assert_eq "3.4.5" "$(printf '%s\n' "$versions" | sed -n '2p')" \
+    "macOS stable bundle version"
+}
+
+test_macos_bundle_contract_and_gui_activation() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/Home & <Primary>"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin with spaces"
+  tools_dir="$temp_dir/tools"
+  plutil_log="$temp_dir/plutil.log"
+  launchctl_log="$temp_dir/launchctl.log"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  : > "$plutil_log"
+  : > "$launchctl_log"
+  home_physical=$(CDPATH= cd -- "$home_dir" && pwd -P)
+  test_uid=$(id -u)
+
+  output=$(WAKEZILLA_MACOS_PLUTIL_LOG="$plutil_log" \
+    WAKEZILLA_MACOS_LAUNCHCTL_LOG="$launchctl_log" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=present \
+    install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3-beta.4+build.9 \
+      "$home_dir" "$test_uid" "$tools_dir/plutil" "$tools_dir/launchctl" 2>&1)
+
+  app="$home_physical/Applications/Wakezilla.app"
+  info_plist="$app/Contents/Info.plist"
+  launch_agent="$home_physical/Library/LaunchAgents/dev.wakezilla.tray.plist"
+  expected_files='Contents/Info.plist
+Contents/MacOS/wakezilla
+Contents/MacOS/wakezilla-tray
+Contents/Resources/Wakezilla.icns'
+  actual_files=$(CDPATH= cd -- "$app" && find Contents -type f -print | sort)
+  assert_eq "$expected_files" "$actual_files" "macOS exact bundle files"
+  assert_eq "755" "$(portable_file_mode "$app/Contents/MacOS/wakezilla")" \
+    "macOS bundle CLI mode"
+  assert_eq "755" "$(portable_file_mode "$app/Contents/MacOS/wakezilla-tray")" \
+    "macOS bundle tray mode"
+  assert_eq "644" "$(portable_file_mode "$info_plist")" "macOS Info.plist mode"
+  assert_eq "644" "$(portable_file_mode "$app/Contents/Resources/Wakezilla.icns")" \
+    "macOS bundle icon mode"
+  assert_eq "644" "$(portable_file_mode "$launch_agent")" "macOS LaunchAgent mode"
+  if ! cmp -s "$extract_dir/wakezilla" "$app/Contents/MacOS/wakezilla" || \
+     ! cmp -s "$extract_dir/wakezilla-tray" "$app/Contents/MacOS/wakezilla-tray" || \
+     ! cmp -s "$extract_dir/Wakezilla.icns" "$app/Contents/Resources/Wakezilla.icns"; then
+    fail "macOS bundle assets: expected byte-identical files"
+  fi
+
+  for plist_contract in \
+    '<key>CFBundleExecutable</key>' '<string>wakezilla-tray</string>' \
+    '<key>CFBundleIdentifier</key>' '<string>dev.wakezilla.Wakezilla</string>' \
+    '<key>CFBundleName</key>' '<string>Wakezilla</string>' \
+    '<key>CFBundleDisplayName</key>' '<key>CFBundleIconFile</key>' \
+    '<string>Wakezilla.icns</string>' '<key>CFBundlePackageType</key>' \
+    '<string>APPL</string>' '<key>CFBundleShortVersionString</key>' \
+    '<string>1.2.3</string>' '<key>CFBundleVersion</key>' \
+    '<string>1.2.3b4</string>' '<key>LSUIElement</key>' '<true/>' \
+    '<key>CFBundleInfoDictionaryVersion</key>' '<string>6.0</string>' \
+    '<key>LSApplicationCategoryType</key>' \
+    '<string>public.app-category.utilities</string>'; do
+    assert_contains "$(cat "$info_plist")" "$plist_contract" \
+      "macOS Info.plist contract $plist_contract"
+  done
+
+  launch_contents=$(cat "$launch_agent")
+  for launch_contract in \
+    '<key>Label</key>' '<string>dev.wakezilla.tray</string>' \
+    '<key>ProgramArguments</key>' '<string>/usr/bin/open</string>' \
+    '<string>-g</string>' '<key>RunAtLoad</key>' \
+    '<key>LimitLoadToSessionType</key>' '<string>Aqua</string>' \
+    '<key>ProcessType</key>' '<string>Interactive</string>' \
+    '<key>AssociatedBundleIdentifiers</key>' \
+    '<string>dev.wakezilla.Wakezilla</string>' '&amp;' '&lt;'; do
+    assert_contains "$launch_contents" "$launch_contract" \
+      "macOS LaunchAgent contract $launch_contract"
+  done
+  assert_not_contains "$launch_contents" '<key>KeepAlive</key>' \
+    "macOS LaunchAgent omits KeepAlive"
+  assert_not_contains "$launch_contents" 'Terminal' "macOS LaunchAgent omits Terminal"
+  assert_not_contains "$launch_contents" '/bin/sh' "macOS LaunchAgent omits shell"
+  assert_contains "$launch_contents" '<key>RunAtLoad</key>
+  <true/>' "macOS LaunchAgent RunAtLoad boolean"
+  assert_contains "$launch_contents" '<key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>dev.wakezilla.Wakezilla</string>
+  </array>' "macOS LaunchAgent associated bundle array"
+
+  cli_link="$bin_dir/wakezilla"
+  if [ ! -L "$cli_link" ]; then
+    fail "macOS CLI endpoint: expected symlink"
+  else
+    assert_eq "$app/Contents/MacOS/wakezilla" "$(readlink "$cli_link")" \
+      "macOS CLI absolute bundle symlink"
+  fi
+  if [ -e "$bin_dir/wakezilla-tray" ] || [ -L "$bin_dir/wakezilla-tray" ]; then
+    fail "macOS loose tray helper: expected removal"
+  fi
+  plutil_calls=$(cat "$plutil_log")
+  assert_contains "$plutil_calls" \
+    "-lint|$home_physical/Applications/.Wakezilla.app.stage." \
+    "macOS staged Info.plist lint"
+  assert_contains "$plutil_calls" '/Contents/Info.plist' \
+    "macOS staged Info.plist lint path"
+  assert_contains "$plutil_calls" \
+    "-lint|$home_physical/Library/LaunchAgents/.dev.wakezilla.tray.plist.stage." \
+    "macOS staged LaunchAgent lint"
+  launchctl_calls=$(cat "$launchctl_log")
+  assert_contains "$launchctl_calls" "print|gui/$test_uid" "macOS GUI domain lookup"
+  assert_contains "$launchctl_calls" "print|gui/$test_uid/dev.wakezilla.tray" \
+    "macOS prior agent lookup"
+  assert_contains "$launchctl_calls" "bootstrap|gui/$test_uid|$launch_agent" \
+    "macOS LaunchAgent bootstrap"
+  assert_contains "$launchctl_calls" "kickstart|-k|gui/$test_uid/dev.wakezilla.tray" \
+    "macOS immediate tray kickstart"
+  assert_contains "$output" "launch requested" "macOS graphical launch wording"
+
+  if command -v plutil >/dev/null 2>&1 && [ "$(uname -s 2>/dev/null || true)" = Darwin ]; then
+    plutil -lint "$info_plist" >/dev/null || fail "macOS real plutil rejected Info.plist"
+    plutil -lint "$launch_agent" >/dev/null || fail "macOS real plutil rejected LaunchAgent"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_macos_headless_install_keeps_launch_agent() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  launchctl_log="$temp_dir/launchctl.log"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  : > "$launchctl_log"
+  home_physical=$(CDPATH= cd -- "$home_dir" && pwd -P)
+  test_uid=$(id -u)
+
+  output=$(WAKEZILLA_MACOS_LAUNCHCTL_LOG="$launchctl_log" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=absent \
+    install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" 2>&1)
+
+  if [ ! -f "$home_dir/Library/LaunchAgents/dev.wakezilla.tray.plist" ]; then
+    fail "macOS headless install: expected persistent LaunchAgent"
+  fi
+  assert_contains "$output" "next graphical login" "macOS headless next-login warning"
+  assert_not_contains "$(cat "$launchctl_log")" 'bootstrap|' \
+    "macOS headless skips bootstrap"
+  assert_not_contains "$(cat "$launchctl_log")" 'kickstart|' \
+    "macOS headless skips kickstart"
+  rm -rf "$temp_dir"
+}
+
+test_macos_rejects_root_unsafe_home_and_invalid_assets_before_writes() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  test_uid=$(id -u)
+
+  if output=$(install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" 0 \
+    "$tools_dir/plutil" "$tools_dir/launchctl" 2>&1); then
+    fail "macOS root install: expected rejection"
+  else
+    assert_contains "$output" "without sudo" "macOS root rerun guidance"
+  fi
+  if [ -e "$home_dir/Applications" ] || [ -e "$home_dir/Library" ]; then
+    fail "macOS root install: expected no profile publication"
+  fi
+
+  if install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 relative-home "$test_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS relative HOME: expected rejection"
+  fi
+  real_home="$temp_dir/real-home"
+  linked_home="$temp_dir/linked-home"
+  mkdir -p "$real_home"
+  ln -s "$real_home" "$linked_home"
+  if install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$linked_home" "$test_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS symlink HOME: expected rejection"
+  fi
+
+  rm -f "$extract_dir/Wakezilla.icns"
+  if install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS missing icon: expected rejection"
+  fi
+  if [ -e "$home_dir/Applications" ] || [ -e "$home_dir/Library" ]; then
+    fail "macOS invalid assets: expected validation before profile writes"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_macos_rejects_foreign_or_symlink_bundle_without_unrelated_deletion() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  app="$home_dir/Applications/Wakezilla.app"
+  mkdir -p "$app/Contents" "$bin_dir" "$tools_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  test_uid=$(id -u)
+  cat > "$app/Contents/Info.plist" <<'EOF'
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key>
+<string>com.example.Foreign</string>
+</dict></plist>
+EOF
+  printf 'foreign sentinel\n' > "$app/foreign-sentinel"
+  if install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS foreign bundle: expected rejection"
+  fi
+  assert_eq "foreign sentinel" "$(cat "$app/foreign-sentinel")" \
+    "macOS foreign bundle preserved"
+
+  rm -rf "$app"
+  outside="$temp_dir/outside-app"
+  mkdir -p "$outside"
+  printf 'outside sentinel\n' > "$outside/sentinel"
+  ln -s "$outside" "$app"
+  if install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS bundle destination symlink: expected rejection"
+  fi
+  assert_eq "outside sentinel" "$(cat "$outside/sentinel")" \
+    "macOS bundle symlink target preserved"
+  rm -rf "$temp_dir"
+}
+
+test_macos_rejects_wrong_owner_and_symlinked_profile_destinations() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  outside_dir="$temp_dir/outside"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir" "$outside_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  test_uid=$(id -u)
+  wrong_uid=$((test_uid + 1))
+
+  if install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$wrong_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS HOME ownership: expected UID mismatch rejection"
+  fi
+  if [ -e "$home_dir/Applications" ] || [ -e "$home_dir/Library" ]; then
+    fail "macOS HOME ownership: expected rejection before profile writes"
+  fi
+
+  for symlink_case in Applications Library LaunchAgents; do
+    rm -rf "$home_dir/Applications" "$home_dir/Library" "$outside_dir"
+    mkdir -p "$outside_dir"
+    printf 'outside sentinel\n' > "$outside_dir/sentinel"
+    case "$symlink_case" in
+      Applications)
+        ln -s "$outside_dir" "$home_dir/Applications"
+        ;;
+      Library)
+        ln -s "$outside_dir" "$home_dir/Library"
+        ;;
+      LaunchAgents)
+        mkdir -p "$home_dir/Library"
+        ln -s "$outside_dir" "$home_dir/Library/LaunchAgents"
+        ;;
+    esac
+    if install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+      fail "macOS $symlink_case parent symlink: expected rejection"
+    fi
+    outside_count=$(find "$outside_dir" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')
+    assert_eq "1" "$outside_count" "macOS $symlink_case parent symlink containment"
+  done
+
+  rm -rf "$home_dir/Applications" "$home_dir/Library" "$outside_dir"
+  mkdir -p "$home_dir/Library/LaunchAgents" "$outside_dir"
+  printf 'foreign agent bytes\n' > "$outside_dir/foreign-agent"
+  ln -s "$outside_dir/foreign-agent" \
+    "$home_dir/Library/LaunchAgents/dev.wakezilla.tray.plist"
+  if install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS LaunchAgent destination symlink: expected rejection"
+  fi
+  assert_eq "foreign agent bytes" "$(cat "$outside_dir/foreign-agent")" \
+    "macOS foreign LaunchAgent symlink target preserved"
+  rm -rf "$temp_dir"
+}
+
+test_macos_launchctl_partial_failure_rolls_back_loaded_state() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  launchctl_log="$temp_dir/launchctl.log"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  test_uid=$(id -u)
+
+  WAKEZILLA_MACOS_GUI_DOMAIN=absent install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1
+
+  : > "$launchctl_log"
+  if WAKEZILLA_MACOS_LAUNCHCTL_LOG="$launchctl_log" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=present WAKEZILLA_MACOS_OLD_AGENT_LOADED=yes \
+    WAKEZILLA_MACOS_FAIL_LAUNCHCTL=bootstrap \
+    install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS partial bootstrap failure: expected fatal status"
+  fi
+  bootout_count=$(grep -c '^bootout|' "$launchctl_log" 2>/dev/null || true)
+  assert_eq "2" "$bootout_count" \
+    "macOS partial bootstrap rollback attempts new-agent bootout"
+  bootstrap_count=$(grep -c '^bootstrap|' "$launchctl_log" 2>/dev/null || true)
+  assert_eq "2" "$bootstrap_count" \
+    "macOS partial bootstrap rollback reloads previously unloaded agent"
+
+  : > "$launchctl_log"
+  if WAKEZILLA_MACOS_LAUNCHCTL_LOG="$launchctl_log" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=present WAKEZILLA_MACOS_OLD_AGENT_LOADED=yes \
+    WAKEZILLA_MACOS_FAIL_LAUNCHCTL=bootout \
+    install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS old-agent bootout failure: expected fatal status"
+  fi
+  assert_not_contains "$(cat "$launchctl_log")" 'bootstrap|' \
+    "macOS failed old-agent bootout does not spuriously bootstrap"
+  rm -rf "$temp_dir"
+}
+
+test_macos_failed_existing_bundle_move_preserves_original() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  test_uid=$(id -u)
+
+  WAKEZILLA_MACOS_GUI_DOMAIN=absent install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1
+  home_physical=$(CDPATH= cd -- "$home_dir" && pwd -P)
+  app="$home_physical/Applications/Wakezilla.app"
+  printf 'original bundle sentinel\n' > "$app/original-sentinel"
+  original_cli=$(cat "$app/Contents/MacOS/wakezilla")
+  real_mv=$(command -v mv)
+  cat > "$tools_dir/mv" <<SH
+#!/usr/bin/env sh
+if [ "\${1:-}" = "\${WAKEZILLA_TEST_FAIL_MOVE_SOURCE:-}" ]; then
+  exit 73
+fi
+exec '$real_mv' "\$@"
+SH
+  chmod 0755 "$tools_dir/mv"
+
+  if PATH="$tools_dir:$PATH" WAKEZILLA_TEST_FAIL_MOVE_SOURCE="$app" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=absent install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS failed existing bundle move: expected fatal status"
+  fi
+  assert_eq "original bundle sentinel" "$(cat "$app/original-sentinel" 2>/dev/null || printf '')" \
+    "macOS failed existing bundle move preserves original bundle"
+  assert_eq "$original_cli" "$(cat "$app/Contents/MacOS/wakezilla" 2>/dev/null || printf '')" \
+    "macOS failed existing bundle move preserves original CLI"
+  backup_count=$(find "$home_physical/Applications" -maxdepth 1 \
+    -name '.Wakezilla.app.backup.*' -print | wc -l | tr -d ' ')
+  assert_eq "0" "$backup_count" "macOS failed existing bundle move cleans backup placeholder"
+  rm -rf "$temp_dir"
+}
+
+test_macos_incomplete_bundle_restore_preserves_recovery_backup() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  test_uid=$(id -u)
+
+  WAKEZILLA_MACOS_GUI_DOMAIN=absent install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1
+  home_physical=$(CDPATH= cd -- "$home_dir" && pwd -P)
+  app="$home_physical/Applications/Wakezilla.app"
+  printf 'recoverable old bundle\n' > "$app/recovery-sentinel"
+  real_mv=$(command -v mv)
+  cat > "$tools_dir/mv" <<SH
+#!/usr/bin/env sh
+case "\${1:-}" in
+  */.Wakezilla.app.backup.*) exit 74 ;;
+esac
+exec '$real_mv' "\$@"
+SH
+  chmod 0755 "$tools_dir/mv"
+
+  if PATH="$tools_dir:$PATH" WAKEZILLA_MACOS_GUI_DOMAIN=present \
+    WAKEZILLA_MACOS_OLD_AGENT_LOADED=yes WAKEZILLA_MACOS_FAIL_LAUNCHCTL=kickstart \
+    install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS incomplete bundle restore: expected fatal status"
+  fi
+  backup=$(find "$home_physical/Applications" -maxdepth 1 -type d \
+    -name '.Wakezilla.app.backup.*' -print | head -n 1)
+  if [ -z "$backup" ]; then
+    fail "macOS incomplete bundle restore: recovery backup was deleted"
+  else
+    assert_eq "recoverable old bundle" "$(cat "$backup/recovery-sentinel")" \
+      "macOS incomplete bundle restore keeps prior bundle bytes"
+  fi
+  recovery_count=$(find "$home_physical" -maxdepth 1 -type d \
+    -name '.wakezilla-macos-install.*' -print | wc -l | tr -d ' ')
+  assert_eq "1" "$recovery_count" \
+    "macOS incomplete bundle restore keeps integration snapshots"
+  rm -rf "$temp_dir"
+}
+
+test_macos_setup_failure_cleans_staged_siblings() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  mktemp_count="$temp_dir/mktemp-count"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  test_uid=$(id -u)
+  printf '0\n' > "$mktemp_count"
+  real_mktemp=$(command -v mktemp)
+  cat > "$tools_dir/mktemp" <<SH
+#!/usr/bin/env sh
+count=\$(cat "\$WAKEZILLA_TEST_MKTEMP_COUNT")
+count=\$((count + 1))
+printf '%s\n' "\$count" > "\$WAKEZILLA_TEST_MKTEMP_COUNT"
+if [ "\$count" -eq 3 ]; then
+  exit 75
+fi
+exec '$real_mktemp' "\$@"
+SH
+  chmod 0755 "$tools_dir/mktemp"
+
+  if PATH="$tools_dir:$PATH" WAKEZILLA_TEST_MKTEMP_COUNT="$mktemp_count" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=absent install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS setup mktemp failure: expected fatal status"
+  fi
+  temporary_count=$(find "$home_dir" \
+    \( -name '.wakezilla-macos-install.*' -o -name '.Wakezilla.app.stage.*' \
+       -o -name '.Wakezilla.app.backup.*' -o -name '.dev.wakezilla.tray.plist.stage.*' \) \
+    -print | wc -l | tr -d ' ')
+  assert_eq "0" "$temporary_count" "macOS setup mktemp failure cleans staged siblings"
+  rm -rf "$temp_dir"
+}
+
+test_macos_reinstall_is_idempotent_and_rolls_back_late_failure() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  launchctl_log="$temp_dir/launchctl.log"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  : > "$launchctl_log"
+  home_physical=$(CDPATH= cd -- "$home_dir" && pwd -P)
+  test_uid=$(id -u)
+
+  WAKEZILLA_MACOS_LAUNCHCTL_LOG="$launchctl_log" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=present \
+    install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null
+  printf 'macos cli second bytes\n' > "$extract_dir/wakezilla"
+  printf 'macos tray second bytes\n' > "$extract_dir/wakezilla-tray"
+  WAKEZILLA_MACOS_LAUNCHCTL_LOG="$launchctl_log" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=present WAKEZILLA_MACOS_OLD_AGENT_LOADED=yes \
+    install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null
+  app="$home_physical/Applications/Wakezilla.app"
+  assert_eq "macos cli second bytes" "$(cat "$app/Contents/MacOS/wakezilla")" \
+    "macOS idempotent bundle replacement"
+  assert_contains "$(cat "$launchctl_log")" \
+    "bootout|gui/$test_uid|$home_physical/Library/LaunchAgents/dev.wakezilla.tray.plist" \
+    "macOS idempotent old agent bootout"
+  temporary_count=$(find "$home_dir/Applications" "$home_dir/Library/LaunchAgents" \
+    -name '.Wakezilla*' -o -name '.dev.wakezilla.tray*' | wc -l | tr -d ' ')
+  assert_eq "0" "$temporary_count" "macOS idempotent temporary cleanup"
+
+  old_cli=$(cat "$app/Contents/MacOS/wakezilla")
+  old_tray=$(cat "$app/Contents/MacOS/wakezilla-tray")
+  old_info=$(cat "$app/Contents/Info.plist")
+  old_icon=$(cat "$app/Contents/Resources/Wakezilla.icns")
+  launch_agent="$home_physical/Library/LaunchAgents/dev.wakezilla.tray.plist"
+  old_agent=$(cat "$launch_agent")
+  old_link=$(readlink "$bin_dir/wakezilla")
+  rm -f "$bin_dir/wakezilla"
+  ln -s "$temp_dir/prior-cli-target" "$bin_dir/wakezilla"
+  prior_link=$(readlink "$bin_dir/wakezilla")
+  printf 'prior loose helper\n' > "$bin_dir/wakezilla-tray"
+  chmod 0640 "$bin_dir/wakezilla-tray"
+  printf 'macos cli failed bytes\n' > "$extract_dir/wakezilla"
+  printf 'macos tray failed bytes\n' > "$extract_dir/wakezilla-tray"
+
+  set +e
+  output=$(WAKEZILLA_MACOS_LAUNCHCTL_LOG="$launchctl_log" \
+    WAKEZILLA_MACOS_GUI_DOMAIN=present WAKEZILLA_MACOS_OLD_AGENT_LOADED=yes \
+    WAKEZILLA_MACOS_FAIL_LAUNCHCTL=kickstart \
+    install_macos_desktop_integration_at \
+      "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+      "$tools_dir/plutil" "$tools_dir/launchctl" 2>&1)
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fail "macOS late kickstart failure: expected fatal status"
+  fi
+  assert_eq "$old_cli" "$(cat "$app/Contents/MacOS/wakezilla")" \
+    "macOS rollback bundle CLI bytes"
+  assert_eq "$old_tray" "$(cat "$app/Contents/MacOS/wakezilla-tray")" \
+    "macOS rollback bundle tray bytes"
+  assert_eq "$old_info" "$(cat "$app/Contents/Info.plist")" \
+    "macOS rollback Info.plist bytes"
+  assert_eq "$old_icon" "$(cat "$app/Contents/Resources/Wakezilla.icns")" \
+    "macOS rollback icon bytes"
+  assert_eq "$old_agent" "$(cat "$launch_agent")" \
+    "macOS rollback LaunchAgent bytes"
+  assert_eq "$prior_link" "$(readlink "$bin_dir/wakezilla")" \
+    "macOS rollback prior CLI symlink"
+  assert_eq "prior loose helper" "$(cat "$bin_dir/wakezilla-tray")" \
+    "macOS rollback loose helper bytes"
+  assert_eq "640" "$(portable_file_mode "$bin_dir/wakezilla-tray")" \
+    "macOS rollback loose helper mode"
+  assert_not_contains "$(readlink "$bin_dir/wakezilla")" "$old_link" \
+    "macOS rollback restores immediate preinstall symlink state"
+  rm -rf "$temp_dir"
+}
+
 if test_linux_desktop_integration_helpers_defined; then
   test_linux_desktop_integration_writes_xdg_entries_headless
   test_desktop_exec_quote_escapes_reserved_characters
@@ -3064,6 +3963,20 @@ if test_linux_desktop_resolution_helpers_defined; then
   test_resolve_linux_desktop_dir_treats_home_as_disabled
   test_linux_desktop_copy_and_gio_trust_are_best_effort
   test_linux_integration_removes_only_owned_legacy_autostart
+fi
+
+if test_macos_integration_helpers_defined; then
+  test_macos_bundle_version_normalization
+  test_macos_bundle_contract_and_gui_activation
+  test_macos_headless_install_keeps_launch_agent
+  test_macos_rejects_root_unsafe_home_and_invalid_assets_before_writes
+  test_macos_rejects_foreign_or_symlink_bundle_without_unrelated_deletion
+  test_macos_rejects_wrong_owner_and_symlinked_profile_destinations
+  test_macos_launchctl_partial_failure_rolls_back_loaded_state
+  test_macos_failed_existing_bundle_move_preserves_original
+  test_macos_incomplete_bundle_restore_preserves_recovery_backup
+  test_macos_setup_failure_cleans_staged_siblings
+  test_macos_reinstall_is_idempotent_and_rolls_back_late_failure
 fi
 
 if [ "$failures" -ne 0 ]; then
