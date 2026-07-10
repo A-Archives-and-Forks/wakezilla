@@ -28,6 +28,10 @@ die() {
 require_file() {
     required_file=$1
 
+    if [ -L "$required_file" ]; then
+        die "required artifact must not be a symbolic link: $required_file"
+    fi
+
     if [ ! -f "$required_file" ] || [ ! -s "$required_file" ]; then
         die "missing required artifact: $required_file"
     fi

@@ -49,6 +49,14 @@ assert_mode_0755() {
     assert_equal '755' "$mode" "$mode_path must have mode 0755"
 }
 
+assert_regular_files() {
+    for regular_path in "$@"; do
+        if [ ! -f "$regular_path" ] || [ -L "$regular_path" ]; then
+            fail "archive member must be a regular file: $regular_path"
+        fi
+    done
+}
+
 assert_archive_members() {
     members_archive=$1
     shift
@@ -74,6 +82,25 @@ assert_only_archive_output() {
 
     assert_equal "$archive_name" "$output_listing" \
         "$output_dir must contain only $archive_name"
+}
+
+assert_directory_members() {
+    members_dir=$1
+    shift
+    expected_directory_members=$TMP_ROOT/expected-directory-members.txt
+    actual_directory_members=$TMP_ROOT/actual-directory-members.txt
+
+    printf '%s\n' "$@" | LC_ALL=C sort > "$expected_directory_members"
+    LC_ALL=C ls -1A "$members_dir" | LC_ALL=C sort > "$actual_directory_members"
+
+    if ! cmp "$expected_directory_members" "$actual_directory_members" \
+        >/dev/null 2>&1; then
+        printf 'Expected directory members:\n' >&2
+        sed 's/^/  /' "$expected_directory_members" >&2
+        printf 'Actual directory members:\n' >&2
+        sed 's/^/  /' "$actual_directory_members" >&2
+        fail "$members_dir has an unexpected member list"
+    fi
 }
 
 assert_directory_empty() {
@@ -147,6 +174,12 @@ run_linux_case() (
         icons/hicolor/256x256/apps/dev.wakezilla.Wakezilla.png
 
     tar -xzf "$archive_path" -C "$extract_dir"
+    assert_regular_files \
+        "$extract_dir/wakezilla" \
+        "$extract_dir/wakezilla-tray" \
+        "$extract_dir/icons/hicolor/48x48/apps/dev.wakezilla.Wakezilla.png" \
+        "$extract_dir/icons/hicolor/128x128/apps/dev.wakezilla.Wakezilla.png" \
+        "$extract_dir/icons/hicolor/256x256/apps/dev.wakezilla.Wakezilla.png"
     assert_same_file "$build_dir/wakezilla" "$extract_dir/wakezilla"
     assert_same_file "$build_dir/wakezilla-tray" "$extract_dir/wakezilla-tray"
     assert_mode_0755 "$extract_dir/wakezilla"
@@ -190,6 +223,10 @@ run_macos_case() (
     assert_archive_members "$archive_path" wakezilla wakezilla-tray Wakezilla.icns
 
     tar -xzf "$archive_path" -C "$extract_dir"
+    assert_regular_files \
+        "$extract_dir/wakezilla" \
+        "$extract_dir/wakezilla-tray" \
+        "$extract_dir/Wakezilla.icns"
     assert_same_file "$build_dir/wakezilla" "$extract_dir/wakezilla"
     assert_same_file "$build_dir/wakezilla-tray" "$extract_dir/wakezilla-tray"
     assert_mode_0755 "$extract_dir/wakezilla"
@@ -230,6 +267,11 @@ run_windows_case() (
         uninstall-wakezilla.ps1
 
     tar -xzf "$archive_path" -C "$extract_dir"
+    assert_regular_files \
+        "$extract_dir/wakezilla.exe" \
+        "$extract_dir/wakezilla-tray.exe" \
+        "$extract_dir/wakezilla.ico" \
+        "$extract_dir/uninstall-wakezilla.ps1"
     assert_same_file "$build_dir/wakezilla.exe" "$extract_dir/wakezilla.exe"
     assert_same_file "$build_dir/wakezilla-tray.exe" "$extract_dir/wakezilla-tray.exe"
     assert_same_file "$REPO_ROOT/assets/desktop/wakezilla.ico" \
@@ -331,5 +373,114 @@ assert_equal 'preserve this directory' "$(sed -n '1p' "$directory_sentinel")" \
 assert_no_package_temps "$directory_output"
 assert_only_archive_output "$directory_output" "$directory_archive_name"
 printf 'ok - archive destination directories are rejected\n'
+
+symlink_build=$TMP_ROOT/symlink\ artifact\ build
+symlink_output=$TMP_ROOT/symlink\ artifact\ output
+symlink_external_dir=$TMP_ROOT/symlink\ external\ source
+symlink_target=x86_64-unknown-linux-gnu
+symlink_archive_name=wakezilla-$VERSION-$symlink_target.tar.gz
+symlink_expected_archive=$TMP_ROOT/symlink\ expected\ archive
+symlink_expected_sentinel=$TMP_ROOT/symlink\ expected\ sentinel
+make_unix_build "$symlink_build"
+mkdir -p "$symlink_output" "$symlink_external_dir"
+symlink_build=$(CDPATH= cd "$symlink_build" && pwd)
+symlink_output=$(CDPATH= cd "$symlink_output" && pwd)
+symlink_archive=$symlink_output/$symlink_archive_name
+symlink_sentinel=$symlink_output/unrelated\ sentinel.txt
+printf 'external executable bytes\n' > "$symlink_external_dir/wakezilla"
+rm "$symlink_build/wakezilla"
+ln -s "$symlink_external_dir/wakezilla" "$symlink_build/wakezilla"
+printf 'previous release archive\n' > "$symlink_expected_archive"
+printf 'preserve unrelated output\n' > "$symlink_expected_sentinel"
+cp "$symlink_expected_archive" "$symlink_archive"
+cp "$symlink_expected_sentinel" "$symlink_sentinel"
+if symlink_message=$(
+    cd "$FOREIGN_CWD"
+    sh "$PACKAGER" "$VERSION" "$symlink_target" \
+        "$symlink_build" "$symlink_output" 2>&1
+); then
+    fail 'symbolic-link build artifact unexpectedly succeeded'
+fi
+case $symlink_message in
+    *'required artifact must not be a symbolic link:'*"$symlink_build/wakezilla"*) ;;
+    *) fail "symbolic-link artifact error was not clear: $symlink_message" ;;
+esac
+assert_same_file "$symlink_expected_archive" "$symlink_archive"
+assert_same_file "$symlink_expected_sentinel" "$symlink_sentinel"
+assert_no_package_temps "$symlink_output"
+assert_directory_members "$symlink_output" \
+    "$symlink_archive_name" \
+    'unrelated sentinel.txt'
+printf 'ok - symbolic-link artifacts are rejected\n'
+
+replace_build=$TMP_ROOT/replace\ existing\ build
+replace_output=$TMP_ROOT/replace\ existing\ output
+replace_target=x86_64-apple-darwin
+replace_archive_name=wakezilla-$VERSION-$replace_target.tar.gz
+replace_archive=$replace_output/$replace_archive_name
+replace_sentinel=$replace_output/unrelated\ sentinel.txt
+replace_expected_old=$TMP_ROOT/replace\ expected\ old\ archive
+replace_expected_sentinel=$TMP_ROOT/replace\ expected\ sentinel
+make_unix_build "$replace_build"
+mkdir -p "$replace_output"
+printf 'previous release archive\n' > "$replace_expected_old"
+printf 'preserve unrelated output\n' > "$replace_expected_sentinel"
+cp "$replace_expected_old" "$replace_archive"
+cp "$replace_expected_sentinel" "$replace_sentinel"
+(
+    cd "$FOREIGN_CWD"
+    sh "$PACKAGER" "$VERSION" "$replace_target" \
+        "$replace_build" "$replace_output"
+)
+if cmp "$replace_expected_old" "$replace_archive" >/dev/null 2>&1; then
+    fail 'successful packaging did not replace the previous archive'
+fi
+assert_archive_members "$replace_archive" wakezilla wakezilla-tray Wakezilla.icns
+assert_same_file "$replace_expected_sentinel" "$replace_sentinel"
+assert_no_package_temps "$replace_output"
+assert_directory_members "$replace_output" \
+    "$replace_archive_name" \
+    'unrelated sentinel.txt'
+printf 'ok - existing archives are atomically replaced\n'
+
+tar_failure_build=$TMP_ROOT/tar\ failure\ build
+tar_failure_output=$TMP_ROOT/tar\ failure\ output
+tar_failure_bin=$TMP_ROOT/tar\ failure\ tools
+tar_failure_target=x86_64-apple-darwin
+tar_failure_archive_name=wakezilla-$VERSION-$tar_failure_target.tar.gz
+tar_failure_archive=$tar_failure_output/$tar_failure_archive_name
+tar_failure_sentinel=$tar_failure_output/unrelated\ sentinel.txt
+tar_failure_expected_archive=$TMP_ROOT/tar\ failure\ expected\ archive
+tar_failure_expected_sentinel=$TMP_ROOT/tar\ failure\ expected\ sentinel
+make_unix_build "$tar_failure_build"
+mkdir -p "$tar_failure_output" "$tar_failure_bin"
+printf 'previous release archive\n' > "$tar_failure_expected_archive"
+printf 'preserve unrelated output\n' > "$tar_failure_expected_sentinel"
+cp "$tar_failure_expected_archive" "$tar_failure_archive"
+cp "$tar_failure_expected_sentinel" "$tar_failure_sentinel"
+printf '%s\n' \
+    '#!/bin/sh' \
+    "printf '%s\\n' 'intentional fake tar failure' >&2" \
+    'exit 42' \
+    > "$tar_failure_bin/tar"
+chmod 0755 "$tar_failure_bin/tar"
+if tar_failure_message=$(
+    cd "$FOREIGN_CWD"
+    PATH="$tar_failure_bin:$PATH" sh "$PACKAGER" "$VERSION" \
+        "$tar_failure_target" "$tar_failure_build" "$tar_failure_output" 2>&1
+); then
+    fail 'injected tar failure unexpectedly succeeded'
+fi
+case $tar_failure_message in
+    *'intentional fake tar failure'*) ;;
+    *) fail "injected tar error was not clear: $tar_failure_message" ;;
+esac
+assert_same_file "$tar_failure_expected_archive" "$tar_failure_archive"
+assert_same_file "$tar_failure_expected_sentinel" "$tar_failure_sentinel"
+assert_no_package_temps "$tar_failure_output"
+assert_directory_members "$tar_failure_output" \
+    "$tar_failure_archive_name" \
+    'unrelated sentinel.txt'
+printf 'ok - tar failures preserve existing output\n'
 
 printf 'All release package tests passed.\n'
