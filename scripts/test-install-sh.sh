@@ -121,12 +121,16 @@ if [ -n "$output" ]; then
     *)
       temp_dir=$(mktemp -d)
       mkdir -p "$temp_dir/archive"
-      if [ "${WAKEZILLA_FAKE_VERSION_EXITS_NONZERO:-}" = "1" ]; then
-        printf '#!/usr/bin/env sh\nif [ "${1:-}" = "--no-update-check" ] && [ "${2:-}" = "--version" ]; then\n  printf "wakezilla 0.1.49\\n"\n  exit 1\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
+      if [ "${WAKEZILLA_FAKE_HISTORICAL_VERSION_ONLY:-}" = "1" ]; then
+        printf '#!/usr/bin/env sh\nif [ "$#" -eq 1 ] && [ "${1:-}" = "--version" ]; then\n  printf "wakezilla 0.1.49\\n"\n  exit 0\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
+      elif [ "${WAKEZILLA_FAKE_VERSION_MISMATCH:-}" = "1" ]; then
+        printf '#!/usr/bin/env sh\nif [ "$#" -eq 1 ] && [ "${1:-}" = "--version" ]; then\n  printf "wakezilla 0.1.50\\n"\n  exit 0\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
+      elif [ "${WAKEZILLA_FAKE_VERSION_EXITS_NONZERO:-}" = "1" ]; then
+        printf '#!/usr/bin/env sh\nif [ "$#" -eq 1 ] && [ "${1:-}" = "--version" ]; then\n  printf "wakezilla 0.1.49\\n"\n  exit 1\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
       elif [ "${WAKEZILLA_FAKE_VERSION_EMPTY:-}" = "1" ]; then
-        printf '#!/usr/bin/env sh\nif [ "${1:-}" = "--no-update-check" ] && [ "${2:-}" = "--version" ]; then\n  exit 0\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
+        printf '#!/usr/bin/env sh\nif [ "$#" -eq 1 ] && [ "${1:-}" = "--version" ]; then\n  exit 0\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
       else
-        printf '#!/usr/bin/env sh\nif [ "${1:-}" = "--no-update-check" ] && [ "${2:-}" = "--version" ]; then\n  printf "wakezilla 0.1.49\\n"\n  exit 0\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
+        printf '#!/usr/bin/env sh\nif [ "$#" -eq 1 ] && [ "${1:-}" = "--version" ]; then\n  printf "wakezilla 0.1.49\\n"\n  exit 0\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
       fi
       chmod +x "$temp_dir/archive/wakezilla"
       printf '#!/usr/bin/env sh\nexit 0\n' > "$temp_dir/archive/wakezilla-tray"
@@ -202,7 +206,7 @@ write_linux_release_archive() {
   write_linux_integration_fixture "$archive_stage"
   cat > "$archive_stage/wakezilla" <<SH
 #!/usr/bin/env sh
-if [ "\${1:-}" = "--no-update-check" ] && [ "\${2:-}" = "--version" ]; then
+if [ "\$#" -eq 1 ] && [ "\${1:-}" = "--version" ]; then
   printf 'wakezilla 0.1.49\\n'
   exit $version_status
 fi
@@ -306,7 +310,7 @@ test_end_to_end_install_with_fake_curl() {
 
   write_install_dependency_stubs "$temp_dir/bin"
 
-  printf '#!/usr/bin/env sh\nprintf "wakezilla 0.1.49\\n"\n' > "$temp_dir/archive/wakezilla"
+  printf '#!/usr/bin/env sh\nif [ "$#" -eq 1 ] && [ "${1:-}" = "--version" ]; then\n  printf "wakezilla 0.1.49\\n"\n  exit 0\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
   write_linux_integration_fixture "$temp_dir/archive"
   chmod +x "$temp_dir/archive/wakezilla"
   chmod +x "$temp_dir/archive/wakezilla-tray"
@@ -675,6 +679,35 @@ test_unrunnable_candidate_is_fatal_without_publication() {
   rm -rf "$temp_dir"
 }
 
+test_historical_version_only_candidate_installs() {
+  temp_dir=$(mktemp -d)
+  old_path="$PATH"
+  write_install_dependency_stubs "$temp_dir/bin"
+  write_fixture_curl "$temp_dir/bin/curl"
+  TARGET=x86_64-unknown-linux-gnu
+  BIN_DIR="$temp_dir/install-bin"
+  WAKEZILLA_FAKE_CURL_FIXTURE="$ROOT_DIR/tests/fixtures/install/release-v0.1.49.json"
+  WAKEZILLA_FAKE_HISTORICAL_VERSION_ONLY=1
+  PATH="$temp_dir/bin:$PATH"
+  export TARGET BIN_DIR WAKEZILLA_FAKE_CURL_FIXTURE \
+    WAKEZILLA_FAKE_HISTORICAL_VERSION_ONLY PATH
+  mkdir -p "$temp_dir/home"
+  HOME="$temp_dir/home" XDG_DATA_HOME="$temp_dir/data" \
+    XDG_CONFIG_HOME="$temp_dir/config" DISPLAY= WAYLAND_DISPLAY= run_script
+  unset TARGET BIN_DIR WAKEZILLA_FAKE_CURL_FIXTURE \
+    WAKEZILLA_FAKE_HISTORICAL_VERSION_ONLY
+  PATH="$old_path"
+  export PATH
+
+  assert_eq "0" "$status" "historical --version-only candidate status"
+  assert_contains "$output" "installed wakezilla v0.1.49" \
+    "historical --version-only candidate installed version"
+  if [ ! -x "$temp_dir/install-bin/wakezilla" ]; then
+    fail "historical --version-only candidate: expected binary publication"
+  fi
+  rm -rf "$temp_dir"
+}
+
 test_empty_version_candidate_is_fatal_without_publication() {
   temp_dir=$(mktemp -d)
   old_path="$PATH"
@@ -701,6 +734,53 @@ test_empty_version_candidate_is_fatal_without_publication() {
   if [ -e "$temp_dir/install-bin/wakezilla" ] || \
      [ -e "$temp_dir/install-bin/wakezilla-tray" ]; then
     fail "empty version candidate: expected no binary publication"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_mismatched_version_candidate_is_fatal_without_publication() {
+  temp_dir=$(mktemp -d)
+  old_path="$PATH"
+  write_install_dependency_stubs "$temp_dir/bin"
+  write_fixture_curl "$temp_dir/bin/curl"
+  TARGET=x86_64-unknown-linux-gnu
+  BIN_DIR="$temp_dir/install-bin"
+  install_dir=$BIN_DIR
+  WAKEZILLA_FAKE_CURL_FIXTURE="$ROOT_DIR/tests/fixtures/install/release-v0.1.49.json"
+  WAKEZILLA_FAKE_VERSION_MISMATCH=1
+  PATH="$temp_dir/bin:$PATH"
+  export TARGET BIN_DIR WAKEZILLA_FAKE_CURL_FIXTURE \
+    WAKEZILLA_FAKE_VERSION_MISMATCH PATH
+  mkdir -p "$temp_dir/home" "$BIN_DIR"
+  printf 'existing cli\n' > "$BIN_DIR/wakezilla"
+  printf 'existing helper\n' > "$BIN_DIR/wakezilla-tray"
+  chmod 0640 "$BIN_DIR/wakezilla"
+  chmod 0600 "$BIN_DIR/wakezilla-tray"
+  HOME="$temp_dir/home" XDG_DATA_HOME="$temp_dir/data" \
+    XDG_CONFIG_HOME="$temp_dir/config" DISPLAY= WAYLAND_DISPLAY= run_script
+  unset TARGET BIN_DIR WAKEZILLA_FAKE_CURL_FIXTURE \
+    WAKEZILLA_FAKE_VERSION_MISMATCH
+  PATH="$old_path"
+  export PATH
+
+  if [ "$status" -eq 0 ]; then
+    fail "mismatched version candidate: expected fatal install status"
+  fi
+  assert_contains "$output" \
+    "candidate version 0.1.50 does not match release version 0.1.49" \
+    "mismatched version candidate error"
+  assert_not_contains "$output" "retrying with" \
+    "mismatched version candidate does not use compatibility fallback"
+  assert_eq "existing cli" "$(cat "$install_dir/wakezilla")" \
+    "mismatched version candidate preserves existing CLI"
+  assert_eq "existing helper" "$(cat "$install_dir/wakezilla-tray")" \
+    "mismatched version candidate preserves existing helper"
+  assert_eq "640" "$(portable_file_mode "$install_dir/wakezilla")" \
+    "mismatched version candidate preserves existing CLI mode"
+  assert_eq "600" "$(portable_file_mode "$install_dir/wakezilla-tray")" \
+    "mismatched version candidate preserves existing helper mode"
+  if [ -d "$temp_dir/data/applications" ] || [ -d "$temp_dir/config/autostart" ]; then
+    fail "mismatched version candidate: expected no profile integration"
   fi
   rm -rf "$temp_dir"
 }
@@ -823,8 +903,10 @@ test_end_to_end_install_with_fake_curl
 test_linux_integration_uses_final_musl_fallback_extract_once
 test_linux_fallback_rejects_unrunnable_musl_without_publication
 test_end_to_end_rejects_malicious_archive_before_extracting
+test_historical_version_only_candidate_installs
 test_unrunnable_candidate_is_fatal_without_publication
 test_empty_version_candidate_is_fatal_without_publication
+test_mismatched_version_candidate_is_fatal_without_publication
 test_integration_failure_rolls_back_installed_binaries
 test_missing_dependency_reports_hint
 test_unknown_args_fail_with_parser_error
@@ -1395,7 +1477,7 @@ test_verify_checksum_rejects_mismatch() {
 test_extract_binary_from_tarball() {
   temp_dir=$(mktemp -d)
   mkdir -p "$temp_dir/archive"
-  printf '#!/usr/bin/env sh\nprintf "wakezilla 0.1.49\\n"\n' > "$temp_dir/archive/wakezilla"
+  printf '#!/usr/bin/env sh\nif [ "$#" -eq 1 ] && [ "${1:-}" = "--version" ]; then\n  printf "wakezilla 0.1.49\\n"\n  exit 0\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
   chmod +x "$temp_dir/archive/wakezilla"
   tar -C "$temp_dir/archive" -czf "$temp_dir/wakezilla.tar.gz" wakezilla
 
@@ -1410,7 +1492,7 @@ test_extract_binary_from_tarball() {
 test_extract_binary_from_nested_tarball() {
   temp_dir=$(mktemp -d)
   mkdir -p "$temp_dir/archive/nested"
-  printf '#!/usr/bin/env sh\nprintf "wakezilla 0.1.49\\n"\n' > "$temp_dir/archive/nested/wakezilla"
+  printf '#!/usr/bin/env sh\nif [ "$#" -eq 1 ] && [ "${1:-}" = "--version" ]; then\n  printf "wakezilla 0.1.49\\n"\n  exit 0\nfi\nexit 97\n' > "$temp_dir/archive/nested/wakezilla"
   chmod +x "$temp_dir/archive/nested/wakezilla"
   tar -C "$temp_dir/archive" -czf "$temp_dir/wakezilla.tar.gz" nested/wakezilla
 

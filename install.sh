@@ -523,9 +523,11 @@ musl_fallback_target() {
 }
 
 # Download, verify, extract, and validate an asset without publishing it.
-# Returns 2 when the target has no asset and 3 when its CLI cannot run.
+# Returns 2 when the target has no asset, 3 when its CLI cannot report a
+# version, and 4 when the reported version does not match the release.
 download_and_stage_target() {
   install_target="$1"
+  STAGE_REPORTED_VERSION=
   install_asset_url=$(printf '%s' "$json" | asset_url_from_json "$BIN_NAME" "$release_version" "$install_target")
 
   if [ -z "$install_asset_url" ] || [ "$install_asset_url" = "null" ]; then
@@ -543,8 +545,7 @@ download_and_stage_target() {
   install_bin_file=$(extract_binary \
     "$install_archive" "$install_extract_dir" "$BIN_NAME") || return 1
 
-  if install_version_output=$("$install_bin_file" \
-    --no-update-check --version 2>/dev/null); then
+  if install_version_output=$("$install_bin_file" --version 2>/dev/null); then
     install_version_status=0
   else
     install_version_status=$?
@@ -553,6 +554,10 @@ download_and_stage_target() {
     awk 'NF { value=$NF } END { print value }')
   if [ "$install_version_status" -ne 0 ] || [ -z "$install_version" ]; then
     return 3
+  fi
+  if [ "$install_version" != "$release_version" ]; then
+    STAGE_REPORTED_VERSION=$install_version
+    return 4
   fi
 
   install_helper_file=$(find_binary_in_dir "$install_extract_dir" "$TRAY_HELPER_NAME")
@@ -1834,6 +1839,9 @@ case "$stage_status" in
       err "install" "no runnable $BIN_NAME binary is available for $original_target or $fallback_target"
     fi
     target=$fallback_target
+    ;;
+  4)
+    err "install" "$BIN_NAME candidate version $STAGE_REPORTED_VERSION does not match release version $release_version"
     ;;
   *) err "install" "failed to stage $BIN_NAME for $target" ;;
 esac
