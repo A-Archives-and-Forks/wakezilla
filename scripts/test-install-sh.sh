@@ -3853,9 +3853,9 @@ test_macos_install_lock_contention_fails_without_removing_owner() {
   extract_dir="$temp_dir/extract"
   bin_dir="$temp_dir/bin"
   tools_dir="$temp_dir/tools"
-  lock_dir="$home_dir/.wakezilla-macos-install.lock"
-  mkdir -p "$lock_dir" "$bin_dir" "$tools_dir"
-  printf 'concurrent installer owns lock\n' > "$lock_dir/owner-sentinel"
+  lock_file="$home_dir/.wakezilla-macos-install.lock"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  printf '%s\n' "$$" > "$lock_file"
   write_macos_integration_fixture "$extract_dir"
   write_fake_plutil "$tools_dir/plutil"
   write_fake_launchctl "$tools_dir/launchctl"
@@ -3866,10 +3866,35 @@ test_macos_install_lock_contention_fails_without_removing_owner() {
     "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
     fail "macOS installer lock contention: expected fatal status"
   fi
-  assert_eq "concurrent installer owns lock" "$(cat "$lock_dir/owner-sentinel")" \
+  assert_eq "$$" "$(cat "$lock_file")" \
     "macOS installer lock contention preserves owner"
   if [ -e "$home_dir/Applications" ] || [ -e "$home_dir/Library" ]; then
     fail "macOS installer lock contention: published profile artifacts"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_macos_stale_install_lock_is_recovered() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  tools_dir="$temp_dir/tools"
+  lock_file="$home_dir/.wakezilla-macos-install.lock"
+  mkdir -p "$home_dir" "$bin_dir" "$tools_dir"
+  printf '99999999\n' > "$lock_file"
+  write_macos_integration_fixture "$extract_dir"
+  write_fake_plutil "$tools_dir/plutil"
+  write_fake_launchctl "$tools_dir/launchctl"
+  test_uid=$(id -u)
+
+  if ! WAKEZILLA_MACOS_GUI_DOMAIN=absent install_macos_desktop_integration_at \
+    "$extract_dir" "$bin_dir" 1.2.3 "$home_dir" "$test_uid" \
+    "$tools_dir/plutil" "$tools_dir/launchctl" >/dev/null 2>&1; then
+    fail "macOS stale installer lock: expected recovery"
+  fi
+  if [ -e "$lock_file" ]; then
+    fail "macOS stale installer lock: lock remained after recovery"
   fi
   rm -rf "$temp_dir"
 }
@@ -4112,6 +4137,7 @@ if test_macos_integration_helpers_defined; then
   test_macos_incomplete_bundle_restore_preserves_recovery_backup
   test_macos_setup_failure_cleans_staged_siblings
   test_macos_install_lock_contention_fails_without_removing_owner
+  test_macos_stale_install_lock_is_recovered
   test_macos_bundle_publication_race_preserves_foreign_app
   test_macos_agent_publication_race_preserves_foreign_agent
   test_macos_reinstall_is_idempotent_and_rolls_back_late_failure

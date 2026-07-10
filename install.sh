@@ -2071,28 +2071,62 @@ install_macos_desktop_integration_at() (
   macos_agent_nested_stage=
   macos_backup_bundle=
   macos_backup_placeholder_identity=
-  macos_lock_dir="$macos_home_physical/.wakezilla-macos-install.lock"
+  macos_lock_file="$macos_home_physical/.wakezilla-macos-install.lock"
   macos_lock_identity=
   umask 077
-  if ! mkdir "$macos_lock_dir" 2>/dev/null; then
-    warn "another macOS Wakezilla installation is already in progress"
-    exit 1
-  fi
-  macos_lock_identity=$(macos_path_identity "$macos_lock_dir") || {
-    warn "cannot identify the macOS installer lock"
-    rmdir "$macos_lock_dir" 2>/dev/null || true
-    exit 1
-  }
+  macos_lock_acquired=no
   macos_lock_is_owned() {
-    macos_directory_has_identity "$macos_lock_dir" "$macos_lock_identity"
+    [ "$macos_lock_acquired" = yes ] || return 1
+    [ -f "$macos_lock_file" ] && [ ! -L "$macos_lock_file" ] || return 1
+    [ "$(sed -n '1p' "$macos_lock_file" 2>/dev/null || true)" = "$$" ] || return 1
+    [ -z "$macos_lock_identity" ] || \
+      macos_file_has_identity "$macos_lock_file" "$macos_lock_identity"
   }
   macos_release_lock() {
     if macos_lock_is_owned; then
-      rmdir "$macos_lock_dir"
-    elif [ -e "$macos_lock_dir" ] || [ -L "$macos_lock_dir" ]; then
+      rm -f "$macos_lock_file" || return 1
+      macos_lock_acquired=no
+    elif [ -e "$macos_lock_file" ] || [ -L "$macos_lock_file" ]; then
       return 1
     fi
   }
+  macos_lock_cleanup() {
+    macos_lock_status=$?
+    trap - 0 1 2 15
+    macos_release_lock || macos_lock_status=1
+    exit "$macos_lock_status"
+  }
+  # Install the lock cleanup before attempting acquisition. A signal between
+  # the atomic create and the normal transaction trap must not strand a lock.
+  trap macos_lock_cleanup 0 1 2 15
+  macos_acquire_lock() {
+    if (set -C; printf '%s\n' "$$" > "$macos_lock_file") 2>/dev/null; then
+      macos_lock_acquired=yes
+      macos_lock_identity=$(macos_path_identity "$macos_lock_file") || return 1
+      return 0
+    fi
+    if [ -L "$macos_lock_file" ] || [ ! -f "$macos_lock_file" ]; then
+      return 1
+    fi
+    macos_existing_lock_pid=$(sed -n '1p' "$macos_lock_file" 2>/dev/null || true)
+    case "$macos_existing_lock_pid" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    if kill -0 "$macos_existing_lock_pid" 2>/dev/null; then
+      return 1
+    fi
+    rm -f "$macos_lock_file" || return 1
+    if (set -C; printf '%s\n' "$$" > "$macos_lock_file") 2>/dev/null; then
+      macos_lock_acquired=yes
+      macos_lock_identity=$(macos_path_identity "$macos_lock_file") || return 1
+      return 0
+    fi
+    return 1
+  }
+  if ! macos_acquire_lock; then
+    warn "another macOS Wakezilla installation is already in progress"
+    exit 1
+  fi
   macos_setup_cleanup() {
     macos_setup_status=$?
     trap - 0 1 2 15
