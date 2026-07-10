@@ -127,7 +127,14 @@ if [ -n "$output" ]; then
         printf '#!/usr/bin/env sh\nprintf "wakezilla 0.1.49\\n"\n' > "$temp_dir/archive/wakezilla"
       fi
       chmod +x "$temp_dir/archive/wakezilla"
-      tar -C "$temp_dir/archive" -czf "$output" wakezilla
+      printf '#!/usr/bin/env sh\nexit 0\n' > "$temp_dir/archive/wakezilla-tray"
+      chmod +x "$temp_dir/archive/wakezilla-tray"
+      for size in 48 128 256; do
+        mkdir -p "$temp_dir/archive/icons/hicolor/${size}x${size}/apps"
+        printf 'fixture-icon-%s\n' "$size" > \
+          "$temp_dir/archive/icons/hicolor/${size}x${size}/apps/dev.wakezilla.Wakezilla.png"
+      done
+      tar -C "$temp_dir/archive" -czf "$output" wakezilla wakezilla-tray icons
       rm -rf "$temp_dir"
       ;;
   esac
@@ -163,6 +170,42 @@ sha256_file() {
   fi
 }
 
+write_linux_integration_fixture() {
+  extract_dir="$1"
+  mkdir -p "$extract_dir/icons/hicolor/48x48/apps" \
+    "$extract_dir/icons/hicolor/128x128/apps" \
+    "$extract_dir/icons/hicolor/256x256/apps"
+  printf '#!/usr/bin/env sh\nexit 0\n' > "$extract_dir/wakezilla-tray"
+  chmod 755 "$extract_dir/wakezilla-tray"
+  for size in 48 128 256; do
+    printf 'wakezilla-icon-%s\n' "$size" > \
+      "$extract_dir/icons/hicolor/${size}x${size}/apps/dev.wakezilla.Wakezilla.png"
+  done
+}
+
+write_linux_release_archive() {
+  archive_path="$1"
+  version_status="$2"
+  icon_marker="$3"
+  archive_stage=$(mktemp -d)
+  write_linux_integration_fixture "$archive_stage"
+  cat > "$archive_stage/wakezilla" <<SH
+#!/usr/bin/env sh
+if [ "\${1:-}" = "--version" ]; then
+  printf 'wakezilla 0.1.49\\n'
+  exit $version_status
+fi
+exit 0
+SH
+  chmod 755 "$archive_stage/wakezilla"
+  for archive_size in 48 128 256; do
+    printf '%s-%s\n' "$icon_marker" "$archive_size" > \
+      "$archive_stage/icons/hicolor/${archive_size}x${archive_size}/apps/dev.wakezilla.Wakezilla.png"
+  done
+  tar -C "$archive_stage" -czf "$archive_path" wakezilla wakezilla-tray icons
+  rm -rf "$archive_stage"
+}
+
 test_help_includes_required_docs() {
   run_script --help
   assert_eq "0" "$status" "help exit status"
@@ -189,7 +232,12 @@ test_no_args_resolves_release_metadata() {
   WAKEZILLA_FAKE_CURL_FIXTURE="$ROOT_DIR/tests/fixtures/install/release-v0.1.49.json"
   PATH="$temp_dir/bin:$PATH"
   export TARGET BIN_DIR GITHUB_TOKEN WAKEZILLA_FAKE_CURL_FIXTURE PATH
-  run_script
+  mkdir -p "$temp_dir/home"
+  HOME="$temp_dir/home" \
+  XDG_DATA_HOME="$temp_dir/data" \
+  XDG_CONFIG_HOME="$temp_dir/config" \
+  DISPLAY= WAYLAND_DISPLAY= \
+    run_script
   unset TARGET BIN_DIR GITHUB_TOKEN WAKEZILLA_FAKE_CURL_FIXTURE
   PATH="$old_path"
   export PATH
@@ -197,12 +245,20 @@ test_no_args_resolves_release_metadata() {
   assert_contains "$output" "installing wakezilla for x86_64-unknown-linux-gnu" "release metadata target"
   assert_contains "$output" "resolved wakezilla v0.1.49" "release metadata version"
   assert_contains "$output" "asset: https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz" "release metadata asset"
-  assert_contains "$output" "install dir: $temp_dir/install-bin" "release metadata install dir"
-  assert_contains "$output" "installed wakezilla v0.1.49 to $temp_dir/install-bin/wakezilla" "release metadata installed"
+  canonical_install_dir=$(CDPATH= cd -- "$temp_dir/install-bin" && pwd -P)
+  assert_contains "$output" "install dir: $canonical_install_dir" "release metadata install dir"
+  assert_contains "$output" "installed wakezilla v0.1.49 to $canonical_install_dir/wakezilla" "release metadata installed"
   assert_not_contains "$output" "secret-token" "release metadata output token"
   if [ ! -x "$temp_dir/install-bin/wakezilla" ]; then
     fail "release metadata install: expected executable in temp BIN_DIR"
   fi
+  if [ ! -f "$temp_dir/data/applications/dev.wakezilla.Wakezilla.desktop" ]; then
+    fail "release metadata install: expected Linux application integration"
+  fi
+  if [ ! -f "$temp_dir/config/autostart/dev.wakezilla.tray.desktop" ]; then
+    fail "release metadata install: expected Linux autostart integration"
+  fi
+  assert_contains "$output" "next graphical login" "release metadata headless integration message"
   rm -rf "$temp_dir"
 }
 
@@ -214,10 +270,10 @@ test_end_to_end_install_with_fake_curl() {
   write_install_dependency_stubs "$temp_dir/bin"
 
   printf '#!/usr/bin/env sh\nprintf "wakezilla 0.1.49\\n"\n' > "$temp_dir/archive/wakezilla"
-  printf '#!/usr/bin/env sh\nexit 0\n' > "$temp_dir/archive/wakezilla-tray"
+  write_linux_integration_fixture "$temp_dir/archive"
   chmod +x "$temp_dir/archive/wakezilla"
   chmod +x "$temp_dir/archive/wakezilla-tray"
-  tar -C "$temp_dir/archive" -czf "$temp_dir/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz" wakezilla wakezilla-tray
+  tar -C "$temp_dir/archive" -czf "$temp_dir/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz" wakezilla wakezilla-tray icons
   if ! sha=$(sha256_file "$temp_dir/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz"); then
     printf 'SKIP: end-to-end fake release test requires sha256sum or shasum\n'
     rm -rf "$temp_dir"
@@ -281,9 +337,15 @@ EOF
   chmod +x "$temp_dir/bin/curl"
 
   output_file=$(mktemp)
+  mkdir -p "$temp_dir/home"
   set +e
   PATH="$temp_dir/bin:$temp_dir/install:$PATH" \
     BIN_DIR="$temp_dir/install" \
+    HOME="$temp_dir/home" \
+    XDG_DATA_HOME="$temp_dir/data" \
+    XDG_CONFIG_HOME="$temp_dir/config" \
+    DISPLAY= \
+    WAYLAND_DISPLAY= \
     TARGET=x86_64-unknown-linux-gnu \
     "$SCRIPT" 0.1.49 >"$output_file" 2>&1
   status=$?
@@ -297,7 +359,8 @@ EOF
   assert_contains "$output" "installed wakezilla v0.1.49" "end-to-end installed version"
   assert_contains "$output" "resolved wakezilla v0.1.49" "end-to-end resolved version"
   assert_contains "$output" "asset: https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz" "end-to-end asset"
-  assert_contains "$output" "install dir: $temp_dir/install" "end-to-end install dir"
+  canonical_install_dir=$(CDPATH= cd -- "$temp_dir/install" && pwd -P)
+  assert_contains "$output" "install dir: $canonical_install_dir" "end-to-end install dir"
   assert_not_contains "$output" "unexpected url" "end-to-end no unexpected network"
   if [ ! -x "$temp_dir/install/wakezilla" ]; then
     fail "end-to-end install: expected installed binary"
@@ -305,7 +368,86 @@ EOF
   if [ ! -x "$temp_dir/install/wakezilla-tray" ]; then
     fail "end-to-end install: expected installed tray helper"
   fi
+  if [ ! -f "$temp_dir/data/applications/dev.wakezilla.Wakezilla.desktop" ]; then
+    fail "end-to-end install: expected Linux application entry"
+  fi
+  for size in 48 128 256; do
+    if ! cmp -s \
+      "$temp_dir/archive/icons/hicolor/${size}x${size}/apps/dev.wakezilla.Wakezilla.png" \
+      "$temp_dir/data/icons/hicolor/${size}x${size}/apps/dev.wakezilla.Wakezilla.png"; then
+      fail "end-to-end install: expected byte-identical ${size}x${size} icon"
+    fi
+  done
 
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_uses_final_musl_fallback_extract_once() {
+  temp_dir=$(mktemp -d)
+  mkdir -p "$temp_dir/bin" "$temp_dir/install" "$temp_dir/home"
+  write_install_dependency_stubs "$temp_dir/bin"
+  gnu_archive="$temp_dir/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz"
+  musl_archive="$temp_dir/wakezilla-0.1.49-x86_64-unknown-linux-musl.tar.gz"
+  write_linux_release_archive "$gnu_archive" 1 gnu
+  write_linux_release_archive "$musl_archive" 0 musl
+  {
+    printf '%s  %s\n' "$(sha256_file "$gnu_archive")" "${gnu_archive##*/}"
+    printf '%s  %s\n' "$(sha256_file "$musl_archive")" "${musl_archive##*/}"
+  } > "$temp_dir/SHA256SUMS"
+  cat > "$temp_dir/release.json" <<'EOF'
+{
+  "tag_name": "v0.1.49",
+  "assets": [
+    {"name":"wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz","browser_download_url":"https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz"},
+    {"name":"wakezilla-0.1.49-x86_64-unknown-linux-musl.tar.gz","browser_download_url":"https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-musl.tar.gz"}
+  ]
+}
+EOF
+  cat > "$temp_dir/bin/curl" <<SH
+#!/usr/bin/env sh
+set -eu
+out=
+url=
+while [ "\$#" -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    -H) shift 2 ;;
+    -*) shift ;;
+    *) url="\$1"; shift ;;
+  esac
+done
+case "\$url" in
+  https://api.github.com/repos/guibeira/wakezilla/releases/tags/v0.1.49) cat '$temp_dir/release.json' ;;
+  https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz) cp '$gnu_archive' "\$out" ;;
+  https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-musl.tar.gz) cp '$musl_archive' "\$out" ;;
+  https://github.com/guibeira/wakezilla/releases/download/v0.1.49/SHA256SUMS) cp '$temp_dir/SHA256SUMS' "\$out" ;;
+  *) printf 'unexpected url: %s\n' "\$url" >&2; exit 1 ;;
+esac
+SH
+  chmod 755 "$temp_dir/bin/curl"
+
+  output_file=$(mktemp)
+  set +e
+  PATH="$temp_dir/bin:$PATH" \
+    HOME="$temp_dir/home" \
+    BIN_DIR="$temp_dir/install" \
+    XDG_DATA_HOME="$temp_dir/data" \
+    XDG_CONFIG_HOME="$temp_dir/config" \
+    TARGET=x86_64-unknown-linux-gnu \
+    DISPLAY= WAYLAND_DISPLAY= \
+    "$SCRIPT" 0.1.49 > "$output_file" 2>&1
+  status=$?
+  set -e
+  output=$(cat "$output_file")
+  rm -f "$output_file"
+
+  assert_eq "0" "$status" "musl fallback integration status"
+  assert_contains "$output" "retrying with x86_64-unknown-linux-musl" "musl fallback attempted"
+  assert_contains "$output" "asset: https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-musl.tar.gz" "musl fallback final asset"
+  integration_messages=$(printf '%s\n' "$output" | grep -c 'Linux desktop integration installed' || true)
+  assert_eq "1" "$integration_messages" "musl fallback integration count"
+  installed_icon="$temp_dir/data/icons/hicolor/256x256/apps/dev.wakezilla.Wakezilla.png"
+  assert_eq "musl-256" "$(cat "$installed_icon" 2>/dev/null || true)" "musl fallback final extract icon"
   rm -rf "$temp_dir"
 }
 
@@ -320,7 +462,12 @@ test_version_command_nonzero_warns() {
   WAKEZILLA_FAKE_VERSION_EXITS_NONZERO=1
   PATH="$temp_dir/bin:$PATH"
   export TARGET BIN_DIR WAKEZILLA_FAKE_CURL_FIXTURE WAKEZILLA_FAKE_VERSION_EXITS_NONZERO PATH
-  run_script
+  mkdir -p "$temp_dir/home"
+  HOME="$temp_dir/home" \
+  XDG_DATA_HOME="$temp_dir/data" \
+  XDG_CONFIG_HOME="$temp_dir/config" \
+  DISPLAY= WAYLAND_DISPLAY= \
+    run_script
   unset TARGET BIN_DIR WAKEZILLA_FAKE_CURL_FIXTURE WAKEZILLA_FAKE_VERSION_EXITS_NONZERO
   PATH="$old_path"
   export PATH
@@ -393,6 +540,7 @@ test_mode_sources_cleanly() {
 test_help_includes_required_docs
 test_no_args_resolves_release_metadata
 test_end_to_end_install_with_fake_curl
+test_linux_integration_uses_final_musl_fallback_extract_once
 test_version_command_nonzero_warns
 test_missing_dependency_reports_hint
 test_unknown_args_fail_with_parser_error
@@ -516,6 +664,25 @@ test_install_argument_helpers_defined() {
   [ "$missing" -eq 0 ]
 }
 
+test_canonical_bin_dir_helper_defined() {
+  assert_command_exists canonicalize_bin_dir "canonical bin dir helper"
+}
+
+test_canonicalize_bin_dir_makes_relative_path_physical_and_absolute() {
+  temp_dir=$(mktemp -d)
+  mkdir -p "$temp_dir/work/nested"
+  resolved=$(
+    cd "$temp_dir/work"
+    canonicalize_bin_dir "nested/../wakezilla bin"
+  )
+  expected=$(CDPATH= cd -- "$temp_dir/work/wakezilla bin" && pwd -P)
+  assert_eq "$expected" "$resolved" "canonical relative bin dir"
+  if [ ! -d "$resolved" ]; then
+    fail "canonical bin dir: expected created directory"
+  fi
+  rm -rf "$temp_dir"
+}
+
 test_parse_args_positional_version() {
   parsed_version=$(
     VERSION=
@@ -608,6 +775,9 @@ test_resolve_bin_dir_requires_home_for_default() {
 }
 
 load_install_helpers
+if test_canonical_bin_dir_helper_defined; then
+  test_canonicalize_bin_dir_makes_relative_path_physical_and_absolute
+fi
 test_detect_target_linux_x86_64
 test_detect_target_linux_x86_64_musl
 test_detect_target_macos_x86_64
@@ -980,6 +1150,726 @@ if test_path_guidance_helpers_defined; then
   test_path_guidance_quotes_zsh_rc_with_spaces
   test_path_guidance_quotes_bash_rc_with_spaces
   test_path_guidance_quotes_fish_bin_dir_with_spaces
+fi
+
+file_mode() {
+  mode_file="$1"
+  if stat -f '%Lp' "$mode_file" >/dev/null 2>&1; then
+    stat -f '%Lp' "$mode_file"
+  else
+    stat -c '%a' "$mode_file"
+  fi
+}
+
+test_linux_desktop_integration_helpers_defined() {
+  missing=0
+  assert_command_exists resolve_linux_integration_user "linux integration user resolver" || missing=1
+  assert_command_exists desktop_exec_quote "desktop Exec quoting helper" || missing=1
+  assert_command_exists atomic_install_file "atomic integration file helper" || missing=1
+  assert_command_exists install_linux_desktop_integration "linux desktop integration helper" || missing=1
+  [ "$missing" -eq 0 ]
+}
+
+test_linux_desktop_resolution_helpers_defined() {
+  missing=0
+  assert_command_exists resolve_linux_desktop_dir "linux Desktop resolver" || missing=1
+  assert_command_exists legacy_linux_autostart_is_owned "legacy autostart ownership helper" || missing=1
+  [ "$missing" -eq 0 ]
+}
+
+test_linux_desktop_integration_writes_xdg_entries_headless() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  data_dir="$temp_dir/xdg data"
+  config_dir="$temp_dir/xdg config"
+  mkdir -p "$home_dir" "$bin_dir"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+
+  output=$(
+    HOME="$home_dir" \
+    XDG_DATA_HOME="$data_dir" \
+    XDG_CONFIG_HOME="$config_dir" \
+    WAKEZILLA_EUID=1000 \
+    DISPLAY= \
+    WAYLAND_DISPLAY= \
+      install_linux_desktop_integration "$extract_dir" "$bin_dir" 2>&1
+  )
+
+  app_entry="$data_dir/applications/dev.wakezilla.Wakezilla.desktop"
+  autostart_entry="$config_dir/autostart/dev.wakezilla.tray.desktop"
+  if [ ! -f "$app_entry" ]; then
+    fail "linux headless integration: expected application entry"
+  fi
+  if [ ! -f "$autostart_entry" ]; then
+    fail "linux headless integration: expected autostart entry"
+  fi
+  app_contents=$(cat "$app_entry" 2>/dev/null || true)
+  autostart_contents=$(cat "$autostart_entry" 2>/dev/null || true)
+  assert_contains "$app_contents" "Type=Application" "linux application type"
+  assert_contains "$app_contents" "Exec=\"$bin_dir/wakezilla-tray\"" "linux application direct helper Exec"
+  assert_contains "$app_contents" "TryExec=$bin_dir/wakezilla-tray" "linux application TryExec"
+  assert_contains "$app_contents" "Icon=dev.wakezilla.Wakezilla" "linux application icon"
+  assert_contains "$app_contents" "Categories=Network;Utility;" "linux application categories"
+  assert_contains "$autostart_contents" "Exec=\"$bin_dir/wakezilla-tray\"" "linux autostart direct helper Exec"
+  assert_not_contains "$app_contents$autostart_contents" "wakezilla tray" "linux launchers avoid CLI tray subcommand"
+  assert_contains "$output" "next graphical login" "linux headless next-login message"
+
+  rm -rf "$temp_dir"
+}
+
+test_desktop_exec_quote_escapes_reserved_characters() {
+  exec_path='/tmp/wakezilla path/back\slash"quote`tick$dollar%percent/wakezilla-tray'
+  expected='"/tmp/wakezilla path/back\\slash\"quote\`tick\$dollar%%percent/wakezilla-tray"'
+  actual=$(desktop_exec_quote "$exec_path")
+  assert_eq "$expected" "$actual" "desktop Exec reserved-character escaping"
+}
+
+test_desktop_exec_quote_rejects_line_breaks() {
+  cr=$(printf '\r')
+  if desktop_exec_quote "/tmp/wakezilla${cr}tray" >/dev/null 2>&1; then
+    fail "desktop Exec CR: expected rejection"
+  fi
+  if desktop_exec_quote '/tmp/wakezilla
+tray' >/dev/null 2>&1; then
+    fail "desktop Exec LF: expected rejection"
+  fi
+}
+
+test_linux_desktop_integration_launches_graphical_helper_once() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  launch_log="$temp_dir/launch.log"
+  nohup_log="$temp_dir/nohup.log"
+  mkdir -p "$home_dir" "$bin_dir" "$temp_dir/stub-bin"
+  write_linux_integration_fixture "$extract_dir"
+  cat > "$extract_dir/wakezilla-tray" <<'SH'
+#!/usr/bin/env sh
+printf '%s|%s\n' "$0" "$#" >> "$WAKEZILLA_LAUNCH_LOG"
+SH
+  chmod 755 "$extract_dir/wakezilla-tray"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  cat > "$temp_dir/stub-bin/nohup" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$@" >> "$WAKEZILLA_NOHUP_LOG"
+exec "$@"
+SH
+  chmod 755 "$temp_dir/stub-bin/nohup"
+
+  output=$(
+    HOME="$home_dir" \
+    WAKEZILLA_EUID=1000 \
+    DISPLAY=:99 \
+    WAYLAND_DISPLAY= \
+    WAKEZILLA_LAUNCH_LOG="$launch_log" \
+    WAKEZILLA_NOHUP_LOG="$nohup_log" \
+    PATH="$temp_dir/stub-bin:$PATH" \
+      install_linux_desktop_integration "$extract_dir" "$bin_dir" 2>&1
+  )
+
+  launch_wait=0
+  while [ ! -f "$launch_log" ] && [ "$launch_wait" -lt 50 ]; do
+    sleep 0.01
+    launch_wait=$((launch_wait + 1))
+  done
+  if [ -f "$launch_log" ]; then
+    launch_lines=$(wc -l < "$launch_log")
+    launch_record=$(cat "$launch_log")
+  else
+    launch_lines=0
+    launch_record=
+  fi
+  assert_eq "1" "$(printf '%s' "$launch_lines" | tr -d ' ')" "graphical helper launch count"
+  assert_eq "$bin_dir/wakezilla-tray|0" "$launch_record" "graphical direct helper invocation"
+  assert_eq "$bin_dir/wakezilla-tray" "$(cat "$nohup_log" 2>/dev/null || true)" "graphical nohup direct helper"
+  assert_not_contains "$output" "next graphical login" "graphical install omits next-login message"
+
+  rm -rf "$temp_dir"
+}
+
+test_resolve_linux_desktop_dir_prefers_xdg_user_dir() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  desktop_dir="$temp_dir/XDG Desktop"
+  mkdir -p "$home_dir" "$desktop_dir" "$temp_dir/bin"
+  cat > "$temp_dir/bin/xdg-user-dir" <<SH
+#!/usr/bin/env sh
+[ "\${1:-}" = "DESKTOP" ] || exit 1
+printf '%s\n' '$desktop_dir'
+SH
+  chmod 755 "$temp_dir/bin/xdg-user-dir"
+
+  resolved=$(HOME="$home_dir" PATH="$temp_dir/bin:$PATH" resolve_linux_desktop_dir "$home_dir" "$home_dir/.config")
+  assert_eq "$desktop_dir" "$resolved" "xdg-user-dir Desktop resolution"
+  rm -rf "$temp_dir"
+}
+
+test_resolve_linux_desktop_dir_parses_without_execution() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  config_dir="$temp_dir/config"
+  desktop_dir="$home_dir/My Desktop"
+  mkdir -p "$desktop_dir" "$config_dir" "$temp_dir/empty-bin"
+  printf '%s\n' 'XDG_DESKTOP_DIR="$HOME/My Desktop"' > "$config_dir/user-dirs.dirs"
+
+  resolved=$(HOME="$home_dir" PATH="$temp_dir/empty-bin" resolve_linux_desktop_dir "$home_dir" "$config_dir")
+  assert_eq "$desktop_dir" "$resolved" "user-dirs.dirs HOME Desktop resolution"
+
+  mkdir -p "$home_dir/Desktop"
+  printf '%s\n' 'XDG_DESKTOP_DIR="$HOME/Desktop$(touch wakezilla-user-dirs-pwned)"' > "$config_dir/user-dirs.dirs"
+  resolved=$(
+    cd "$temp_dir"
+    HOME="$home_dir" PATH="$temp_dir/empty-bin" resolve_linux_desktop_dir "$home_dir" "$config_dir"
+  )
+  assert_eq "$home_dir/Desktop" "$resolved" "malformed user-dirs fallback"
+  if [ -e "$temp_dir/wakezilla-user-dirs-pwned" ]; then
+    fail "user-dirs parser: command substitution was executed"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_linux_desktop_copy_and_gio_trust_are_best_effort() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  desktop_dir="$home_dir/Desktop"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  gio_log="$temp_dir/gio.log"
+  mkdir -p "$desktop_dir" "$bin_dir" "$temp_dir/stub-bin"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  cat > "$temp_dir/stub-bin/gio" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$@" >> "$WAKEZILLA_GIO_LOG"
+exit 1
+SH
+  chmod 755 "$temp_dir/stub-bin/gio"
+
+  output=$(
+    HOME="$home_dir" \
+    XDG_DATA_HOME="$temp_dir/data" \
+    XDG_CONFIG_HOME="$temp_dir/config" \
+    WAKEZILLA_EUID=1000 \
+    WAKEZILLA_GIO_LOG="$gio_log" \
+    DISPLAY= \
+    PATH="$temp_dir/stub-bin:$PATH" \
+      install_linux_desktop_integration "$extract_dir" "$bin_dir" 2>&1
+  )
+
+  desktop_entry="$desktop_dir/dev.wakezilla.Wakezilla.desktop"
+  app_entry="$temp_dir/data/applications/dev.wakezilla.Wakezilla.desktop"
+  if [ ! -f "$desktop_entry" ]; then
+    fail "Linux Desktop copy: expected canonical application ID"
+  elif ! cmp -s "$app_entry" "$desktop_entry"; then
+    fail "Linux Desktop copy: expected application entry bytes"
+  fi
+  if [ -f "$desktop_entry" ]; then
+    assert_eq "755" "$(file_mode "$desktop_entry")" "Linux Desktop copy mode"
+  fi
+  gio_args=$(tr '\n' ' ' < "$gio_log" 2>/dev/null || true)
+  assert_contains "$gio_args" "set $desktop_entry metadata::trusted true" "Linux Desktop gio trust metadata"
+  assert_contains "$output" "next graphical login" "gio failure remains successful"
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_relative_xdg_falls_back_and_copies_icons() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  mkdir -p "$home_dir" "$bin_dir"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+
+  HOME="$home_dir" \
+  XDG_DATA_HOME=relative/data \
+  XDG_CONFIG_HOME=relative/config \
+  WAKEZILLA_EUID=1000 \
+  DISPLAY= \
+  WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+
+  if [ ! -f "$home_dir/.local/share/applications/dev.wakezilla.Wakezilla.desktop" ]; then
+    fail "relative XDG data: expected HOME fallback"
+  fi
+  if [ ! -f "$home_dir/.config/autostart/dev.wakezilla.tray.desktop" ]; then
+    fail "relative XDG config: expected HOME fallback"
+  fi
+  for size in 48 128 256; do
+    source_icon="$extract_dir/icons/hicolor/${size}x${size}/apps/dev.wakezilla.Wakezilla.png"
+    installed_icon="$home_dir/.local/share/icons/hicolor/${size}x${size}/apps/dev.wakezilla.Wakezilla.png"
+    if ! cmp -s "$source_icon" "$installed_icon"; then
+      fail "Linux ${size}x${size} icon: expected byte-identical copy"
+    fi
+  done
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_removes_only_owned_legacy_autostart() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  config_dir="$temp_dir/config"
+  legacy_entry="$config_dir/autostart/wakezilla-tray.desktop"
+  mkdir -p "$home_dir" "$bin_dir" "$config_dir/autostart"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  cat > "$legacy_entry" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Wakezilla Tray
+Exec=/old/bin/wakezilla-tray
+EOF
+
+  HOME="$home_dir" XDG_DATA_HOME="$temp_dir/data" XDG_CONFIG_HOME="$config_dir" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+  if [ -e "$legacy_entry" ]; then
+    fail "owned legacy Linux autostart: expected removal"
+  fi
+
+  cat > "$legacy_entry" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Wakezilla Tray
+Exec="/old/bin/wakezilla" tray
+Terminal=false
+EOF
+  HOME="$home_dir" XDG_DATA_HOME="$temp_dir/data" XDG_CONFIG_HOME="$config_dir" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+  if [ -e "$legacy_entry" ]; then
+    fail "owned legacy CLI tray autostart: expected removal"
+  fi
+
+  printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Another App' 'Exec=/other/app' > "$legacy_entry"
+  HOME="$home_dir" XDG_DATA_HOME="$temp_dir/data" XDG_CONFIG_HOME="$config_dir" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+  if [ ! -f "$legacy_entry" ]; then
+    fail "foreign legacy-named autostart: expected preservation"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_validates_all_assets_before_writes() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  data_dir="$temp_dir/data"
+  config_dir="$temp_dir/config"
+  mkdir -p "$home_dir" "$bin_dir" "$data_dir/applications" "$config_dir/autostart"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  rm -f "$extract_dir/icons/hicolor/256x256/apps/dev.wakezilla.Wakezilla.png"
+  printf 'existing-app\n' > "$data_dir/applications/dev.wakezilla.Wakezilla.desktop"
+  printf 'legacy-owned\nExec=/old/wakezilla-tray\n' > "$config_dir/autostart/wakezilla-tray.desktop"
+
+  output=$(HOME="$home_dir" XDG_DATA_HOME="$data_dir" XDG_CONFIG_HOME="$config_dir" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" 2>&1)
+  assert_eq "existing-app" "$(cat "$data_dir/applications/dev.wakezilla.Wakezilla.desktop")" "prevalidation preserves application entry"
+  if [ -d "$data_dir/icons" ]; then
+    fail "prevalidation: expected no icon directories before complete validation"
+  fi
+  if [ ! -f "$config_dir/autostart/wakezilla-tray.desktop" ]; then
+    fail "prevalidation: expected legacy entry untouched"
+  fi
+  assert_contains "$output" "skipping desktop integration" "legacy archive compatibility warning"
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_is_idempotent_without_temp_siblings() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  data_dir="$temp_dir/data"
+  config_dir="$temp_dir/config"
+  mkdir -p "$home_dir" "$bin_dir"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+
+  for reinstall in 1 2; do
+    HOME="$home_dir" XDG_DATA_HOME="$data_dir" XDG_CONFIG_HOME="$config_dir" \
+      WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
+      install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+  done
+  temp_count=$(find "$data_dir" "$config_dir" -name '*.tmp.*' -print | wc -l | tr -d ' ')
+  assert_eq "0" "$temp_count" "idempotent integration temporary siblings"
+  assert_eq "1" "$(find "$data_dir/applications" -name 'dev.wakezilla.Wakezilla.desktop' -print | wc -l | tr -d ' ')" "idempotent application entry count"
+  assert_eq "1" "$(find "$config_dir/autostart" -name 'dev.wakezilla.tray.desktop' -print | wc -l | tr -d ' ')" "idempotent autostart entry count"
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_root_without_valid_sudo_user_skips_everything() {
+  temp_dir=$(mktemp -d)
+  root_home="$temp_dir/root-home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  launch_log="$temp_dir/launch.log"
+  mkdir -p "$root_home/Desktop" "$bin_dir"
+  write_linux_integration_fixture "$extract_dir"
+  cat > "$bin_dir/wakezilla-tray" <<'SH'
+#!/usr/bin/env sh
+printf 'launched\n' >> "$WAKEZILLA_LAUNCH_LOG"
+SH
+  chmod 755 "$bin_dir/wakezilla-tray"
+
+  output=$(
+    cd "$temp_dir"
+    HOME="$root_home" \
+    XDG_DATA_HOME="$root_home/data" \
+    XDG_CONFIG_HOME="$root_home/config" \
+    WAKEZILLA_EUID=0 \
+    WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    SUDO_USER='bad$(touch root-user-pwned)' \
+    SUDO_UID=0 \
+    SUDO_GID=0 \
+    DISPLAY=:99 \
+    WAKEZILLA_LAUNCH_LOG="$launch_log" \
+      install_linux_desktop_integration "$extract_dir" "$bin_dir" 2>&1
+  )
+
+  assert_contains "$output" "skipping Linux desktop integration" "root direct integration warning"
+  if [ -d "$root_home/data" ] || [ -d "$root_home/config" ]; then
+    fail "root direct integration: expected no profile writes"
+  fi
+  if [ -e "$launch_log" ]; then
+    fail "root direct integration: expected no graphical launch"
+  fi
+  if [ -e "$temp_dir/root-user-pwned" ]; then
+    fail "root sudo user validation: command substitution was executed"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_euid_override_is_test_mode_only() {
+  temp_dir=$(mktemp -d)
+  mkdir -p "$temp_dir/bin" "$temp_dir/home"
+  cat > "$temp_dir/bin/id" <<'SH'
+#!/usr/bin/env sh
+case "${1:-}" in
+  -u) printf '0\n' ;;
+  -g) printf '0\n' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod 755 "$temp_dir/bin/id"
+
+  if output=$(HOME="$temp_dir/home" WAKEZILLA_INSTALL_SH_TEST_MODE= \
+    WAKEZILLA_EUID=1000 SUDO_USER= SUDO_UID= SUDO_GID= \
+    PATH="$temp_dir/bin:$PATH" resolve_linux_integration_user 2>&1); then
+    fail "production EUID resolver: honored WAKEZILLA_EUID override as root"
+  else
+    assert_contains "$output" "skipping Linux desktop integration" "production EUID override warning"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_valid_sudo_user_targets_profile_and_chowns() {
+  temp_dir=$(mktemp -d)
+  root_home="$temp_dir/root-home"
+  user_home="$temp_dir/user-home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/system-bin"
+  chown_log="$temp_dir/chown.log"
+  launch_log="$temp_dir/launch.log"
+  test_uid=$(id -u)
+  test_gid=$(id -g)
+  mkdir -p "$root_home" "$user_home/Desktop" "$bin_dir" "$temp_dir/stub-bin"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  cat > "$temp_dir/stub-bin/chown" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$@" >> "$WAKEZILLA_CHOWN_LOG"
+exit 0
+SH
+  chmod 755 "$temp_dir/stub-bin/chown"
+
+  output=$(
+    HOME="$root_home" \
+    XDG_DATA_HOME="$root_home/xdg-data-must-not-be-used" \
+    XDG_CONFIG_HOME="$root_home/xdg-config-must-not-be-used" \
+    WAKEZILLA_EUID=0 \
+    WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
+    WAKEZILLA_TEST_SUDO_UID="$test_uid" \
+    WAKEZILLA_TEST_SUDO_GID="$test_gid" \
+    WAKEZILLA_TEST_SUDO_HOME="$user_home" \
+    WAKEZILLA_CHOWN_LOG="$chown_log" \
+    WAKEZILLA_LAUNCH_LOG="$launch_log" \
+    DISPLAY=:99 \
+    PATH="$temp_dir/stub-bin:$PATH" \
+      install_linux_desktop_integration "$extract_dir" "$bin_dir" 2>&1
+  )
+
+  if [ ! -f "$user_home/.local/share/applications/dev.wakezilla.Wakezilla.desktop" ]; then
+    fail "sudo integration: expected target user's application entry"
+  fi
+  if [ ! -f "$user_home/.config/autostart/dev.wakezilla.tray.desktop" ]; then
+    fail "sudo integration: expected target user's autostart entry"
+  fi
+  if [ -d "$root_home/xdg-data-must-not-be-used" ] || [ -d "$root_home/xdg-config-must-not-be-used" ]; then
+    fail "sudo integration: wrote to root profile XDG paths"
+  fi
+  if [ -e "$launch_log" ]; then
+    fail "sudo integration: must not launch the tray as root"
+  fi
+  chown_args=$(cat "$chown_log" 2>/dev/null || true)
+  assert_contains "$chown_args" "$test_uid:$test_gid" "sudo integration chown owner"
+  assert_contains "$output" "next graphical login" "sudo integration next-login message"
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_ignores_test_sudo_overrides_outside_test_mode() {
+  temp_dir=$(mktemp -d)
+  root_home="$temp_dir/root-home"
+  user_home="$temp_dir/user-home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  mkdir -p "$root_home" "$user_home" "$bin_dir"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+
+  output=$(HOME="$root_home" WAKEZILLA_EUID=0 WAKEZILLA_INSTALL_SH_TEST_MODE= \
+    WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
+    WAKEZILLA_TEST_SUDO_UID="$(id -u)" WAKEZILLA_TEST_SUDO_GID="$(id -g)" \
+    WAKEZILLA_TEST_SUDO_HOME="$user_home" DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" 2>&1)
+  if [ -d "$user_home/.local" ] || [ -d "$user_home/.config" ]; then
+    fail "production sudo resolver: honored test-only override"
+  fi
+  if [ ! -f "$root_home/.local/share/applications/dev.wakezilla.Wakezilla.desktop" ]; then
+    fail "production sudo resolver: expected actual non-root HOME instead of test override"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_root_discards_desktop_outside_target_home() {
+  temp_dir=$(mktemp -d)
+  user_home="$temp_dir/user-home"
+  outside_desktop="$temp_dir/outside-desktop"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  test_uid=$(id -u)
+  test_gid=$(id -g)
+  mkdir -p "$user_home" "$outside_desktop" "$bin_dir" "$temp_dir/stub-bin"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  cat > "$temp_dir/stub-bin/xdg-user-dir" <<SH
+#!/usr/bin/env sh
+printf '%s\n' '$outside_desktop'
+SH
+  chmod 755 "$temp_dir/stub-bin/xdg-user-dir"
+
+  HOME=/root WAKEZILLA_EUID=0 \
+    WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
+    WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
+    WAKEZILLA_TEST_SUDO_HOME="$user_home" DISPLAY= WAYLAND_DISPLAY= \
+    PATH="$temp_dir/stub-bin:$PATH" \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+  if [ -e "$outside_desktop/dev.wakezilla.Wakezilla.desktop" ]; then
+    fail "sudo Desktop resolver: wrote outside target profile"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_root_rejects_profile_traversal_and_symlinks() {
+  temp_dir=$(mktemp -d)
+  user_home="$temp_dir/user-home"
+  outside_dir="$temp_dir/outside"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  test_uid=$(id -u)
+  test_gid=$(id -g)
+  mkdir -p "$user_home" "$outside_dir" "$bin_dir"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+
+  HOME=/root WAKEZILLA_EUID=0 WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
+    WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
+    WAKEZILLA_TEST_SUDO_HOME="$user_home" \
+    XDG_DATA_HOME="$user_home/../outside/data" \
+    XDG_CONFIG_HOME="$user_home/../outside/config" DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
+  if [ -d "$outside_dir/data" ] || [ -d "$outside_dir/config" ]; then
+    fail "sudo profile traversal: wrote outside target home"
+  fi
+  if [ ! -f "$user_home/.local/share/applications/dev.wakezilla.Wakezilla.desktop" ]; then
+    fail "sudo profile traversal: expected safe fallback data path"
+  fi
+
+  rm -rf "$user_home/.local" "$user_home/.config"
+  ln -s "$outside_dir" "$user_home/.local"
+  if HOME=/root WAKEZILLA_EUID=0 WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
+    WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
+    WAKEZILLA_TEST_SUDO_HOME="$user_home" \
+    XDG_DATA_HOME= XDG_CONFIG_HOME= DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1; then
+    fail "sudo profile symlink: expected integration failure"
+  fi
+  if [ -d "$outside_dir/share" ]; then
+    fail "sudo profile symlink: wrote outside target home"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_post_validation_setup_failures_are_fatal() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  mkdir -p "$home_dir" "$bin_dir" "$temp_dir/mktemp-bin" "$temp_dir/mkdir-bin"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  cat > "$temp_dir/mktemp-bin/mktemp" <<'SH'
+#!/usr/bin/env sh
+exit 1
+SH
+  chmod 755 "$temp_dir/mktemp-bin/mktemp"
+  if HOME="$home_dir" XDG_DATA_HOME="$temp_dir/data" XDG_CONFIG_HOME="$temp_dir/config" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= PATH="$temp_dir/mktemp-bin:$PATH" \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1; then
+    fail "post-validation mktemp failure: expected nonzero"
+  fi
+
+  real_mkdir=$(command -v mkdir)
+  cat > "$temp_dir/mkdir-bin/mkdir" <<SH
+#!/usr/bin/env sh
+case "\$*" in
+  *'$temp_dir/data'*) exit 1 ;;
+esac
+exec '$real_mkdir' "\$@"
+SH
+  chmod 755 "$temp_dir/mkdir-bin/mkdir"
+  if HOME="$home_dir" XDG_DATA_HOME="$temp_dir/data" XDG_CONFIG_HOME="$temp_dir/config" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= PATH="$temp_dir/mkdir-bin:$PATH" \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1; then
+    fail "post-validation mkdir failure: expected nonzero"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_rejects_symlinked_archive_assets() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  data_dir="$temp_dir/data"
+  mkdir -p "$home_dir" "$bin_dir"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  icon_path="$extract_dir/icons/hicolor/128x128/apps/dev.wakezilla.Wakezilla.png"
+  printf 'outside-icon\n' > "$temp_dir/outside-icon"
+  rm -f "$icon_path"
+  ln -s "$temp_dir/outside-icon" "$icon_path"
+
+  output=$(HOME="$home_dir" XDG_DATA_HOME="$data_dir" XDG_CONFIG_HOME="$temp_dir/config" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" 2>&1)
+  if [ -d "$data_dir" ]; then
+    fail "symlinked archive asset: expected validation before writes"
+  fi
+  assert_contains "$output" "skipping desktop integration" "symlinked archive compatibility warning"
+  rm -rf "$temp_dir"
+}
+
+test_linux_integration_rejects_line_break_in_helper_path_before_writes() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin
+with-line-break"
+  data_dir="$temp_dir/data"
+  mkdir -p "$home_dir" "$bin_dir"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+
+  if HOME="$home_dir" XDG_DATA_HOME="$data_dir" XDG_CONFIG_HOME="$temp_dir/config" \
+    WAKEZILLA_EUID=1000 DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1; then
+    fail "line-break helper path: expected rejection"
+  fi
+  if [ -d "$data_dir" ]; then
+    fail "line-break helper path: expected no integration writes"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_atomic_install_file_rolls_back_failed_rename() {
+  temp_dir=$(mktemp -d)
+  mkdir -p "$temp_dir/bin" "$temp_dir/dest"
+  printf 'old\n' > "$temp_dir/dest/entry.desktop"
+  printf 'new\n' > "$temp_dir/source.desktop"
+  cat > "$temp_dir/bin/mv" <<'SH'
+#!/usr/bin/env sh
+exit 1
+SH
+  chmod 755 "$temp_dir/bin/mv"
+
+  if PATH="$temp_dir/bin:$PATH" atomic_install_file \
+    "$temp_dir/source.desktop" "$temp_dir/dest/entry.desktop" 0644; then
+    fail "atomic integration rename failure: expected failure"
+  fi
+  assert_eq "old" "$(cat "$temp_dir/dest/entry.desktop")" "atomic integration rollback"
+  temp_count=$(find "$temp_dir/dest" -name '*.tmp.*' -print | wc -l | tr -d ' ')
+  assert_eq "0" "$temp_count" "atomic integration rollback cleanup"
+  rm -rf "$temp_dir"
+}
+
+test_atomic_install_file_rejects_directory_destination() {
+  temp_dir=$(mktemp -d)
+  mkdir -p "$temp_dir/dest/entry.desktop"
+  printf 'sentinel\n' > "$temp_dir/dest/entry.desktop/sentinel"
+  printf 'new\n' > "$temp_dir/source.desktop"
+  if atomic_install_file "$temp_dir/source.desktop" "$temp_dir/dest/entry.desktop" 0644; then
+    fail "atomic integration directory destination: expected rejection"
+  fi
+  if [ ! -f "$temp_dir/dest/entry.desktop/sentinel" ]; then
+    fail "atomic integration directory destination: sentinel changed"
+  fi
+  if [ -f "$temp_dir/dest/entry.desktop/.entry.desktop.tmp.$$" ]; then
+    fail "atomic integration directory destination: nested temporary remained"
+  fi
+  rm -rf "$temp_dir"
+}
+
+if test_linux_desktop_integration_helpers_defined; then
+  test_linux_desktop_integration_writes_xdg_entries_headless
+  test_desktop_exec_quote_escapes_reserved_characters
+  test_desktop_exec_quote_rejects_line_breaks
+  test_linux_desktop_integration_launches_graphical_helper_once
+  test_linux_integration_relative_xdg_falls_back_and_copies_icons
+  test_linux_integration_validates_all_assets_before_writes
+  test_linux_integration_is_idempotent_without_temp_siblings
+  test_linux_integration_root_without_valid_sudo_user_skips_everything
+  test_linux_integration_euid_override_is_test_mode_only
+  test_linux_integration_valid_sudo_user_targets_profile_and_chowns
+  test_linux_integration_ignores_test_sudo_overrides_outside_test_mode
+  test_linux_integration_root_discards_desktop_outside_target_home
+  test_linux_integration_root_rejects_profile_traversal_and_symlinks
+  test_linux_integration_post_validation_setup_failures_are_fatal
+  test_linux_integration_rejects_symlinked_archive_assets
+  test_linux_integration_rejects_line_break_in_helper_path_before_writes
+  test_atomic_install_file_rolls_back_failed_rename
+  test_atomic_install_file_rejects_directory_destination
+fi
+
+if test_linux_desktop_resolution_helpers_defined; then
+  test_resolve_linux_desktop_dir_prefers_xdg_user_dir
+  test_resolve_linux_desktop_dir_parses_without_execution
+  test_linux_desktop_copy_and_gio_trust_are_best_effort
+  test_linux_integration_removes_only_owned_legacy_autostart
 fi
 
 if [ "$failures" -ne 0 ]; then

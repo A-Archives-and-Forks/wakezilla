@@ -132,6 +132,20 @@ resolve_bin_dir() {
   fi
 }
 
+canonicalize_bin_dir() (
+  canonical_input="$1"
+  case "$canonical_input" in
+    /*) canonical_path=$canonical_input ;;
+    *)
+      canonical_pwd=$(pwd -P) || exit 1
+      canonical_path="$canonical_pwd/$canonical_input"
+      ;;
+  esac
+  mkdir -p "$canonical_path" || exit 1
+  CDPATH= cd -- "$canonical_path" || exit 1
+  pwd -P
+)
+
 pkg_manager_hint() {
   pkg="$1"
   if command -v brew >/dev/null 2>&1; then
@@ -418,6 +432,7 @@ download_and_install_target() {
   install_optional_tray_helper "$install_extract_dir" "$bin_dir"
 
   INSTALLED_ASSET_URL="$install_asset_url"
+  FINAL_EXTRACT_DIR="$install_extract_dir"
 }
 
 binary_runs() {
@@ -493,6 +508,424 @@ offer_sudo_symlink() {
   fi
 }
 
+resolve_linux_integration_user() {
+  if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
+    integration_euid="${WAKEZILLA_EUID:-$(id -u 2>/dev/null || printf '')}"
+  else
+    integration_euid=$(id -u 2>/dev/null || printf '')
+  fi
+  integration_home=
+  integration_uid=
+  integration_gid=
+  integration_chown=no
+  integration_root=no
+
+  if [ "$integration_euid" != "0" ]; then
+    case "${HOME:-}" in
+      /*) integration_home=$HOME ;;
+      *)
+        warn "HOME is not an absolute path; skipping Linux desktop integration"
+        return 1
+        ;;
+    esac
+    return 0
+  fi
+
+  integration_root=yes
+  if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ] && \
+     { [ -n "${WAKEZILLA_TEST_SUDO_USER:-}" ] || \
+       [ -n "${WAKEZILLA_TEST_SUDO_UID:-}" ] || \
+       [ -n "${WAKEZILLA_TEST_SUDO_GID:-}" ] || \
+       [ -n "${WAKEZILLA_TEST_SUDO_HOME:-}" ]; }; then
+    integration_user="${WAKEZILLA_TEST_SUDO_USER:-}"
+    integration_uid="${WAKEZILLA_TEST_SUDO_UID:-}"
+    integration_gid="${WAKEZILLA_TEST_SUDO_GID:-}"
+    integration_home="${WAKEZILLA_TEST_SUDO_HOME:-}"
+  else
+    integration_user="${SUDO_USER:-}"
+    integration_uid="${SUDO_UID:-}"
+    integration_gid="${SUDO_GID:-}"
+    integration_home=
+  fi
+
+  case "$integration_user" in
+    ''|-*|*[!A-Za-z0-9_.-]*) integration_user_valid=no ;;
+    *) integration_user_valid=yes ;;
+  esac
+  case "$integration_uid" in
+    ''|0|*[!0-9]*) integration_user_valid=no ;;
+  esac
+  case "$integration_gid" in
+    ''|*[!0-9]*) integration_user_valid=no ;;
+  esac
+
+  if [ "$integration_user_valid" = "yes" ] && [ -z "$integration_home" ]; then
+    integration_actual_uid=$(id -u "$integration_user" 2>/dev/null || printf '')
+    integration_actual_gid=$(id -g "$integration_user" 2>/dev/null || printf '')
+    if [ "$integration_actual_uid" != "$integration_uid" ] || \
+       [ "$integration_actual_gid" != "$integration_gid" ]; then
+      integration_user_valid=no
+    elif command -v getent >/dev/null 2>&1; then
+      integration_home=$(getent passwd "$integration_user" 2>/dev/null | \
+        awk -F: -v user="$integration_user" '$1 == user { print $6; exit }')
+    elif [ -r /etc/passwd ]; then
+      integration_home=$(awk -F: -v user="$integration_user" \
+        '$1 == user { print $6; exit }' /etc/passwd)
+    fi
+  fi
+
+  integration_cr=$(printf '\r')
+  case "$integration_home" in
+    /*)
+      case "$integration_home" in
+        *"$integration_cr"*|*"
+"*) integration_user_valid=no ;;
+      esac
+      ;;
+    *) integration_user_valid=no ;;
+  esac
+
+  if [ "$integration_user_valid" != "yes" ]; then
+    warn "running as root without a validated non-root sudo user; skipping Linux desktop integration"
+    return 1
+  fi
+
+  integration_chown=yes
+  return 0
+}
+
+desktop_exec_quote() {
+  desktop_exec_value="$1"
+  desktop_exec_cr=$(printf '\r')
+  case "$desktop_exec_value" in
+    *"$desktop_exec_cr"*|*"
+"*)
+      warn "desktop launcher paths must not contain CR or LF"
+      return 1
+      ;;
+  esac
+
+  desktop_exec_escaped=$(printf '%s' "$desktop_exec_value" | sed \
+    -e 's/\\/\\\\/g' \
+    -e 's/"/\\"/g' \
+    -e 's/`/\\`/g' \
+    -e 's/\$/\\$/g' \
+    -e 's/%/%%/g') || return 1
+  printf '"%s"\n' "$desktop_exec_escaped"
+}
+
+desktop_string_escape() {
+  desktop_string_value="$1"
+  desktop_string_cr=$(printf '\r')
+  case "$desktop_string_value" in
+    *"$desktop_string_cr"*|*"
+"*)
+      warn "desktop launcher paths must not contain CR or LF"
+      return 1
+      ;;
+  esac
+  printf '%s' "$desktop_string_value" | sed -e 's/\\/\\\\/g'
+  printf '\n'
+}
+
+resolve_linux_desktop_dir() {
+  desktop_home="$1"
+  desktop_config_home="$2"
+  desktop_cr=$(printf '\r')
+
+  if command -v xdg-user-dir >/dev/null 2>&1; then
+    desktop_candidate=$(xdg-user-dir DESKTOP 2>/dev/null || printf '')
+    case "$desktop_candidate" in
+      /*)
+        case "$desktop_candidate" in
+          *"$desktop_cr"*|*"
+"*) ;;
+          *)
+            if [ -d "$desktop_candidate" ]; then
+              printf '%s\n' "$desktop_candidate"
+              return 0
+            fi
+            ;;
+        esac
+        ;;
+    esac
+  fi
+
+  desktop_user_dirs="$desktop_config_home/user-dirs.dirs"
+  if [ -f "$desktop_user_dirs" ]; then
+    while IFS= read -r desktop_line || [ -n "$desktop_line" ]; do
+      case "$desktop_line" in
+        XDG_DESKTOP_DIR=\"*\")
+          desktop_candidate=${desktop_line#XDG_DESKTOP_DIR=\"}
+          desktop_candidate=${desktop_candidate%\"}
+          case "$desktop_candidate" in
+            *'$('*|*'${'*|*'`'*|*"$desktop_cr"*|*"
+"*)
+              continue
+              ;;
+            '$HOME')
+              desktop_candidate=$desktop_home
+              ;;
+            '$HOME/'*)
+              desktop_suffix=${desktop_candidate#\$HOME}
+              desktop_candidate=$desktop_home$desktop_suffix
+              ;;
+            /*) ;;
+            *) continue ;;
+          esac
+          if [ -d "$desktop_candidate" ]; then
+            printf '%s\n' "$desktop_candidate"
+            return 0
+          fi
+          ;;
+      esac
+    done < "$desktop_user_dirs"
+  fi
+
+  if [ -d "$desktop_home/Desktop" ]; then
+    printf '%s\n' "$desktop_home/Desktop"
+  fi
+}
+
+legacy_linux_autostart_is_owned() {
+  legacy_entry="$1"
+  [ -f "$legacy_entry" ] || return 1
+  [ ! -L "$legacy_entry" ] || return 1
+  grep -Eq '^Name=Wakezilla( Tray)?[[:space:]]*$' "$legacy_entry" 2>/dev/null || return 1
+  grep -Eq "^Exec=.*wakezilla-tray([[:space:]\"']|$)" "$legacy_entry" 2>/dev/null || \
+    grep -Eq "^Exec=.*wakezilla[\"']?[[:space:]]+tray([[:space:]]|$)" "$legacy_entry" 2>/dev/null
+}
+
+linux_root_profile_path_is_safe() (
+  profile_path="$1"
+  profile_home="$2"
+  profile_cr=$(printf '\r')
+  case "$profile_path" in
+    "$profile_home"|"$profile_home"/*) ;;
+    *) exit 1 ;;
+  esac
+  profile_suffix=${profile_path#"$profile_home"}
+  case "/$profile_suffix/" in
+    *"$profile_cr"*|*"
+"*|*/../*|*/./*) exit 1 ;;
+  esac
+
+  profile_home_physical=$(CDPATH= cd -- "$profile_home" 2>/dev/null && pwd -P) || exit 1
+  profile_probe=$profile_path
+  while [ ! -e "$profile_probe" ] && [ ! -L "$profile_probe" ]; do
+    profile_parent=${profile_probe%/*}
+    [ -n "$profile_parent" ] || profile_parent=/
+    [ "$profile_parent" != "$profile_probe" ] || exit 1
+    profile_probe=$profile_parent
+  done
+  [ -d "$profile_probe" ] || exit 1
+  profile_probe_physical=$(CDPATH= cd -- "$profile_probe" 2>/dev/null && pwd -P) || exit 1
+  case "$profile_probe_physical" in
+    "$profile_home_physical"|"$profile_home_physical"/*) exit 0 ;;
+    *) exit 1 ;;
+  esac
+)
+
+chown_linux_profile_dirs() (
+  profile_path="$1"
+  profile_home="$2"
+  profile_owner="$3:$4"
+  while :; do
+    [ -L "$profile_path" ] && exit 1
+    if [ -d "$profile_path" ]; then
+      chown "$profile_owner" "$profile_path" || exit 1
+    fi
+    [ "$profile_path" = "$profile_home" ] && exit 0
+    profile_parent=${profile_path%/*}
+    [ -n "$profile_parent" ] || profile_parent=/
+    case "$profile_parent" in
+      "$profile_home"|"$profile_home"/*) profile_path=$profile_parent ;;
+      *) exit 1 ;;
+    esac
+  done
+)
+
+atomic_install_file() (
+  atomic_source="$1"
+  atomic_target="$2"
+  atomic_mode="$3"
+  atomic_uid="${4:-}"
+  atomic_gid="${5:-}"
+  atomic_dir=$(dirname "$atomic_target") || exit 1
+  atomic_name=${atomic_target##*/}
+  if [ -d "$atomic_target" ]; then
+    exit 1
+  fi
+  atomic_tmp=$(mktemp "$atomic_dir/.${atomic_name}.tmp.XXXXXX") || exit 1
+  trap 'if [ -n "${atomic_tmp:-}" ]; then rm -f "$atomic_tmp"; fi' 0 1 2 15
+
+  cp "$atomic_source" "$atomic_tmp" || exit 1
+  chmod "$atomic_mode" "$atomic_tmp" || exit 1
+  if [ -n "$atomic_uid" ] && [ -n "$atomic_gid" ]; then
+    chown "$atomic_uid:$atomic_gid" "$atomic_tmp" || exit 1
+  fi
+  mv -f "$atomic_tmp" "$atomic_target" || exit 1
+  atomic_tmp=
+)
+
+install_linux_desktop_integration() (
+  linux_extract_dir="$1"
+  linux_bin_dir="$2"
+  linux_helper_source="$linux_extract_dir/$TRAY_HELPER_NAME"
+  linux_helper="$linux_bin_dir/$TRAY_HELPER_NAME"
+  linux_icon_name=dev.wakezilla.Wakezilla.png
+
+  if ! resolve_linux_integration_user; then
+    exit 0
+  fi
+
+  linux_missing=
+  if [ ! -f "$linux_helper_source" ] || [ -L "$linux_helper_source" ] || \
+     [ ! -x "$linux_helper_source" ] || [ ! -f "$linux_helper" ] || \
+     [ -L "$linux_helper" ] || [ ! -x "$linux_helper" ]; then
+    linux_missing=$TRAY_HELPER_NAME
+  fi
+  for linux_size in 48 128 256; do
+    linux_icon_source="$linux_extract_dir/icons/hicolor/${linux_size}x${linux_size}/apps/$linux_icon_name"
+    if [ ! -f "$linux_icon_source" ] || [ -L "$linux_icon_source" ]; then
+      linux_missing="${linux_missing:+$linux_missing, }${linux_size}x${linux_size} icon"
+    fi
+  done
+  if [ -n "$linux_missing" ]; then
+    warn "release archive lacks Linux desktop assets ($linux_missing); skipping desktop integration"
+    exit 0
+  fi
+
+  if [ "$integration_root" = "yes" ]; then
+    linux_data_home="$integration_home/.local/share"
+    linux_config_home="$integration_home/.config"
+    if [ -n "${XDG_DATA_HOME:-}" ] && \
+       linux_root_profile_path_is_safe "$XDG_DATA_HOME" "$integration_home"; then
+      linux_data_home=$XDG_DATA_HOME
+    fi
+    if [ -n "${XDG_CONFIG_HOME:-}" ] && \
+       linux_root_profile_path_is_safe "$XDG_CONFIG_HOME" "$integration_home"; then
+      linux_config_home=$XDG_CONFIG_HOME
+    fi
+  else
+    case "${XDG_DATA_HOME:-}" in
+      /*) linux_data_home=$XDG_DATA_HOME ;;
+      *) linux_data_home="$integration_home/.local/share" ;;
+    esac
+    case "${XDG_CONFIG_HOME:-}" in
+      /*) linux_config_home=$XDG_CONFIG_HOME ;;
+      *) linux_config_home="$integration_home/.config" ;;
+    esac
+  fi
+
+  linux_app_dir="$linux_data_home/applications"
+  linux_autostart_dir="$linux_config_home/autostart"
+  if [ "$integration_root" = "yes" ] && \
+     { ! linux_root_profile_path_is_safe "$linux_data_home" "$integration_home" || \
+       ! linux_root_profile_path_is_safe "$linux_config_home" "$integration_home"; }; then
+    warn "target profile contains an unsafe path; refusing Linux desktop integration"
+    exit 1
+  fi
+  linux_desktop_dir=$(resolve_linux_desktop_dir "$integration_home" "$linux_config_home")
+  if [ "$integration_root" = "yes" ]; then
+    if [ -n "$linux_desktop_dir" ] && \
+       ! linux_root_profile_path_is_safe "$linux_desktop_dir" "$integration_home"; then
+      linux_desktop_dir=
+    fi
+  fi
+  linux_stage=$(mktemp -d 2>/dev/null || mktemp -d -t wakezilla-linux-integration) || {
+    warn "failed to create a temporary directory for Linux desktop integration"
+    exit 1
+  }
+  trap 'rm -rf "$linux_stage"' 0 1 2 15
+
+  linux_exec=$(desktop_exec_quote "$linux_helper") || exit 1
+  linux_try_exec=$(desktop_string_escape "$linux_helper") || exit 1
+  {
+    printf '%s\n' '[Desktop Entry]'
+    printf '%s\n' 'Type=Application'
+    printf '%s\n' 'Version=1.0'
+    printf '%s\n' 'Name=Wakezilla'
+    printf '%s\n' 'Comment=Wakezilla network wake-on-LAN tray application'
+    printf 'TryExec=%s\n' "$linux_try_exec"
+    printf 'Exec=%s\n' "$linux_exec"
+    printf '%s\n' 'Icon=dev.wakezilla.Wakezilla'
+    printf '%s\n' 'Terminal=false'
+    printf '%s\n' 'Categories=Network;Utility;'
+    printf '%s\n' 'StartupNotify=false'
+  } > "$linux_stage/application.desktop" || exit 1
+  cp "$linux_stage/application.desktop" "$linux_stage/autostart.desktop" || exit 1
+
+  mkdir -p "$linux_app_dir" "$linux_autostart_dir" || {
+    warn "failed to create Linux desktop integration directories"
+    exit 1
+  }
+  for linux_size in 48 128 256; do
+    mkdir -p "$linux_data_home/icons/hicolor/${linux_size}x${linux_size}/apps" || exit 1
+  done
+
+  if [ "$integration_chown" = "yes" ]; then
+    chown_linux_profile_dirs "$linux_app_dir" "$integration_home" \
+      "$integration_uid" "$integration_gid" || exit 1
+    chown_linux_profile_dirs "$linux_data_home/icons/hicolor/48x48/apps" "$integration_home" \
+      "$integration_uid" "$integration_gid" || exit 1
+    chown_linux_profile_dirs "$linux_data_home/icons/hicolor/128x128/apps" "$integration_home" \
+      "$integration_uid" "$integration_gid" || exit 1
+    chown_linux_profile_dirs "$linux_data_home/icons/hicolor/256x256/apps" "$integration_home" \
+      "$integration_uid" "$integration_gid" || exit 1
+    chown_linux_profile_dirs "$linux_autostart_dir" "$integration_home" \
+      "$integration_uid" "$integration_gid" || exit 1
+  fi
+
+  linux_install_file() {
+    if [ "$integration_chown" = "yes" ]; then
+      atomic_install_file "$1" "$2" "$3" "$integration_uid" "$integration_gid"
+    else
+      atomic_install_file "$1" "$2" "$3"
+    fi
+  }
+
+  linux_install_file "$linux_stage/application.desktop" \
+    "$linux_app_dir/dev.wakezilla.Wakezilla.desktop" 0644 || exit 1
+  linux_install_file "$linux_stage/autostart.desktop" \
+    "$linux_autostart_dir/dev.wakezilla.tray.desktop" 0644 || exit 1
+  if [ -n "$linux_desktop_dir" ]; then
+    linux_desktop_entry="$linux_desktop_dir/dev.wakezilla.Wakezilla.desktop"
+    linux_install_file "$linux_stage/application.desktop" "$linux_desktop_entry" 0755 || exit 1
+    if command -v gio >/dev/null 2>&1; then
+      gio set "$linux_desktop_entry" metadata::trusted true >/dev/null 2>&1 || true
+    fi
+  fi
+  for linux_size in 48 128 256; do
+    linux_install_file \
+      "$linux_extract_dir/icons/hicolor/${linux_size}x${linux_size}/apps/$linux_icon_name" \
+      "$linux_data_home/icons/hicolor/${linux_size}x${linux_size}/apps/$linux_icon_name" \
+      0644 || exit 1
+  done
+
+  linux_legacy_entry="$linux_autostart_dir/wakezilla-tray.desktop"
+  if legacy_linux_autostart_is_owned "$linux_legacy_entry"; then
+    rm -f "$linux_legacy_entry" || exit 1
+  fi
+
+  if [ "$integration_root" = "yes" ]; then
+    info "Linux desktop integration installed; the Wakezilla tray will start at the next graphical login"
+  elif [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    if command -v nohup >/dev/null 2>&1; then
+      (
+        nohup "$linux_helper" </dev/null >/dev/null 2>&1 &
+      ) || true
+    else
+      (
+        "$linux_helper" </dev/null >/dev/null 2>&1 &
+      ) || true
+    fi
+    info "Linux desktop integration installed; started the Wakezilla tray"
+  else
+    info "Linux desktop integration installed; the Wakezilla tray will start at the next graphical login"
+  fi
+)
+
 if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -500,7 +933,9 @@ fi
 parse_args "$@"
 check_dependencies
 target=$(detect_target)
-bin_dir=$(resolve_bin_dir)
+requested_bin_dir=$(resolve_bin_dir)
+bin_dir=$(canonicalize_bin_dir "$requested_bin_dir") || \
+  err "install" "failed to create or canonicalize install directory: $requested_bin_dir"
 
 info "installing $BIN_NAME for $target"
 json=$(fetch_release_json "${VERSION:-}") || err "download" "failed to fetch release metadata from GitHub"
@@ -547,6 +982,14 @@ if ! binary_runs; then
     fi
   fi
 fi
+
+case "$target" in
+  *-unknown-linux-gnu|*-unknown-linux-musl)
+    if ! install_linux_desktop_integration "$FINAL_EXTRACT_DIR" "$bin_dir"; then
+      err "integration" "failed to install Linux desktop integration"
+    fi
+    ;;
+esac
 
 set +e
 version_output=$("$bin_dir/$BIN_NAME" --version 2>/dev/null)
