@@ -275,26 +275,27 @@ verify_checksum() {
   fi
 }
 
-install_bin() {
+install_bin() (
   src="$1"
   dst="$2"
-  if command -v install >/dev/null 2>&1; then
-    install -m 755 "$src" "$dst"
-  else
-    dst_dir=$(dirname "$dst")
-    dst_tmp="$dst_dir/.${BIN_NAME:-wakezilla}.install.$$"
-    rm -f "$dst_tmp"
-    if cp "$src" "$dst_tmp" && chmod 755 "$dst_tmp" && mv -f "$dst_tmp" "$dst"; then
-      return 0
-    fi
-    status=$?
-    rm -f "$dst_tmp"
-    return "$status"
-  fi
-}
+  dst_dir=$(dirname "$dst") || exit 1
+  dst_name=${dst##*/}
+  [ ! -d "$dst" ] || exit 1
+  dst_tmp=$(mktemp "$dst_dir/.${dst_name}.install.XXXXXX") || exit 1
+  trap 'if [ -n "${dst_tmp:-}" ]; then rm -f "$dst_tmp"; fi' 0 1 2 15
+
+  cp "$src" "$dst_tmp" || exit $?
+  chmod 755 "$dst_tmp" || exit $?
+  mv -f "$dst_tmp" "$dst" || exit $?
+  dst_tmp=
+)
 
 validate_tar_archive() (
   archive="$1"
+  expected_cli_name="${2:-}"
+  expected_helper_name="${3:-}"
+  LC_ALL=C
+  export LC_ALL
   archive_validation_dir=$(mktemp -d 2>/dev/null || mktemp -d -t wakezilla-archive-validation) || {
     printf '%s\n' 'cannot create private archive validation directory'
     exit 1
@@ -308,9 +309,9 @@ validate_tar_archive() (
   trap archive_validation_cleanup 0
   trap 'exit 1' 1 2 15
 
-  if ! tar -tzf "$archive" > "$archive_names" 2>/dev/null; then
+  if ! TAR_OPTIONS= tar -tzf "$archive" > "$archive_names" 2>/dev/null; then
     archive_validation_error="cannot list archive members"
-  elif ! tar -tvzf "$archive" > "$archive_types" 2>/dev/null; then
+  elif ! TAR_OPTIONS= tar -tvzf "$archive" > "$archive_types" 2>/dev/null; then
     archive_validation_error="cannot inspect archive member types"
   fi
 
@@ -329,12 +330,50 @@ validate_tar_archive() (
           archive_validation_error="parent traversal member path: $archive_member"
           break
           ;;
+        *[!A-Za-z0-9._/-]*)
+          archive_validation_error="unsupported archive member name"
+          break
+          ;;
       esac
       if printf '%s' "$archive_member" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
         archive_validation_error="control character in member path"
         break
       fi
     done < "$archive_names"
+  fi
+
+  if [ -z "$archive_validation_error" ]; then
+    if ! archive_identity_error=$(awk \
+      -v cli="$expected_cli_name" \
+      -v helper="$expected_helper_name" '
+      {
+        if (++seen[$0] > 1 && duplicate == "") duplicate = $0
+        path = $0
+        sub(/\/$/, "", path)
+        count = split(path, components, "/")
+        base = components[count]
+        if ($0 !~ /\/$/ && \
+            ((cli != "" && base == cli) || (helper != "" && base == helper))) {
+          executable_count[base]++
+        }
+      }
+      END {
+        if (duplicate != "") {
+          print "duplicate archive member: " duplicate
+          exit 1
+        }
+        if (cli != "" && executable_count[cli] > 1) {
+          print "ambiguous archive executable: " cli
+          exit 1
+        }
+        if (helper != "" && executable_count[helper] > 1) {
+          print "ambiguous archive executable: " helper
+          exit 1
+        }
+      }
+    ' "$archive_names"); then
+      archive_validation_error=${archive_identity_error:-cannot inspect archive member identities}
+    fi
   fi
 
   if [ -z "$archive_validation_error" ]; then
@@ -372,11 +411,13 @@ extract_binary() {
 
   case "$archive" in
     *.tar.gz|*.tgz)
-      if ! archive_validation_error=$(validate_tar_archive "$archive"); then
+      if ! archive_validation_error=$(validate_tar_archive \
+        "$archive" "$bin_name" "$TRAY_HELPER_NAME"); then
         err "extract" "unsafe release archive: $archive_validation_error"
       fi
       mkdir -p "$out_dir"
-      tar -xzf "$archive" -C "$out_dir" || err "extract" "failed to extract $(basename "$archive")"
+      TAR_OPTIONS= LC_ALL=C tar -xzf "$archive" -C "$out_dir" || \
+        err "extract" "failed to extract $(basename "$archive")"
       ;;
     *)
       err "extract" "unsupported archive format: $(basename "$archive")"
@@ -481,10 +522,9 @@ musl_fallback_target() {
   esac
 }
 
-# Download, verify and install the asset for a target using the already-fetched
-# release JSON. Sets INSTALLED_ASSET_URL on success. Returns 2 when the target
-# has no published asset so the caller can decide how to handle it.
-download_and_install_target() {
+# Download, verify, extract, and validate an asset without publishing it.
+# Returns 2 when the target has no asset and 3 when its CLI cannot run.
+download_and_stage_target() {
   install_target="$1"
   install_asset_url=$(printf '%s' "$json" | asset_url_from_json "$BIN_NAME" "$release_version" "$install_target")
 
@@ -500,16 +540,32 @@ download_and_install_target() {
   verify_checksum "$install_archive" "$checksums" "$install_asset_name"
 
   install_extract_dir="$tmpdir/extract-$install_target"
-  install_bin_file=$(extract_binary "$install_archive" "$install_extract_dir" "$BIN_NAME")
-  install_bin "$install_bin_file" "$bin_dir/$BIN_NAME" || err "install" "failed to install binary to $bin_dir/$BIN_NAME"
-  install_optional_tray_helper "$install_extract_dir" "$bin_dir"
+  install_bin_file=$(extract_binary \
+    "$install_archive" "$install_extract_dir" "$BIN_NAME") || return 1
 
-  INSTALLED_ASSET_URL="$install_asset_url"
-  FINAL_EXTRACT_DIR="$install_extract_dir"
-}
+  if install_version_output=$("$install_bin_file" \
+    --no-update-check --version 2>/dev/null); then
+    install_version_status=0
+  else
+    install_version_status=$?
+  fi
+  install_version=$(printf '%s\n' "$install_version_output" | \
+    awk 'NF { value=$NF } END { print value }')
+  if [ "$install_version_status" -ne 0 ] || [ -z "$install_version" ]; then
+    return 3
+  fi
 
-binary_runs() {
-  "$bin_dir/$BIN_NAME" --version >/dev/null 2>&1
+  install_helper_file=$(find_binary_in_dir "$install_extract_dir" "$TRAY_HELPER_NAME")
+  if [ -n "${install_helper_file:-}" ] && \
+     { [ ! -f "$install_helper_file" ] || [ -L "$install_helper_file" ]; }; then
+    return 1
+  fi
+
+  STAGED_BIN_FILE=$install_bin_file
+  STAGED_HELPER_FILE=${install_helper_file:-}
+  STAGED_EXTRACT_DIR=$install_extract_dir
+  STAGED_ASSET_URL=$install_asset_url
+  STAGED_VERSION=$install_version
 }
 
 # Directories on sudo's default secure_path. A binary in one of these is
@@ -969,6 +1025,8 @@ data_home="$2"
 config_home="$3"
 profile_home="$4"
 failure_hook="${5:-}"
+failure_after_hook="${6:-}"
+rollback_failure_hook="${7:-}"
 app_id=dev.wakezilla.Wakezilla
 icon_name=$app_id.png
 app_dir="$data_home/applications"
@@ -1159,6 +1217,7 @@ snapshot_target() {
 restore_target() {
   restore_key="$1"
   restore_path="$2"
+  [ "$rollback_failure_hook" != "$restore_key" ] || return 1
   if [ -f "$snapshot_dir/$restore_key.present" ]; then
     atomic_restore "$snapshot_dir/$restore_key.file" "$restore_path"
   else
@@ -1171,25 +1230,28 @@ publish_target() {
   publish_source="$2"
   publish_path="$3"
   publish_mode="$4"
+  touched_targets="$publish_key $touched_targets"
   [ "$failure_hook" != "$publish_key" ] || return 1
   atomic_copy "$publish_source" "$publish_path" "$publish_mode" || return 1
-  touched_targets="$publish_key $touched_targets"
+  [ "$failure_after_hook" != "$publish_key" ] || return 1
 }
 
 rollback_profile() {
+  rollback_failed=no
   set +e
   for rollback_key in $touched_targets; do
     case "$rollback_key" in
-      icon48) restore_target icon48 "$icon_48_target" ;;
-      icon128) restore_target icon128 "$icon_128_target" ;;
-      icon256) restore_target icon256 "$icon_256_target" ;;
-      application) restore_target application "$application_target" ;;
-      desktop) restore_target desktop "$desktop_target" ;;
-      legacy) restore_target legacy "$legacy_entry" ;;
-      autostart) restore_target autostart "$autostart_target" ;;
+      icon48) restore_target icon48 "$icon_48_target" || rollback_failed=yes ;;
+      icon128) restore_target icon128 "$icon_128_target" || rollback_failed=yes ;;
+      icon256) restore_target icon256 "$icon_256_target" || rollback_failed=yes ;;
+      application) restore_target application "$application_target" || rollback_failed=yes ;;
+      desktop) restore_target desktop "$desktop_target" || rollback_failed=yes ;;
+      legacy) restore_target legacy "$legacy_entry" || rollback_failed=yes ;;
+      autostart) restore_target autostart "$autostart_target" || rollback_failed=yes ;;
     esac
   done
   set -e
+  [ "$rollback_failed" = no ]
 }
 
 transaction_cleanup() {
@@ -1197,7 +1259,10 @@ transaction_cleanup() {
   trap - 0 1 2 15
   if [ "${transaction_active:-no}" = yes ]; then
     printf '%s\n' 'warning: Linux desktop integration failed; rolling back profile files' >&2
-    rollback_profile
+    if ! rollback_profile; then
+      printf '%s\n' 'warning: profile rollback incomplete; manual recovery may be required' >&2
+      transaction_status=1
+    fi
   fi
   exit "$transaction_status"
 }
@@ -1268,8 +1333,8 @@ if [ -n "$desktop_target" ]; then
   publish_target desktop "$stage_dir/application.desktop" "$desktop_target" 0755
 fi
 if legacy_is_owned "$legacy_entry"; then
-  rm -f "$legacy_entry"
   touched_targets="legacy $touched_targets"
+  rm -f "$legacy_entry"
 fi
 publish_target autostart "$stage_dir/autostart.desktop" "$autostart_target" 0644
 transaction_active=no
@@ -1290,6 +1355,8 @@ apply_linux_profile_as_user() {
   apply_uid="$6"
   apply_gid="$7"
   apply_failure_hook="${8:-}"
+  apply_failure_after_hook="${9:-}"
+  apply_rollback_failure_hook="${10:-}"
 
   apply_chown=
   apply_env=
@@ -1342,7 +1409,8 @@ apply_linux_profile_as_user() {
       PATH=/usr/local/bin:/usr/bin:/bin \
       "$apply_shell" "$apply_stage/apply-profile.sh" \
       "$apply_stage" "$apply_data_home" "$apply_config_home" "$apply_home" \
-      "$apply_failure_hook"
+      "$apply_failure_hook" "$apply_failure_after_hook" \
+      "$apply_rollback_failure_hook"
     return $?
   fi
   if [ "$apply_runner_kind" = "runuser" ]; then
@@ -1354,7 +1422,8 @@ apply_linux_profile_as_user() {
       PATH=/usr/local/bin:/usr/bin:/bin \
       "$apply_shell" "$apply_stage/apply-profile.sh" \
       "$apply_stage" "$apply_data_home" "$apply_config_home" "$apply_home" \
-      "$apply_failure_hook"
+      "$apply_failure_hook" "$apply_failure_after_hook" \
+      "$apply_rollback_failure_hook"
     return $?
   fi
   warn "cannot apply Linux desktop integration as $apply_user: sudo or runuser is unavailable"
@@ -1430,7 +1499,10 @@ install_linux_desktop_integration() (
     trap - 0 1 2 15
     if [ "${linux_transaction_active:-no}" = yes ]; then
       warn "Linux desktop integration failed; rolling back profile files"
-      linux_rollback_profile
+      if ! linux_rollback_profile; then
+        warn "profile rollback incomplete; manual recovery may be required"
+        linux_cleanup_status=1
+      fi
     fi
     rm -rf "$linux_stage"
     exit "$linux_cleanup_status"
@@ -1456,8 +1528,12 @@ install_linux_desktop_integration() (
 
   if [ "$integration_root" = "yes" ]; then
     linux_failure_hook=
+    linux_failure_after_hook=
+    linux_rollback_failure_hook=
     if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ]; then
       linux_failure_hook=${WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION:-}
+      linux_failure_after_hook=${WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION_AFTER:-}
+      linux_rollback_failure_hook=${WAKEZILLA_TEST_FAIL_LINUX_ROLLBACK:-}
     fi
     for linux_size in 48 128 256; do
       cp "$linux_extract_dir/icons/hicolor/${linux_size}x${linux_size}/apps/$linux_icon_name" \
@@ -1474,7 +1550,9 @@ install_linux_desktop_integration() (
       "$integration_user" \
       "$integration_uid" \
       "$integration_gid" \
-      "$linux_failure_hook"
+      "$linux_failure_hook" \
+      "$linux_failure_after_hook" \
+      "$linux_rollback_failure_hook"
     linux_apply_status=$?
     set -e
     case "$linux_apply_status" in
@@ -1525,6 +1603,10 @@ install_linux_desktop_integration() (
   linux_restore_target() {
     linux_restore_key="$1"
     linux_restore_path="$2"
+    if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ] && \
+       [ "${WAKEZILLA_TEST_FAIL_LINUX_ROLLBACK:-}" = "$linux_restore_key" ]; then
+      return 1
+    fi
     if [ -f "$linux_snapshot_dir/$linux_restore_key.present" ]; then
       atomic_restore_file "$linux_snapshot_dir/$linux_restore_key.file" "$linux_restore_path"
     else
@@ -1533,19 +1615,21 @@ install_linux_desktop_integration() (
   }
 
   linux_rollback_profile() {
+    linux_rollback_failed=no
     set +e
     for linux_rollback_key in $linux_touched_targets; do
       case "$linux_rollback_key" in
-        icon48) linux_restore_target icon48 "$linux_icon_48_target" ;;
-        icon128) linux_restore_target icon128 "$linux_icon_128_target" ;;
-        icon256) linux_restore_target icon256 "$linux_icon_256_target" ;;
-        application) linux_restore_target application "$linux_application_target" ;;
-        desktop) linux_restore_target desktop "$linux_desktop_target" ;;
-        legacy) linux_restore_target legacy "$linux_legacy_entry" ;;
-        autostart) linux_restore_target autostart "$linux_autostart_target" ;;
+        icon48) linux_restore_target icon48 "$linux_icon_48_target" || linux_rollback_failed=yes ;;
+        icon128) linux_restore_target icon128 "$linux_icon_128_target" || linux_rollback_failed=yes ;;
+        icon256) linux_restore_target icon256 "$linux_icon_256_target" || linux_rollback_failed=yes ;;
+        application) linux_restore_target application "$linux_application_target" || linux_rollback_failed=yes ;;
+        desktop) linux_restore_target desktop "$linux_desktop_target" || linux_rollback_failed=yes ;;
+        legacy) linux_restore_target legacy "$linux_legacy_entry" || linux_rollback_failed=yes ;;
+        autostart) linux_restore_target autostart "$linux_autostart_target" || linux_rollback_failed=yes ;;
       esac
     done
     set -e
+    [ "$linux_rollback_failed" = no ]
   }
 
   linux_publish_target() {
@@ -1553,12 +1637,16 @@ install_linux_desktop_integration() (
     linux_publish_source="$2"
     linux_publish_path="$3"
     linux_publish_mode="$4"
+    linux_touched_targets="$linux_publish_key $linux_touched_targets"
     if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ] && \
        [ "${WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION:-}" = "$linux_publish_key" ]; then
       return 1
     fi
     atomic_install_file "$linux_publish_source" "$linux_publish_path" "$linux_publish_mode" || return 1
-    linux_touched_targets="$linux_publish_key $linux_touched_targets"
+    if [ -n "${WAKEZILLA_INSTALL_SH_TEST_MODE:-}" ] && \
+       [ "${WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION_AFTER:-}" = "$linux_publish_key" ]; then
+      return 1
+    fi
   }
 
   linux_snapshot_target icon48 "$linux_icon_48_target" || exit 1
@@ -1587,8 +1675,8 @@ install_linux_desktop_integration() (
       "$linux_desktop_target" 0755 || exit 1
   fi
   if legacy_linux_autostart_is_owned "$linux_legacy_entry"; then
-    rm -f "$linux_legacy_entry" || exit 1
     linux_touched_targets="legacy $linux_touched_targets"
+    rm -f "$linux_legacy_entry" || exit 1
   fi
   linux_publish_target autostart "$linux_stage/autostart.desktop" \
     "$linux_autostart_target" 0644 || exit 1
@@ -1631,45 +1719,141 @@ json=$(fetch_release_json "${VERSION:-}") || err "download" "failed to fetch rel
 release_version=$(printf '%s' "$json" | release_version_from_json)
 
 tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t wakezilla-install)
+binary_transaction_active=no
+binary_touched_targets=
 cleanup() {
-  rm -rf "$tmpdir"
+  cleanup_status=$?
+  trap - 0 1 2 15
+  if [ "${binary_transaction_active:-no}" = yes ]; then
+    if ! binary_rollback; then
+      warn "binary rollback incomplete; manual recovery may be required"
+      cleanup_status=1
+    fi
+  fi
+  rm -rf "$tmpdir" || cleanup_status=1
+  exit "$cleanup_status"
 }
 cleanup_and_exit() {
-  cleanup
   exit 1
 }
-trap cleanup EXIT
-trap cleanup_and_exit INT TERM
+trap cleanup 0
+trap cleanup_and_exit 1 2 15
 
 checksums="$tmpdir/SHA256SUMS"
 
 mkdir -p "$bin_dir" || err "install" "failed to create install directory: $bin_dir"
 
-if ! download_and_install_target "$target"; then
-  {
-    printf '%s %s does not include a prebuilt binary for %s.\n' "$BIN_NAME" "v$release_version" "$target"
-    printf '\nAvailable targets:\n'
-    printf '%s' "$json" | available_targets_from_json "$BIN_NAME" | while IFS= read -r available_target; do
-      [ -n "$available_target" ] && printf ' - %s\n' "$available_target"
-    done
-  } >&2
-  err "download" "no release asset found for target: $target"
-fi
+binary_snapshot_dir="$tmpdir/binary-rollback"
+mkdir -p "$binary_snapshot_dir" || err "install" "failed to create binary rollback state"
+binary_cli_target="$bin_dir/$BIN_NAME"
+binary_helper_target="$bin_dir/$TRAY_HELPER_NAME"
 
-# A gnu (glibc) binary built on a newer toolchain can fail to run on hosts with
-# an older glibc -- a common Raspberry Pi case. Fall back to the static musl
-# build, which carries no libc version requirement.
-if ! binary_runs; then
-  fallback_target=$(musl_fallback_target "$target")
-  if [ -n "$fallback_target" ] && [ "$fallback_target" != "$target" ]; then
-    warn "$BIN_NAME for $target installed but failed to run (likely an incompatible libc); retrying with $fallback_target"
-    if download_and_install_target "$fallback_target"; then
-      target="$fallback_target"
-    else
-      warn "no $fallback_target asset available for v$release_version; keeping the $target build"
-    fi
+binary_snapshot_target() {
+  binary_snapshot_key="$1"
+  binary_snapshot_path="$2"
+  if [ -e "$binary_snapshot_path" ] || [ -L "$binary_snapshot_path" ]; then
+    [ -f "$binary_snapshot_path" ] || return 1
+    [ ! -L "$binary_snapshot_path" ] || return 1
+    cp -p "$binary_snapshot_path" \
+      "$binary_snapshot_dir/$binary_snapshot_key.file" || return 1
+    : > "$binary_snapshot_dir/$binary_snapshot_key.present" || return 1
+  else
+    : > "$binary_snapshot_dir/$binary_snapshot_key.missing" || return 1
   fi
+}
+
+binary_restore_target() {
+  binary_restore_key="$1"
+  binary_restore_path="$2"
+  if [ -f "$binary_snapshot_dir/$binary_restore_key.present" ]; then
+    atomic_restore_file "$binary_snapshot_dir/$binary_restore_key.file" \
+      "$binary_restore_path"
+  else
+    rm -f "$binary_restore_path"
+  fi
+}
+
+binary_rollback() {
+  binary_rollback_failed=no
+  set +e
+  for binary_rollback_key in $binary_touched_targets; do
+    case "$binary_rollback_key" in
+      cli)
+        binary_restore_target cli "$binary_cli_target" || \
+          binary_rollback_failed=yes
+        ;;
+      helper)
+        binary_restore_target helper "$binary_helper_target" || \
+          binary_rollback_failed=yes
+        ;;
+    esac
+  done
+  set -e
+  [ "$binary_rollback_failed" = no ]
+}
+
+binary_snapshot_target cli "$binary_cli_target" || \
+  err "install" "cannot snapshot existing CLI destination"
+binary_snapshot_target helper "$binary_helper_target" || \
+  err "install" "cannot snapshot existing tray helper destination"
+
+if download_and_stage_target "$target"; then
+  stage_status=0
+else
+  stage_status=$?
 fi
+case "$stage_status" in
+  0) ;;
+  2)
+    {
+      printf '%s %s does not include a prebuilt binary for %s.\n' \
+        "$BIN_NAME" "v$release_version" "$target"
+      printf '\nAvailable targets:\n'
+      printf '%s' "$json" | available_targets_from_json "$BIN_NAME" | \
+        while IFS= read -r available_target; do
+          [ -n "$available_target" ] && printf ' - %s\n' "$available_target"
+        done
+    } >&2
+    err "download" "no release asset found for target: $target"
+    ;;
+  3)
+    # A glibc build can be incompatible with an older host. Validate the static
+    # musl candidate before allowing either candidate to reach the install dir.
+    original_target=$target
+    fallback_target=$(musl_fallback_target "$target")
+    if [ -z "$fallback_target" ] || [ "$fallback_target" = "$target" ]; then
+      err "install" "no runnable $BIN_NAME binary is available for $target"
+    fi
+    warn "$BIN_NAME for $target failed validation; retrying with $fallback_target"
+    if download_and_stage_target "$fallback_target"; then
+      fallback_status=0
+    else
+      fallback_status=$?
+    fi
+    if [ "$fallback_status" -ne 0 ]; then
+      err "install" "no runnable $BIN_NAME binary is available for $original_target or $fallback_target"
+    fi
+    target=$fallback_target
+    ;;
+  *) err "install" "failed to stage $BIN_NAME for $target" ;;
+esac
+
+INSTALLED_ASSET_URL=$STAGED_ASSET_URL
+FINAL_EXTRACT_DIR=$STAGED_EXTRACT_DIR
+installed_version=$STAGED_VERSION
+
+binary_transaction_active=yes
+binary_touched_targets="helper $binary_touched_targets"
+if [ -n "$STAGED_HELPER_FILE" ]; then
+  install_bin "$STAGED_HELPER_FILE" "$binary_helper_target" || \
+    err "install" "failed to install binary to $binary_helper_target"
+else
+  rm -f "$binary_helper_target" || \
+    err "install" "failed to remove stale tray helper at $binary_helper_target"
+fi
+binary_touched_targets="cli $binary_touched_targets"
+install_bin "$STAGED_BIN_FILE" "$binary_cli_target" || \
+  err "install" "failed to install binary to $binary_cli_target"
 
 case "$target" in
   *-unknown-linux-gnu|*-unknown-linux-musl)
@@ -1678,19 +1862,12 @@ case "$target" in
     fi
     ;;
 esac
+binary_transaction_active=no
 
-set +e
-version_output=$("$bin_dir/$BIN_NAME" --version 2>/dev/null)
-version_status=$?
-set -e
-installed_version=
-if [ "$version_status" -eq 0 ]; then
-  installed_version=$(printf '%s\n' "$version_output" | awk 'NF { value=$NF } END { print value }')
-fi
-if [ "$version_status" -eq 0 ] && [ -n "$installed_version" ]; then
+if [ -n "$installed_version" ]; then
   info "installed $BIN_NAME v$installed_version to $bin_dir/$BIN_NAME"
 else
-  warn "$BIN_NAME installed, but '$BIN_NAME --version' failed or produced no output"
+  err "install" "validated $BIN_NAME version unexpectedly became empty"
 fi
 
 info "resolved $BIN_NAME v$release_version"

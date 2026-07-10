@@ -122,9 +122,11 @@ if [ -n "$output" ]; then
       temp_dir=$(mktemp -d)
       mkdir -p "$temp_dir/archive"
       if [ "${WAKEZILLA_FAKE_VERSION_EXITS_NONZERO:-}" = "1" ]; then
-        printf '#!/usr/bin/env sh\nif [ "${1:-}" = "--version" ]; then\n  printf "wakezilla 0.1.49\\n"\n  exit 1\nfi\nexit 0\n' > "$temp_dir/archive/wakezilla"
+        printf '#!/usr/bin/env sh\nif [ "${1:-}" = "--no-update-check" ] && [ "${2:-}" = "--version" ]; then\n  printf "wakezilla 0.1.49\\n"\n  exit 1\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
+      elif [ "${WAKEZILLA_FAKE_VERSION_EMPTY:-}" = "1" ]; then
+        printf '#!/usr/bin/env sh\nif [ "${1:-}" = "--no-update-check" ] && [ "${2:-}" = "--version" ]; then\n  exit 0\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
       else
-        printf '#!/usr/bin/env sh\nprintf "wakezilla 0.1.49\\n"\n' > "$temp_dir/archive/wakezilla"
+        printf '#!/usr/bin/env sh\nif [ "${1:-}" = "--no-update-check" ] && [ "${2:-}" = "--version" ]; then\n  printf "wakezilla 0.1.49\\n"\n  exit 0\nfi\nexit 97\n' > "$temp_dir/archive/wakezilla"
       fi
       chmod +x "$temp_dir/archive/wakezilla"
       printf '#!/usr/bin/env sh\nexit 0\n' > "$temp_dir/archive/wakezilla-tray"
@@ -200,11 +202,11 @@ write_linux_release_archive() {
   write_linux_integration_fixture "$archive_stage"
   cat > "$archive_stage/wakezilla" <<SH
 #!/usr/bin/env sh
-if [ "\${1:-}" = "--version" ]; then
+if [ "\${1:-}" = "--no-update-check" ] && [ "\${2:-}" = "--version" ]; then
   printf 'wakezilla 0.1.49\\n'
   exit $version_status
 fi
-exit 0
+exit 97
 SH
   chmod 755 "$archive_stage/wakezilla"
   for archive_size in 48 128 256; do
@@ -486,6 +488,80 @@ SH
   rm -rf "$temp_dir"
 }
 
+test_linux_fallback_rejects_unrunnable_musl_without_publication() {
+  temp_dir=$(mktemp -d)
+  mkdir -p "$temp_dir/bin" "$temp_dir/install" "$temp_dir/home"
+  write_install_dependency_stubs "$temp_dir/bin"
+  gnu_archive="$temp_dir/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz"
+  musl_archive="$temp_dir/wakezilla-0.1.49-x86_64-unknown-linux-musl.tar.gz"
+  write_linux_release_archive "$gnu_archive" 1 gnu-broken
+  write_linux_release_archive "$musl_archive" 1 musl-broken
+  {
+    printf '%s  %s\n' "$(sha256_file "$gnu_archive")" "${gnu_archive##*/}"
+    printf '%s  %s\n' "$(sha256_file "$musl_archive")" "${musl_archive##*/}"
+  } > "$temp_dir/SHA256SUMS"
+  cat > "$temp_dir/release.json" <<'EOF'
+{
+  "tag_name": "v0.1.49",
+  "assets": [
+    {"name":"wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz","browser_download_url":"https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz"},
+    {"name":"wakezilla-0.1.49-x86_64-unknown-linux-musl.tar.gz","browser_download_url":"https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-musl.tar.gz"}
+  ]
+}
+EOF
+  cat > "$temp_dir/bin/curl" <<SH
+#!/usr/bin/env sh
+set -eu
+out=
+url=
+while [ "\$#" -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    -H) shift 2 ;;
+    -*) shift ;;
+    *) url="\$1"; shift ;;
+  esac
+done
+case "\$url" in
+  https://api.github.com/repos/guibeira/wakezilla/releases/tags/v0.1.49) cat '$temp_dir/release.json' ;;
+  https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-gnu.tar.gz) cp '$gnu_archive' "\$out" ;;
+  https://example.test/wakezilla-0.1.49-x86_64-unknown-linux-musl.tar.gz) cp '$musl_archive' "\$out" ;;
+  https://github.com/guibeira/wakezilla/releases/download/v0.1.49/SHA256SUMS) cp '$temp_dir/SHA256SUMS' "\$out" ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod 755 "$temp_dir/bin/curl"
+  printf 'prior cli\n' > "$temp_dir/install/wakezilla"
+  printf 'prior helper\n' > "$temp_dir/install/wakezilla-tray"
+
+  output_file=$(mktemp)
+  set +e
+  PATH="$temp_dir/bin:$PATH" HOME="$temp_dir/home" BIN_DIR="$temp_dir/install" \
+    XDG_DATA_HOME="$temp_dir/data" XDG_CONFIG_HOME="$temp_dir/config" \
+    TARGET=x86_64-unknown-linux-gnu DISPLAY= WAYLAND_DISPLAY= \
+    "$SCRIPT" 0.1.49 > "$output_file" 2>&1
+  status=$?
+  set -e
+  output=$(cat "$output_file")
+  rm -f "$output_file"
+
+  if [ "$status" -eq 0 ]; then
+    fail "unrunnable musl fallback: expected fatal status"
+  fi
+  assert_contains "$output" "retrying with x86_64-unknown-linux-musl" \
+    "unrunnable musl fallback attempted"
+  assert_contains "$output" "no runnable wakezilla binary" \
+    "unrunnable musl fallback fatal error"
+  assert_eq "prior cli" "$(cat "$temp_dir/install/wakezilla")" \
+    "unrunnable musl fallback preserves CLI"
+  assert_eq "prior helper" "$(cat "$temp_dir/install/wakezilla-tray")" \
+    "unrunnable musl fallback preserves helper"
+  if [ -d "$temp_dir/data/applications" ]; then
+    fail "unrunnable musl fallback: expected no integration"
+  fi
+  rm -rf "$temp_dir"
+}
+
 test_end_to_end_rejects_malicious_archive_before_extracting() {
   temp_dir=$(mktemp -d)
   mkdir -p "$temp_dir/bin" "$temp_dir/archive" "$temp_dir/install" "$temp_dir/home"
@@ -554,18 +630,23 @@ SH
   rm -rf "$temp_dir"
 }
 
-test_version_command_nonzero_warns() {
+test_unrunnable_candidate_is_fatal_without_publication() {
   temp_dir=$(mktemp -d)
   old_path="$PATH"
   write_install_dependency_stubs "$temp_dir/bin"
   write_fixture_curl "$temp_dir/bin/curl"
   TARGET=x86_64-unknown-linux-gnu
   BIN_DIR="$temp_dir/install-bin"
+  install_dir=$BIN_DIR
   WAKEZILLA_FAKE_CURL_FIXTURE="$ROOT_DIR/tests/fixtures/install/release-v0.1.49.json"
   WAKEZILLA_FAKE_VERSION_EXITS_NONZERO=1
   PATH="$temp_dir/bin:$PATH"
   export TARGET BIN_DIR WAKEZILLA_FAKE_CURL_FIXTURE WAKEZILLA_FAKE_VERSION_EXITS_NONZERO PATH
-  mkdir -p "$temp_dir/home"
+  mkdir -p "$temp_dir/home" "$BIN_DIR"
+  printf 'existing cli\n' > "$BIN_DIR/wakezilla"
+  printf 'existing helper\n' > "$BIN_DIR/wakezilla-tray"
+  chmod 0640 "$BIN_DIR/wakezilla"
+  chmod 0600 "$BIN_DIR/wakezilla-tray"
   HOME="$temp_dir/home" \
   XDG_DATA_HOME="$temp_dir/data" \
   XDG_CONFIG_HOME="$temp_dir/config" \
@@ -575,11 +656,107 @@ test_version_command_nonzero_warns() {
   PATH="$old_path"
   export PATH
 
-  assert_eq "0" "$status" "version command nonzero install status"
-  assert_contains "$output" "warning: wakezilla installed, but 'wakezilla --version' failed or produced no output" "version command nonzero warning"
-  assert_not_contains "$output" "installed wakezilla v0.1.49 to $temp_dir/install-bin/wakezilla" "version command nonzero success message"
+  if [ "$status" -eq 0 ]; then
+    fail "unrunnable candidate: expected fatal install status"
+  fi
+  assert_contains "$output" "no runnable wakezilla binary" "unrunnable candidate fatal error"
+  assert_eq "existing cli" "$(cat "$install_dir/wakezilla")" \
+    "unrunnable candidate preserves existing CLI"
+  assert_eq "existing helper" "$(cat "$install_dir/wakezilla-tray")" \
+    "unrunnable candidate preserves existing helper"
+  assert_eq "640" "$(portable_file_mode "$install_dir/wakezilla")" \
+    "unrunnable candidate preserves existing CLI mode"
+  assert_eq "600" "$(portable_file_mode "$install_dir/wakezilla-tray")" \
+    "unrunnable candidate preserves existing helper mode"
+  if [ -d "$temp_dir/data/applications" ] || [ -d "$temp_dir/config/autostart" ]; then
+    fail "unrunnable candidate: expected no profile integration"
+  fi
 
   rm -rf "$temp_dir"
+}
+
+test_empty_version_candidate_is_fatal_without_publication() {
+  temp_dir=$(mktemp -d)
+  old_path="$PATH"
+  write_install_dependency_stubs "$temp_dir/bin"
+  write_fixture_curl "$temp_dir/bin/curl"
+  TARGET=x86_64-unknown-linux-gnu
+  BIN_DIR="$temp_dir/install-bin"
+  WAKEZILLA_FAKE_CURL_FIXTURE="$ROOT_DIR/tests/fixtures/install/release-v0.1.49.json"
+  WAKEZILLA_FAKE_VERSION_EMPTY=1
+  PATH="$temp_dir/bin:$PATH"
+  export TARGET BIN_DIR WAKEZILLA_FAKE_CURL_FIXTURE WAKEZILLA_FAKE_VERSION_EMPTY PATH
+  mkdir -p "$temp_dir/home"
+  HOME="$temp_dir/home" XDG_DATA_HOME="$temp_dir/data" \
+    XDG_CONFIG_HOME="$temp_dir/config" DISPLAY= WAYLAND_DISPLAY= run_script
+  unset TARGET BIN_DIR WAKEZILLA_FAKE_CURL_FIXTURE WAKEZILLA_FAKE_VERSION_EMPTY
+  PATH="$old_path"
+  export PATH
+
+  if [ "$status" -eq 0 ]; then
+    fail "empty version candidate: expected fatal install status"
+  fi
+  assert_contains "$output" "no runnable wakezilla binary" \
+    "empty version candidate fatal error"
+  if [ -e "$temp_dir/install-bin/wakezilla" ] || \
+     [ -e "$temp_dir/install-bin/wakezilla-tray" ]; then
+    fail "empty version candidate: expected no binary publication"
+  fi
+  rm -rf "$temp_dir"
+}
+
+test_integration_failure_rolls_back_installed_binaries() {
+  for prior_state in existing missing; do
+    temp_dir=$(mktemp -d)
+    old_path="$PATH"
+    write_install_dependency_stubs "$temp_dir/bin"
+    write_fixture_curl "$temp_dir/bin/curl"
+    install_dir="$temp_dir/install-bin"
+    mkdir -p "$temp_dir/home" "$temp_dir/data" "$install_dir"
+    printf 'blocks applications directory\n' > "$temp_dir/data/applications"
+    if [ "$prior_state" = existing ]; then
+      printf 'prior cli\n' > "$install_dir/wakezilla"
+      printf 'prior helper\n' > "$install_dir/wakezilla-tray"
+      chmod 0640 "$install_dir/wakezilla"
+      chmod 0600 "$install_dir/wakezilla-tray"
+    fi
+
+    TARGET=x86_64-unknown-linux-gnu \
+    BIN_DIR="$install_dir" \
+    WAKEZILLA_FAKE_CURL_FIXTURE="$ROOT_DIR/tests/fixtures/install/release-v0.1.49.json" \
+    PATH="$temp_dir/bin:$PATH" \
+    HOME="$temp_dir/home" \
+    XDG_DATA_HOME="$temp_dir/data" \
+    XDG_CONFIG_HOME="$temp_dir/config" \
+    DISPLAY= WAYLAND_DISPLAY= \
+      run_script
+
+    if [ "$status" -eq 0 ]; then
+      fail "integration failure $prior_state binaries: expected nonzero status"
+    fi
+    assert_contains "$output" "error[integration]" \
+      "integration failure $prior_state binaries error"
+    if [ "$prior_state" = existing ]; then
+      assert_eq "prior cli" "$(cat "$install_dir/wakezilla")" \
+        "integration failure restores prior CLI"
+      assert_eq "prior helper" "$(cat "$install_dir/wakezilla-tray")" \
+        "integration failure restores prior helper"
+      assert_eq "640" "$(portable_file_mode "$install_dir/wakezilla")" \
+        "integration failure restores prior CLI mode"
+      assert_eq "600" "$(portable_file_mode "$install_dir/wakezilla-tray")" \
+        "integration failure restores prior helper mode"
+    else
+      if [ -e "$install_dir/wakezilla" ] || [ -L "$install_dir/wakezilla" ] || \
+         [ -e "$install_dir/wakezilla-tray" ] || [ -L "$install_dir/wakezilla-tray" ]; then
+        fail "integration failure removes newly installed binaries"
+      fi
+    fi
+    temp_count=$(find "$install_dir" -name '.*.install.*' -print | wc -l | tr -d ' ')
+    assert_eq "0" "$temp_count" "integration failure binary temporary cleanup"
+    PATH="$old_path"
+    export PATH
+    rm -rf "$temp_dir"
+  done
 }
 
 test_missing_dependency_reports_hint() {
@@ -644,8 +821,11 @@ test_help_includes_required_docs
 test_no_args_resolves_release_metadata
 test_end_to_end_install_with_fake_curl
 test_linux_integration_uses_final_musl_fallback_extract_once
+test_linux_fallback_rejects_unrunnable_musl_without_publication
 test_end_to_end_rejects_malicious_archive_before_extracting
-test_version_command_nonzero_warns
+test_unrunnable_candidate_is_fatal_without_publication
+test_empty_version_candidate_is_fatal_without_publication
+test_integration_failure_rolls_back_installed_binaries
 test_missing_dependency_reports_hint
 test_unknown_args_fail_with_parser_error
 test_mode_executes_cleanly
@@ -923,8 +1103,99 @@ test_validate_tar_archive_rejects_unsafe_member_kinds_and_paths() {
   rm -rf "$temp_dir"
 }
 
+test_validate_tar_archive_rejects_control_character_member_names() {
+  temp_dir=$(mktemp -d)
+  archive_dir="$temp_dir/archive"
+  mkdir -p "$archive_dir"
+
+  for control_name in tab carriage_return escape delete line_feed; do
+    case "$control_name" in
+      tab) control_character=$(printf '\t_'); control_character=${control_character%_} ;;
+      carriage_return) control_character=$(printf '\r_'); control_character=${control_character%_} ;;
+      escape) control_character=$(printf '\033_'); control_character=${control_character%_} ;;
+      delete) control_character=$(printf '\177_'); control_character=${control_character%_} ;;
+      line_feed) control_character=$(printf '\n_'); control_character=${control_character%_} ;;
+    esac
+    archive_member="unsafe${control_character}member"
+    printf 'control fixture\n' > "$archive_dir/$archive_member"
+    tar -C "$archive_dir" -czf "$temp_dir/$control_name.tar.gz" \
+      "$archive_member" 2>/dev/null
+
+    if validation_error=$(validate_tar_archive "$temp_dir/$control_name.tar.gz"); then
+      fail "archive $control_name member name: expected rejection"
+    else
+      assert_contains "$validation_error" "unsupported archive member name" \
+        "archive $control_name member name rejection"
+    fi
+    rm -f "$archive_dir/$archive_member"
+  done
+
+  rm -rf "$temp_dir"
+}
+
+test_validate_tar_archive_rejects_nonportable_and_duplicate_names() {
+  temp_dir=$(mktemp -d)
+  archive_dir="$temp_dir/archive"
+  mkdir -p "$archive_dir/first" "$archive_dir/second"
+  printf 'backslash fixture\n' > "$archive_dir/unsafe\member"
+  printf 'regular fixture\n' > "$archive_dir/regular"
+  printf 'first cli\n' > "$archive_dir/first/wakezilla"
+  printf 'second cli\n' > "$archive_dir/second/wakezilla"
+  printf 'first helper\n' > "$archive_dir/first/wakezilla-tray"
+  printf 'second helper\n' > "$archive_dir/second/wakezilla-tray"
+
+  tar -C "$archive_dir" -czf "$temp_dir/backslash.tar.gz" 'unsafe\member' 2>/dev/null
+  if validation_error=$(validate_tar_archive "$temp_dir/backslash.tar.gz"); then
+    fail "archive backslash member name: expected rejection"
+  else
+    assert_contains "$validation_error" "unsupported archive member name" \
+      "archive backslash member name rejection"
+  fi
+
+  tar -C "$archive_dir" -czf "$temp_dir/duplicate.tar.gz" regular regular 2>/dev/null
+  if validation_error=$(validate_tar_archive "$temp_dir/duplicate.tar.gz"); then
+    fail "archive duplicate member name: expected rejection"
+  else
+    assert_contains "$validation_error" "duplicate archive member" \
+      "archive duplicate member rejection"
+  fi
+
+  for executable_name in wakezilla wakezilla-tray; do
+    tar -C "$archive_dir" -czf "$temp_dir/ambiguous-$executable_name.tar.gz" \
+      "first/$executable_name" "second/$executable_name" 2>/dev/null
+    if validation_error=$(validate_tar_archive \
+      "$temp_dir/ambiguous-$executable_name.tar.gz" wakezilla wakezilla-tray); then
+      fail "archive ambiguous $executable_name basename: expected rejection"
+    else
+      assert_contains "$validation_error" "ambiguous archive executable" \
+        "archive ambiguous $executable_name basename rejection"
+    fi
+  done
+
+  rm -rf "$temp_dir"
+}
+
+test_validate_tar_archive_allows_legacy_directory_named_like_binary() {
+  temp_dir=$(mktemp -d)
+  archive_dir="$temp_dir/archive"
+  mkdir -p "$archive_dir/wakezilla"
+  printf 'legacy nested cli\n' > "$archive_dir/wakezilla/wakezilla"
+  tar -C "$archive_dir" -czf "$temp_dir/legacy-nested.tar.gz" wakezilla 2>/dev/null
+
+  if validation_error=$(validate_tar_archive \
+    "$temp_dir/legacy-nested.tar.gz" wakezilla wakezilla-tray); then
+    :
+  else
+    fail "archive legacy binary directory: expected acceptance, got '$validation_error'"
+  fi
+  rm -rf "$temp_dir"
+}
+
 load_install_helpers
 test_validate_tar_archive_rejects_unsafe_member_kinds_and_paths
+test_validate_tar_archive_rejects_control_character_member_names
+test_validate_tar_archive_rejects_nonportable_and_duplicate_names
+test_validate_tar_archive_allows_legacy_directory_named_like_binary
 if test_canonical_bin_dir_helper_defined; then
   test_canonicalize_bin_dir_makes_relative_path_physical_and_absolute
 fi
@@ -1200,6 +1471,7 @@ test_install_bin_fallback_replaces_symlink() {
   write_exec_wrapper "$temp_dir/path/cp" "$(command -v cp)"
   write_exec_wrapper "$temp_dir/path/chmod" "$(command -v chmod)"
   write_exec_wrapper "$temp_dir/path/mv" "$(command -v mv)"
+  write_exec_wrapper "$temp_dir/path/mktemp" "$(command -v mktemp)"
 
   printf '#!/usr/bin/env sh\nexit 0\n' > "$temp_dir/src"
   printf 'outside\n' > "$temp_dir/outside"
@@ -1224,6 +1496,43 @@ test_install_bin_fallback_replaces_symlink() {
   rm -rf "$temp_dir"
 }
 
+test_install_bin_atomic_failures_preserve_destination() {
+  temp_dir=$(mktemp -d)
+  mkdir -p "$temp_dir/path" "$temp_dir/bin"
+  printf '#!/usr/bin/env sh\nexit 0\n' > "$temp_dir/src"
+
+  for failing_command in cp chmod mv; do
+    rm -f "$temp_dir/path"/*
+    for command_name in dirname rm cp chmod mv mktemp; do
+      if [ "$command_name" = "$failing_command" ]; then
+        cat > "$temp_dir/path/$command_name" <<'SH'
+#!/bin/sh
+exit 73
+SH
+        chmod 755 "$temp_dir/path/$command_name"
+      else
+        write_exec_wrapper "$temp_dir/path/$command_name" "$(command -v "$command_name")"
+      fi
+    done
+    printf 'existing destination\n' > "$temp_dir/bin/wakezilla"
+    chmod 0640 "$temp_dir/bin/wakezilla"
+
+    set +e
+    PATH="$temp_dir/path" install_bin "$temp_dir/src" "$temp_dir/bin/wakezilla"
+    install_status=$?
+    set -e
+    assert_eq "73" "$install_status" \
+      "install bin $failing_command failure propagates status"
+    assert_eq "existing destination" "$(cat "$temp_dir/bin/wakezilla")" \
+      "install bin $failing_command failure preserves destination"
+    assert_eq "640" "$(portable_file_mode "$temp_dir/bin/wakezilla")" \
+      "install bin $failing_command failure preserves mode"
+    temp_count=$(find "$temp_dir/bin" -name '.wakezilla.install.*' -print | wc -l | tr -d ' ')
+    assert_eq "0" "$temp_count" "install bin $failing_command failure cleans temporary"
+  done
+  rm -rf "$temp_dir"
+}
+
 if test_install_release_json_helpers_defined; then
   test_release_version_from_json
   test_asset_url_from_json
@@ -1236,6 +1545,7 @@ if test_install_release_json_helpers_defined; then
   test_install_optional_tray_helper_removes_stale_helper
   test_install_bin_sets_executable
   test_install_bin_fallback_replaces_symlink
+  test_install_bin_atomic_failures_preserve_destination
 fi
 
 test_path_guidance_helpers_defined() {
@@ -1948,7 +2258,7 @@ EOF
   set +e
   HOME="$home_dir" XDG_DATA_HOME="$data_dir" XDG_CONFIG_HOME="$config_dir" \
     WAKEZILLA_EUID=1000 WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
-    WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION=autostart \
+    WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION_AFTER=autostart \
     DISPLAY= WAYLAND_DISPLAY= \
     install_linux_desktop_integration "$extract_dir" "$bin_dir" >/dev/null 2>&1
   install_status=$?
@@ -2005,6 +2315,46 @@ test_linux_integration_profile_directory_modes() {
   rm -rf "$temp_dir"
 }
 
+test_linux_integration_reports_incomplete_rollback_and_continues() {
+  temp_dir=$(mktemp -d)
+  home_dir="$temp_dir/home"
+  extract_dir="$temp_dir/extract"
+  bin_dir="$temp_dir/bin"
+  data_dir="$temp_dir/data"
+  config_dir="$temp_dir/config"
+  app_entry="$data_dir/applications/dev.wakezilla.Wakezilla.desktop"
+  icon_entry="$data_dir/icons/hicolor/48x48/apps/dev.wakezilla.Wakezilla.png"
+  mkdir -p "$home_dir" "$bin_dir" "${app_entry%/*}" "${icon_entry%/*}"
+  write_linux_integration_fixture "$extract_dir"
+  cp "$extract_dir/wakezilla-tray" "$bin_dir/wakezilla-tray"
+  printf 'old application\n' > "$app_entry"
+  printf 'old icon\n' > "$icon_entry"
+  output_file="$temp_dir/output"
+
+  set +e
+  HOME="$home_dir" XDG_DATA_HOME="$data_dir" XDG_CONFIG_HOME="$config_dir" \
+    WAKEZILLA_EUID=1000 WAKEZILLA_INSTALL_SH_TEST_MODE=1 \
+    WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION_AFTER=autostart \
+    WAKEZILLA_TEST_FAIL_LINUX_ROLLBACK=application \
+    DISPLAY= WAYLAND_DISPLAY= \
+    install_linux_desktop_integration "$extract_dir" "$bin_dir" \
+      >"$output_file" 2>&1
+  install_status=$?
+  set -e
+  output=$(cat "$output_file")
+
+  if [ "$install_status" -eq 0 ]; then
+    fail "incomplete profile rollback: expected nonzero status"
+  fi
+  assert_contains "$output" "rollback incomplete" \
+    "incomplete profile rollback warning"
+  assert_not_contains "$(cat "$app_entry")" "old application" \
+    "injected application restore failure remains visible"
+  assert_eq "old icon" "$(cat "$icon_entry")" \
+    "incomplete profile rollback continues restoring icons"
+  rm -rf "$temp_dir"
+}
+
 test_linux_integration_root_helper_rolls_back_late_failure() {
   temp_dir=$(mktemp -d)
   root_home="$temp_dir/root-home"
@@ -2046,7 +2396,7 @@ EOF
     WAKEZILLA_TEST_SUDO_USER=wakezilla-test-user \
     WAKEZILLA_TEST_SUDO_UID="$test_uid" WAKEZILLA_TEST_SUDO_GID="$test_gid" \
     WAKEZILLA_TEST_SUDO_HOME="$user_home" \
-    WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION=autostart \
+    WAKEZILLA_TEST_FAIL_LINUX_INTEGRATION_AFTER=autostart \
     WAKEZILLA_PRIVILEGE_LOG="$temp_dir/privilege.log" \
     WAKEZILLA_CHOWN_LOG="$temp_dir/chown.log" \
     DISPLAY= WAYLAND_DISPLAY= PATH="$temp_dir/stub-bin:$PATH" \
@@ -2607,6 +2957,7 @@ if test_linux_desktop_integration_helpers_defined; then
   test_linux_integration_is_idempotent_without_temp_siblings
   test_linux_integration_rolls_back_late_autostart_failure
   test_linux_integration_profile_directory_modes
+  test_linux_integration_reports_incomplete_rollback_and_continues
   test_linux_integration_root_helper_rolls_back_late_failure
   test_linux_integration_root_without_valid_sudo_user_skips_everything
   test_linux_integration_euid_override_is_test_mode_only
