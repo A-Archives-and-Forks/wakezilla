@@ -71,6 +71,18 @@ function Test-ReleaseHelpers {
     Assert-Contains $targets "x86_64-pc-windows-msvc" "available windows target"
 }
 
+function Test-GuiInstallationContracts {
+    $content = Get-Content -Raw -Path $Script
+    Assert-Contains $content "function Install-WakezillaDesktopIntegration" "GUI integration helper"
+    Assert-Contains $content "wakezilla-tray.exe" "tray helper publication"
+    Assert-Contains $content "New-Object -ComObject WScript.Shell" "native Windows shortcuts"
+    Assert-Contains $content "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" "tray autostart registry"
+    Assert-Contains $content 'Start-Process -FilePath $tray' "post-install tray launch"
+    Assert-Contains $content "CurrentVersion\Uninstall\Wakezilla" "Installed Apps registration"
+    Assert-Contains $content 'TargetPath = $TargetPath' "shortcut direct target contract"
+    Assert-Contains $content 'Arguments = ""' "shortcut no-arguments contract"
+}
+
 function Test-ChecksumHelpers {
     $tempDir = New-Item -ItemType Directory -Force -Path (Join-Path ([System.IO.Path]::GetTempPath()) "wakezilla-ps1-checksum-$PID")
     try {
@@ -277,6 +289,7 @@ function Test-ProcessStopHelper {
 
 Test-TargetDetection
 Test-ReleaseHelpers
+Test-GuiInstallationContracts
 Test-ChecksumHelpers
 Test-ArchiveAndInstall
 Test-ServiceStopAndRestartHelpers

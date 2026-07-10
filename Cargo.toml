@@ -7,8 +7,10 @@ default = []
 desktop-tray = [
     "dep:arboard",
     "dep:base64",
+    "dep:gtk",
     "dep:open",
     "dep:png",
+    "dep:single-instance",
     "dep:tray-icon",
     "dep:winit",
 ]
@@ -92,12 +94,29 @@ tar = "0.4"
 tempfile = "3"
 base64 = { version = "0.22.1", optional = true }
 
-[target.'cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "musl"))))'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"], optional = true }
 open = { version = "5.3.6", optional = true }
 png = { version = "0.18", optional = true }
 tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"], optional = true }
 winit = { version = "0.30", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+single-instance = { version = "0.3.3", optional = true }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.1"

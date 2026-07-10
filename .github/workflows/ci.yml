@@ -47,7 +47,7 @@ jobs:
       - name: Install desktop tray Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxkbcommon-x11-0 xvfb xauth
 
       - name: Prepare frontend assets for backend lint
         run: |
@@ -56,6 +56,15 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked --features desktop-tray -- -D warnings
+
+      - name: Run desktop tray library tests
+        run: xvfb-run -a cargo test -p wakezilla --locked --features desktop-tray --lib
+
+      - name: Test desktop icon assets
+        run: cargo test -p wakezilla --locked --features desktop-tray --test desktop_assets
+
+      - name: Test desktop tray startup
+        run: xvfb-run -a cargo test -p wakezilla --locked --features desktop-tray --test tray_startup
 
   install-script:
     name: install script
@@ -66,10 +75,82 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check shell syntax
-        run: sh -n install.sh scripts/test-install-sh.sh
+        run: |
+          for script in \
+            install.sh \
+            scripts/test-install-sh.sh \
+            scripts/test-install-linux-real.sh \
+            scripts/release/package_archive.sh \
+            scripts/test-release-package.sh
+          do
+            sh -n "$script"
+          done
 
       - name: Run installer tests
         run: scripts/test-install-sh.sh
+
+      - name: Install Linux desktop integration test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y desktop-file-utils libglib2.0-bin util-linux
+
+      - name: Test installer with a real secondary user and GLib
+        run: sudo env WAKEZILLA_CI_REQUIRED=1 sh scripts/test-install-linux-real.sh
+
+      - name: Run release package tests
+        run: sh scripts/test-release-package.sh
+
+  macos-install-preflight:
+    name: macOS installer preflight
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check installer shell syntax with BSD userland
+        run: |
+          sh -n install.sh
+          sh -n scripts/test-install-sh.sh
+          sh -n scripts/test-install-linux-real.sh
+          sh -n scripts/release/package_archive.sh
+          sh -n scripts/test-release-package.sh
+
+      - name: Run installer tests with BSD tar
+        run: sh scripts/test-install-sh.sh
+
+      - name: Run release package tests with BSD tar
+        run: sh scripts/test-release-package.sh
+
+      - name: Validate generated macOS plists with real plutil
+        run: |
+          fixture=$(mktemp -d "$RUNNER_TEMP/wakezilla-plists.XXXXXX")
+          trap 'rm -rf "$fixture"' EXIT
+          WAKEZILLA_INSTALL_SH_TEST_MODE=1 . ./install.sh
+          versions=$(macos_bundle_versions 1.2.3-beta.4+ci.1)
+          short_version=$(printf '%s\n' "$versions" | sed -n '1p')
+          bundle_version=$(printf '%s\n' "$versions" | sed -n '2p')
+          write_macos_info_plist "$fixture/Info.plist" "$short_version" "$bundle_version"
+          write_macos_launch_agent_plist "$fixture/LaunchAgent.plist" \
+            "$fixture/Home & Team/Applications/Wakezilla.app"
+          /usr/bin/plutil -lint "$fixture/Info.plist"
+          /usr/bin/plutil -lint "$fixture/LaunchAgent.plist"
+
+      - name: Prepare frontend assets for focused runtime tests
+        run: |
+          mkdir -p target/frontend-dist
+          printf '<!doctype html><html><head><title>wakezilla</title></head><body></body></html>\n' > target/frontend-dist/index.html
+
+      - name: Run focused macOS desktop runtime tests
+        run: cargo test -p wakezilla --locked --features desktop-tray --lib tray::desktop::tests::macos_
+
+      - name: Check both macOS executables
+        run: cargo check -p wakezilla --locked --features desktop-tray --bin wakezilla --bin wakezilla-tray
+
+      - name: Build both macOS executables
+        run: cargo build -p wakezilla --locked --features desktop-tray --bin wakezilla --bin wakezilla-tray
 
   windows:
     name: windows
@@ -82,6 +163,37 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Check Windows uninstaller syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          $scriptPath = (Resolve-Path 'scripts/windows/uninstall-wakezilla.ps1').Path
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            $scriptPath,
+            [ref]$tokens,
+            [ref]$parseErrors
+          ) | Out-Null
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | ForEach-Object {
+              Write-Error $_.Message -ErrorAction Continue
+            }
+            exit 1
+          }
+          $installTokens = $null
+          $installErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'install.ps1').Path,
+            [ref]$installTokens,
+            [ref]$installErrors
+          ) | Out-Null
+          if ($installErrors.Count -gt 0) {
+            $installErrors | ForEach-Object {
+              Write-Error $_.Message -ErrorAction Continue
+            }
+            exit 1
+          }
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -102,6 +214,27 @@ jobs:
 
       - name: Check Windows backend
         run: cargo check -p wakezilla --all-targets --locked --features desktop-tray
+
+      - name: Build and verify native Windows subsystems
+        shell: pwsh
+        run: |
+          cargo build -p wakezilla --locked --features desktop-tray --bin wakezilla --bin wakezilla-tray
+          $root = (Resolve-Path 'target/debug').Path
+          function Get-Subsystem([string]$Path) {
+            $stream = [IO.File]::OpenRead($Path)
+            try {
+              $reader = New-Object IO.BinaryReader($stream)
+              $stream.Position = 0x3c
+              $peOffset = $reader.ReadInt32()
+              $stream.Position = $peOffset + 4 + 20 + 68
+              return $reader.ReadUInt16()
+            }
+            finally { $stream.Dispose() }
+          }
+          $cli = Join-Path $root 'wakezilla.exe'
+          $tray = Join-Path $root 'wakezilla-tray.exe'
+          if ((Get-Subsystem $cli) -ne 3) { throw 'wakezilla.exe must be a console PE (subsystem 3)' }
+          if ((Get-Subsystem $tray) -ne 2) { throw 'wakezilla-tray.exe must be a GUI PE (subsystem 2)' }
 
       - name: Run Windows backend tests
         run: cargo test -p wakezilla -p wakezilla-common --locked

@@ -3,6 +3,16 @@ use anyhow::{anyhow, Context, Result};
 #[cfg(target_os = "windows")]
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use std::io::Cursor;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::io::Write as _;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::MetadataExt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -10,6 +20,8 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     Icon, TrayIcon, TrayIconBuilder,
 };
+#[cfg(target_os = "macos")]
+use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::{
     application::ApplicationHandler,
     event::{StartCause, WindowEvent},
@@ -17,6 +29,7 @@ use winit::{
     window::WindowId,
 };
 
+const TRAY_INSTANCE_NAME: &str = "dev.wakezilla.tray";
 const OPEN_DASHBOARD_ID: &str = "open_dashboard";
 const COPY_DASHBOARD_URL_ID: &str = "copy_dashboard_url";
 const SETUP_ID: &str = "setup_services";
@@ -69,6 +82,225 @@ struct TrayApp {
     status_refresh_in_flight: bool,
 }
 
+struct TrayInstanceGuard {
+    #[cfg(target_os = "linux")]
+    _socket: OwnedFd,
+    #[cfg(target_os = "windows")]
+    _instance: single_instance::SingleInstance,
+    #[cfg(target_os = "macos")]
+    _lock_file: std::fs::File,
+}
+
+impl TrayInstanceGuard {
+    fn acquire_named(name: &str) -> Result<Option<Self>> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::acquire_linux(name)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let backend_name = name.to_owned();
+            let instance =
+                single_instance::SingleInstance::new(&backend_name).with_context(|| {
+                    format!("failed to acquire tray instance lock `{name}` as `{backend_name}`")
+                })?;
+            if !instance.is_single() {
+                return Ok(None);
+            }
+
+            Ok(Some(Self {
+                _instance: instance,
+            }))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            Self::acquire_macos(name)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn acquire_linux(name: &str) -> Result<Option<Self>> {
+        let backend_name = linux_backend_name(name, effective_uid());
+        let socket_type = combine_linux_socket_type(libc::SOCK_STREAM, libc::SOCK_CLOEXEC);
+
+        // SAFETY: socket is called with valid Linux domain/type/protocol constants and no
+        // pointers. A nonnegative result is a newly owned descriptor.
+        let raw_socket = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
+        if raw_socket < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("failed to create tray instance socket `{backend_name}`")
+            });
+        }
+        // SAFETY: raw_socket was just returned as an owned descriptor and has not been wrapped
+        // or closed. OwnedFd now closes it on every return path.
+        let socket = unsafe { OwnedFd::from_raw_fd(raw_socket) };
+        let (address, address_len) = linux_abstract_socket_address(&backend_name)?;
+
+        // SAFETY: socket is a valid AF_UNIX descriptor; address points to an initialized
+        // sockaddr_un and address_len covers only its family and populated abstract name.
+        let rc = unsafe {
+            libc::bind(
+                socket.as_raw_fd(),
+                std::ptr::addr_of!(address).cast::<libc::sockaddr>(),
+                address_len,
+            )
+        };
+        if rc == 0 {
+            return Ok(Some(Self { _socket: socket }));
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EADDRINUSE) {
+            Ok(None)
+        } else {
+            Err(error)
+                .with_context(|| format!("failed to bind tray instance socket `{backend_name}`"))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn acquire_macos(name: &str) -> Result<Option<Self>> {
+        let lock_path = macos_lock_path(name)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        options.mode(0o600);
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let lock_file = options
+            .open(&lock_path)
+            .with_context(|| format!("failed to open tray lock {}", lock_path.display()))?;
+        lock_file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to secure tray lock {}", lock_path.display()))?;
+
+        // SAFETY: lock_file owns a valid descriptor for this call, and flock does not retain it
+        // or access Rust-managed memory.
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let errno = if rc == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
+
+        match classify_macos_flock_result(rc, errno)
+            .with_context(|| format!("failed to lock tray instance file {}", lock_path.display()))?
+        {
+            MacosFlockOutcome::Acquired => Ok(Some(Self {
+                _lock_file: lock_file,
+            })),
+            MacosFlockOutcome::Contended => Ok(None),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn effective_uid() -> libc::uid_t {
+    // SAFETY: geteuid has no preconditions and does not dereference any pointers.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_backend_name(name: &str, euid: libc::uid_t) -> String {
+    format!("{name}.uid-{euid}")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn combine_linux_socket_type(stream: i32, cloexec: i32) -> i32 {
+    stream | cloexec
+}
+
+#[cfg(target_os = "linux")]
+fn linux_abstract_socket_address(name: &str) -> Result<(libc::sockaddr_un, libc::socklen_t)> {
+    // SAFETY: sockaddr_un contains only integer fields and a c_char array, for which all-zero is
+    // a valid bit pattern. Zeroing also establishes the leading NUL for an abstract address.
+    let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+
+    let name_bytes = name.as_bytes();
+    let maximum_name_len = address.sun_path.len().saturating_sub(1);
+    if name_bytes.len() > maximum_name_len {
+        anyhow::bail!(
+            "tray instance socket name is {} bytes; maximum is {maximum_name_len}",
+            name_bytes.len()
+        );
+    }
+    address.sun_path[0] = 0;
+    for (index, byte) in name_bytes.iter().enumerate() {
+        address.sun_path[index + 1] = *byte as libc::c_char;
+    }
+
+    let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name_bytes.len();
+    let address_len = libc::socklen_t::try_from(address_len)
+        .context("tray instance socket address length overflowed socklen_t")?;
+    Ok((address, address_len))
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Eq, PartialEq)]
+enum MacosFlockOutcome {
+    Acquired,
+    Contended,
+}
+
+#[cfg(target_os = "macos")]
+fn classify_macos_flock_result(
+    rc: libc::c_int,
+    errno: libc::c_int,
+) -> std::io::Result<MacosFlockOutcome> {
+    if rc == 0 {
+        Ok(MacosFlockOutcome::Acquired)
+    } else if errno == libc::EWOULDBLOCK {
+        Ok(MacosFlockOutcome::Contended)
+    } else {
+        Err(std::io::Error::from_raw_os_error(errno))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_lock_path(name: &str) -> Result<PathBuf> {
+    let temp_dir = std::env::temp_dir()
+        .canonicalize()
+        .context("failed to resolve the per-user temporary directory")?;
+    let lock_dir = temp_dir.join("Wakezilla");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(&lock_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create {}", lock_dir.display()));
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(&lock_dir)
+        .with_context(|| format!("failed to inspect {}", lock_dir.display()))?;
+    if !metadata.file_type().is_dir() {
+        anyhow::bail!(
+            "tray lock directory is not a directory: {}",
+            lock_dir.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o7777 != 0o700 {
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure {}", lock_dir.display()))?;
+    }
+
+    let file_name = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    Ok(lock_dir.join(format!("instance-{file_name}.lock")))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ServiceStatuses {
     proxy: ModeStatus,
@@ -82,10 +314,20 @@ struct ModeStatus {
 }
 
 pub fn run() -> Result<()> {
+    let Some(_instance_guard) = TrayInstanceGuard::acquire_named(TRAY_INSTANCE_NAME)? else {
+        return Ok(());
+    };
+
+    #[cfg(target_os = "linux")]
+    gtk::init().context("failed to initialize GTK")?;
+
     let config = config::Config::load();
     let dashboard_url = dashboard_url(&config);
 
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    #[cfg(target_os = "macos")]
+    builder.with_activation_policy(ActivationPolicy::Accessory);
+    let event_loop = builder
         .build()
         .context("failed to create tray event loop")?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -603,6 +845,7 @@ fn wakezilla_cli_exe() -> Result<PathBuf> {
     })
 }
 
+#[cfg(target_os = "windows")]
 fn wakezilla_tray_command() -> Result<(PathBuf, Vec<&'static str>)> {
     let exe = std::env::current_exe().context("failed to resolve wakezilla executable")?;
     if is_wakezilla_tray_exe(&exe) {
@@ -613,7 +856,9 @@ fn wakezilla_tray_command() -> Result<(PathBuf, Vec<&'static str>)> {
         return Ok((tray_exe, Vec::new()));
     }
 
-    Ok((exe, vec!["tray"]))
+    Err(anyhow!(
+        "wakezilla-tray helper is required for graphical startup; refusing to launch the console CLI"
+    ))
 }
 
 fn is_wakezilla_tray_exe(exe: &Path) -> bool {
@@ -634,63 +879,457 @@ fn sibling_exe(exe: &Path, name: &str) -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn install_tray_autostart() -> Result<std::path::PathBuf> {
-    let (exe, args) = wakezilla_tray_command()?;
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
-        })
-        .context("HOME or XDG_CONFIG_HOME is required to install tray autostart")?;
+    let current_exe = std::env::current_exe().context("failed to resolve wakezilla executable")?;
+    let helper = if is_wakezilla_tray_exe(&current_exe) {
+        current_exe
+    } else {
+        sibling_exe(&current_exe, "wakezilla-tray").with_context(|| {
+            format!(
+                "failed to find wakezilla-tray next to {}",
+                current_exe.display()
+            )
+        })?
+    };
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
+    let config_home = resolve_linux_config_home(xdg_config_home.as_deref(), home.as_deref())?;
+    install_linux_tray_autostart_at(&config_home, &helper)
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn resolve_linux_config_home(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    if let Some(path) = xdg_config_home
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+    {
+        return Ok(path.to_path_buf());
+    }
+    let home = home
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+        .context("absolute HOME or XDG_CONFIG_HOME is required to install tray autostart")?;
+    Ok(home.join(".config"))
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn install_linux_tray_autostart_at(config_home: &Path, helper: &Path) -> Result<PathBuf> {
+    let helper = helper
+        .to_str()
+        .context("wakezilla-tray path must be valid UTF-8 for a desktop entry")?;
     let autostart_dir = config_home.join("autostart");
-    std::fs::create_dir_all(&autostart_dir)
+    let mut directory_builder = std::fs::DirBuilder::new();
+    directory_builder.recursive(true).mode(0o700);
+    directory_builder
+        .create(&autostart_dir)
         .with_context(|| format!("failed to create {}", autostart_dir.display()))?;
-    let path = autostart_dir.join("wakezilla-tray.desktop");
+    let canonical = autostart_dir.join("dev.wakezilla.tray.desktop");
     let content = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=Wakezilla Tray\n\
+         Name=Wakezilla\n\
+         Comment=Wakezilla network wake-on-LAN tray application\n\
+         TryExec={}\n\
          Exec={}\n\
+         Icon=dev.wakezilla.Wakezilla\n\
          Terminal=false\n\
-         X-GNOME-Autostart-enabled=true\n",
-        desktop_entry_command(&exe, &args),
+         StartupNotify=false\n",
+        desktop_string_escape(helper)?,
+        desktop_entry_quote(helper)?,
     );
-    std::fs::write(&path, content)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(path)
+    atomic_write_linux_autostart(&canonical, content.as_bytes())?;
+
+    let legacy = autostart_dir.join("wakezilla-tray.desktop");
+    if let Ok(metadata) = std::fs::symlink_metadata(&legacy) {
+        if metadata.file_type().is_file()
+            && std::fs::read(&legacy).is_ok_and(|legacy_content| {
+                std::str::from_utf8(&legacy_content).is_ok_and(linux_legacy_autostart_is_owned)
+            })
+        {
+            std::fs::remove_file(&legacy)
+                .with_context(|| format!("failed to remove {}", legacy.display()))?;
+        }
+    }
+    Ok(canonical)
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn atomic_write_linux_autostart(path: &Path, content: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .context("Linux autostart path has no parent directory")?;
+    let file_name = path
+        .file_name()
+        .context("Linux autostart path has no file name")?
+        .to_string_lossy();
+    let (temp_path, mut temp_file) = loop {
+        let suffix = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{file_name}.tmp.{}.{}",
+            std::process::id(),
+            suffix
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to create {}", candidate.display()));
+            }
+        }
+    };
+
+    let publish_result = (|| -> Result<()> {
+        temp_file
+            .write_all(content)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        temp_file
+            .sync_all()
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("failed to chmod {}", temp_path.display()))?;
+        std::fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed to publish Linux autostart {} -> {}",
+                temp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if publish_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    publish_result
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn linux_legacy_autostart_is_owned(content: &str) -> bool {
+    let mut in_desktop_entry = false;
+    let mut entry_type = false;
+    let mut name = false;
+    let mut exec = false;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            if in_desktop_entry && entry_type && name && exec {
+                return true;
+            }
+            in_desktop_entry = line == "[Desktop Entry]";
+            entry_type = false;
+            name = false;
+            exec = false;
+            continue;
+        }
+        if !in_desktop_entry {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "Type" => entry_type = value == "Application",
+            "Name" => name = matches!(value, "Wakezilla" | "Wakezilla Tray"),
+            "Exec" => exec = linux_legacy_exec_is_owned(value),
+            _ => {}
+        }
+    }
+    entry_type && name && exec
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn linux_legacy_exec_is_owned(value: &str) -> bool {
+    let tokens = linux_desktop_exec_tokens(value, 2);
+    let Some(executable) = tokens.first() else {
+        return false;
+    };
+    let Some(basename) = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    basename == "wakezilla-tray"
+        || (basename == "wakezilla" && tokens.get(1).is_some_and(|argument| argument == "tray"))
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn linux_desktop_exec_tokens(value: &str, limit: usize) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut characters = value.chars().peekable();
+    while tokens.len() < limit {
+        while characters
+            .peek()
+            .is_some_and(|character| character.is_ascii_whitespace())
+        {
+            characters.next();
+        }
+        if characters.peek().is_none() {
+            break;
+        }
+        let quoted = characters.peek() == Some(&'"');
+        if quoted {
+            characters.next();
+        }
+        let mut token = String::new();
+        let mut terminated = !quoted;
+        while let Some(character) = characters.next() {
+            if quoted && character == '"' {
+                terminated = true;
+                break;
+            }
+            if !quoted && character.is_ascii_whitespace() {
+                break;
+            }
+            if character == '\\' {
+                let Some(escaped) = characters.next() else {
+                    return Vec::new();
+                };
+                token.push(escaped);
+            } else {
+                token.push(character);
+            }
+        }
+        if !terminated || token.is_empty() {
+            return Vec::new();
+        }
+        tokens.push(token);
+    }
+    tokens
 }
 
 #[cfg(target_os = "macos")]
 fn install_tray_autostart() -> Result<std::path::PathBuf> {
-    let (exe, args) = wakezilla_tray_command()?;
+    let executable = std::env::current_exe().context("failed to resolve wakezilla executable")?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .context("HOME is required to install tray autostart")?;
-    let launch_agents = home.join("Library/LaunchAgents");
-    std::fs::create_dir_all(&launch_agents)
-        .with_context(|| format!("failed to create {}", launch_agents.display()))?;
+    install_macos_tray_autostart_at(&home, &executable)
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_tray_autostart_at(home: &Path, executable: &Path) -> Result<PathBuf> {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    install_macos_tray_autostart_for_uid(home, executable, effective_uid)
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_tray_autostart_for_uid(
+    home: &Path,
+    executable: &Path,
+    effective_uid: libc::uid_t,
+) -> Result<PathBuf> {
+    if effective_uid == 0 {
+        anyhow::bail!("macOS tray autostart must be installed without sudo");
+    }
+    if !home.is_absolute() {
+        anyhow::bail!("HOME must be absolute to install macOS tray autostart");
+    }
+    let home_metadata = std::fs::symlink_metadata(home)
+        .with_context(|| format!("failed to inspect HOME {}", home.display()))?;
+    if !home_metadata.file_type().is_dir() || home_metadata.file_type().is_symlink() {
+        anyhow::bail!("HOME must be a real, non-symlink directory");
+    }
+    if home_metadata.uid() != effective_uid {
+        anyhow::bail!("HOME is not owned by the effective user");
+    }
+    let home = home
+        .canonicalize()
+        .with_context(|| format!("failed to resolve HOME {}", home.display()))?;
+    let bundle = macos_bundle_from_executable(executable)?;
+    let content = macos_launch_agent_content(&bundle)?;
+
+    let library = home.join("Library");
+    ensure_macos_profile_directory(&home, &library, effective_uid)?;
+    let launch_agents = library.join("LaunchAgents");
+    ensure_macos_profile_directory(&home, &launch_agents, effective_uid)?;
     let path = launch_agents.join("dev.wakezilla.tray.plist");
-    let content = format!(
+    atomic_write_macos_launch_agent(&path, content.as_bytes())?;
+    Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_from_executable(executable: &Path) -> Result<PathBuf> {
+    let executable = executable
+        .canonicalize()
+        .with_context(|| format!("failed to resolve executable {}", executable.display()))?;
+    if !executable.is_file() || !is_wakezilla_tray_exe(&executable) {
+        anyhow::bail!(
+            "macOS tray autostart requires a wakezilla-tray executable inside Wakezilla.app"
+        );
+    }
+    let macos = executable
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "MacOS"))
+        .context("wakezilla-tray is not inside a bundle Contents/MacOS directory")?;
+    let contents = macos
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "Contents"))
+        .context("wakezilla-tray is not inside a bundle Contents/MacOS directory")?;
+    let bundle = contents
+        .parent()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "app"))
+        .context("wakezilla-tray is not inside a macOS application bundle")?;
+    if !bundle.is_dir() {
+        anyhow::bail!("macOS application bundle is not a directory");
+    }
+    Ok(bundle.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_content(bundle: &Path) -> Result<String> {
+    let bundle = bundle
+        .to_str()
+        .context("Wakezilla.app path must be valid UTF-8 for a LaunchAgent")?;
+    let bundle = xml_escape(bundle)?;
+    Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\">\n\
          <dict>\n\
-         \t<key>Label</key>\n\
-         \t<string>dev.wakezilla.tray</string>\n\
-         \t<key>ProgramArguments</key>\n\
-         \t<array>\n\
-         \t\t<string>{}</string>\n\
-         {}\
-         \t</array>\n\
-         \t<key>RunAtLoad</key>\n\
-         \t<true/>\n\
+           <key>Label</key>\n\
+           <string>dev.wakezilla.tray</string>\n\
+           <key>ProgramArguments</key>\n\
+           <array>\n\
+             <string>/usr/bin/open</string>\n\
+             <string>-g</string>\n\
+             <string>{bundle}</string>\n\
+           </array>\n\
+           <key>RunAtLoad</key>\n\
+           <true/>\n\
+           <key>LimitLoadToSessionType</key>\n\
+           <string>Aqua</string>\n\
+           <key>ProcessType</key>\n\
+           <string>Interactive</string>\n\
+           <key>AssociatedBundleIdentifiers</key>\n\
+           <array>\n\
+             <string>dev.wakezilla.Wakezilla</string>\n\
+           </array>\n\
          </dict>\n\
-         </plist>\n",
-        xml_escape(&exe.to_string_lossy()),
-        plist_args(&args),
-    );
-    std::fs::write(&path, content)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(path)
+         </plist>\n"
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_profile_directory(
+    home: &Path,
+    directory: &Path,
+    effective_uid: libc::uid_t,
+) -> Result<()> {
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                anyhow::bail!("unsafe macOS profile directory: {}", directory.display());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(directory)
+                .with_context(|| format!("failed to create {}", directory.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", directory.display()));
+        }
+    }
+    let canonical = directory
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", directory.display()))?;
+    if !canonical.starts_with(home) || canonical == home {
+        anyhow::bail!(
+            "macOS profile directory escaped HOME: {}",
+            directory.display()
+        );
+    }
+    let owner = std::fs::metadata(&canonical)
+        .with_context(|| format!("failed to inspect {}", canonical.display()))?
+        .uid();
+    if owner != effective_uid {
+        anyhow::bail!(
+            "macOS profile directory is not owned by the effective user: {}",
+            directory.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct MacosAtomicTemp(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosAtomicTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn atomic_write_macos_launch_agent(path: &Path, content: &[u8]) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                anyhow::bail!(
+                    "refusing unsafe LaunchAgent destination: {}",
+                    path.display()
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    }
+    let directory = path.parent().context("LaunchAgent path has no parent")?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("LaunchAgent file name must be valid UTF-8")?;
+    let mut temporary = None;
+    let mut file = None;
+    for attempt in 0..100_u32 {
+        let candidate =
+            directory.join(format!(".{file_name}.tmp.{}.{attempt}", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(&candidate) {
+            Ok(opened) => {
+                temporary = Some(MacosAtomicTemp(candidate));
+                file = Some(opened);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to stage {}", path.display()));
+            }
+        }
+    }
+    let mut file = file.context("failed to allocate a unique LaunchAgent staging file")?;
+    let mut temporary = temporary.context("LaunchAgent staging path was not recorded")?;
+    file.write_all(content)
+        .with_context(|| format!("failed to stage {}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("failed to set mode on staged {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync staged {}", path.display()))?;
+    drop(file);
+    std::fs::rename(&temporary.0, path)
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    temporary.0 = PathBuf::new();
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -717,40 +1356,43 @@ fn install_tray_autostart() -> Result<std::path::PathBuf> {
     Ok(exe)
 }
 
-#[cfg(target_os = "linux")]
-fn desktop_entry_command(exe: &Path, args: &[&str]) -> String {
-    std::iter::once(desktop_entry_quote(&exe.to_string_lossy()))
-        .chain(args.iter().map(|arg| desktop_entry_quote(arg)))
-        .collect::<Vec<_>>()
-        .join(" ")
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn desktop_entry_quote(value: &str) -> Result<String> {
+    reject_desktop_controls(value)?;
+    let exec_layer = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('`', "\\`")
+        .replace('$', "\\$")
+        .replace('%', "%%");
+    Ok(format!("\"{}\"", exec_layer.replace('\\', "\\\\")))
 }
 
-#[cfg(target_os = "linux")]
-fn desktop_entry_quote(value: &str) -> String {
-    format!(
-        "\"{}\"",
-        value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('%', "%%")
-    )
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn desktop_string_escape(value: &str) -> Result<String> {
+    reject_desktop_controls(value)?;
+    Ok(value.replace('\\', "\\\\"))
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn reject_desktop_controls(value: &str) -> Result<()> {
+    if value.chars().any(|character| character.is_ascii_control()) {
+        anyhow::bail!("desktop entry value contains an ASCII control character");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn plist_args(args: &[&str]) -> String {
-    args.iter()
-        .map(|arg| format!("\t\t<string>{}</string>\n", xml_escape(arg)))
-        .collect()
-}
-
-#[cfg(target_os = "macos")]
-fn xml_escape(value: &str) -> String {
-    value
+fn xml_escape(value: &str) -> Result<String> {
+    if value.chars().any(|character| character.is_ascii_control()) {
+        anyhow::bail!("LaunchAgent value contains an ASCII control character");
+    }
+    Ok(value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+        .replace('\'', "&apos;"))
 }
 
 #[cfg(target_os = "windows")]
@@ -913,6 +1555,324 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tray_instance_rejects_a_second_guard() {
+        const CHILD_ENV: &str = "WAKEZILLA_TEST_TRAY_INSTANCE_CHILD";
+
+        if let Some(name) = std::env::var_os(CHILD_ENV) {
+            let name = name.to_string_lossy();
+            assert!(TrayInstanceGuard::acquire_named(&name)
+                .expect("child acquire")
+                .is_none());
+            return;
+        }
+
+        let name = format!("dev.wakezilla.tray.test.{}", std::process::id());
+        let first = TrayInstanceGuard::acquire_named(&name)
+            .expect("first acquire")
+            .expect("first instance");
+
+        assert!(TrayInstanceGuard::acquire_named(&name)
+            .expect("second acquire")
+            .is_none());
+
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tray::desktop::tests::tray_instance_rejects_a_second_guard",
+            ])
+            .env(CHILD_ENV, &name)
+            .status()
+            .expect("run child test process");
+        assert!(child.success(), "child should observe the held guard");
+
+        drop(first);
+
+        let reacquired = TrayInstanceGuard::acquire_named(&name)
+            .expect("acquire after drop")
+            .expect("instance after drop");
+        drop(reacquired);
+
+        #[cfg(target_os = "macos")]
+        std::fs::remove_file(macos_lock_path(&name).expect("test lock path"))
+            .expect("remove test lock file");
+    }
+
+    #[test]
+    fn tray_instance_linux_socket_type_combines_cloexec_atomically() {
+        assert_eq!(combine_linux_socket_type(0b0001, 0b1000), 0b1001);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tray_instance_linux_backend_name_is_scoped_by_euid() {
+        let first_user = linux_backend_name(TRAY_INSTANCE_NAME, 1000);
+        let second_user = linux_backend_name(TRAY_INSTANCE_NAME, 1001);
+
+        assert_eq!(first_user, "dev.wakezilla.tray.uid-1000");
+        assert_ne!(first_user, second_user);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tray_instance_linux_socket_does_not_survive_exec() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::process::{Child, Stdio};
+
+        const CHILD_ENV: &str = "WAKEZILLA_TEST_TRAY_INSTANCE_CLOEXEC_CHILD";
+        const READY_MARKER: &str = "WAKEZILLA_TRAY_INSTANCE_CHILD_READY";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "{READY_MARKER}").expect("write child ready marker");
+            stdout.flush().expect("flush child ready marker");
+            drop(stdout);
+
+            let mut release = [0_u8; 1];
+            std::io::stdin()
+                .read_exact(&mut release)
+                .expect("wait for parent release");
+            return;
+        }
+
+        struct ChildGuard(Option<Child>);
+
+        impl ChildGuard {
+            fn child_mut(&mut self) -> &mut Child {
+                self.0.as_mut().expect("child process")
+            }
+
+            fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+                let result = self.0.as_mut().expect("child process").wait();
+                if result.is_ok() {
+                    self.0.take();
+                }
+                result
+            }
+        }
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let name = format!("dev.wakezilla.tray.cloexec.test.{}", std::process::id());
+        let first = TrayInstanceGuard::acquire_named(&name)
+            .expect("first acquire")
+            .expect("first instance");
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tray::desktop::tests::tray_instance_linux_socket_does_not_survive_exec",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn child test process");
+        let mut child = ChildGuard(Some(child));
+        let stdout = child.child_mut().stdout.take().expect("child stdout pipe");
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(stdout.read_line(&mut line).expect("read child output"), 0);
+            if line.contains(READY_MARKER) {
+                break;
+            }
+        }
+
+        drop(first);
+        let reacquired = TrayInstanceGuard::acquire_named(&name)
+            .expect("reacquire while child lives")
+            .expect("socket fd must close during exec");
+        drop(reacquired);
+
+        child
+            .child_mut()
+            .stdin
+            .as_mut()
+            .expect("child stdin pipe")
+            .write_all(b"x")
+            .expect("release child");
+        let status = child.wait().expect("wait for child test process");
+        assert!(status.success(), "child test process should exit cleanly");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_instance_flock_success_is_acquired() {
+        assert_eq!(
+            classify_macos_flock_result(0, 0).expect("successful flock"),
+            MacosFlockOutcome::Acquired
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_instance_flock_would_block_is_duplicate() {
+        assert_eq!(
+            classify_macos_flock_result(-1, libc::EWOULDBLOCK).expect("contended flock"),
+            MacosFlockOutcome::Contended
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tray_instance_flock_other_errno_is_error() {
+        let error = classify_macos_flock_result(-1, libc::EINVAL)
+            .expect_err("unexpected flock errno must fail closed");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_autostart_uses_canonical_bundle_and_native_open_contract() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temporary macOS home parent");
+        let home = temp.path().join("Home & <Primary>");
+        let executable = home.join("Applications/Wakezilla.app/Contents/MacOS/wakezilla-tray");
+        std::fs::create_dir_all(executable.parent().expect("bundle executable parent"))
+            .expect("create bundle fixture");
+        std::fs::write(&executable, b"tray executable fixture")
+            .expect("write bundle executable fixture");
+
+        let installed = install_macos_tray_autostart_at(&home, &executable)
+            .expect("install native macOS LaunchAgent");
+        let canonical_home = home.canonicalize().expect("canonical fixture HOME");
+        assert_eq!(
+            installed,
+            canonical_home.join("Library/LaunchAgents/dev.wakezilla.tray.plist")
+        );
+        let bundle = executable
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("bundle fixture path")
+            .canonicalize()
+            .expect("canonical bundle fixture");
+        let content = std::fs::read_to_string(&installed).expect("read LaunchAgent");
+        for required in [
+            "<key>Label</key>",
+            "<string>dev.wakezilla.tray</string>",
+            "<key>ProgramArguments</key>",
+            "<string>/usr/bin/open</string>",
+            "<string>-g</string>",
+            "<key>RunAtLoad</key>\n<true/>",
+            "<key>LimitLoadToSessionType</key>",
+            "<string>Aqua</string>",
+            "<key>ProcessType</key>",
+            "<string>Interactive</string>",
+            "<key>AssociatedBundleIdentifiers</key>\n<array>\n<string>dev.wakezilla.Wakezilla</string>\n</array>",
+        ] {
+            assert!(content.contains(required), "missing contract: {required}");
+        }
+        assert!(content.contains(
+            &xml_escape(bundle.to_str().expect("UTF-8 bundle fixture"))
+                .expect("escape bundle path")
+        ));
+        assert!(!content.contains("KeepAlive"));
+        assert!(!content.contains("Terminal"));
+        assert!(!content.contains("wakezilla-tray</string>"));
+        assert!(!content.contains("/bin/sh"));
+        assert_eq!(
+            std::fs::metadata(&installed)
+                .expect("LaunchAgent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        let lint = std::process::Command::new("/usr/bin/plutil")
+            .args(["-lint"])
+            .arg(&installed)
+            .status()
+            .expect("run real plutil against runtime LaunchAgent");
+        assert!(
+            lint.success(),
+            "real plutil must accept runtime LaunchAgent"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_autostart_rejects_nonbundle_and_control_paths_before_publish() {
+        let temp = tempfile::tempdir().expect("temporary macOS fixture");
+        let home = temp.path().join("home");
+        std::fs::create_dir(&home).expect("create fixture HOME");
+        let loose_helper = temp.path().join("wakezilla-tray");
+        std::fs::write(&loose_helper, b"loose helper").expect("write loose helper");
+
+        assert!(install_macos_tray_autostart_at(&home, &loose_helper).is_err());
+        assert!(!home.join("Library").exists());
+        assert!(
+            install_macos_tray_autostart_at(Path::new("relative-home"), &loose_helper).is_err()
+        );
+        assert!(xml_escape("bad\npath").is_err());
+        assert!(xml_escape("bad\u{1b}path").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_autostart_rejects_root_and_wrong_owner_before_publish() {
+        let temp = tempfile::tempdir().expect("temporary macOS fixture");
+        let home = temp.path().join("home");
+        let executable = home.join("Applications/Wakezilla.app/Contents/MacOS/wakezilla-tray");
+        std::fs::create_dir_all(executable.parent().expect("bundle executable parent"))
+            .expect("create bundle fixture");
+        std::fs::write(&executable, b"tray executable fixture")
+            .expect("write bundle executable fixture");
+        let owner = std::fs::metadata(&home).expect("HOME metadata").uid();
+
+        assert!(install_macos_tray_autostart_for_uid(&home, &executable, 0).is_err());
+        assert!(!home.join("Library").exists());
+        assert!(install_macos_tray_autostart_for_uid(&home, &executable, owner + 1).is_err());
+        assert!(!home.join("Library").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_autostart_replaces_atomically_and_rejects_symlink_destination() {
+        let temp = tempfile::tempdir().expect("temporary macOS fixture");
+        let home = temp.path().join("home");
+        let executable = home.join("Applications/Wakezilla.app/Contents/MacOS/wakezilla-tray");
+        std::fs::create_dir_all(executable.parent().expect("bundle executable parent"))
+            .expect("create bundle fixture");
+        std::fs::write(&executable, b"tray executable fixture")
+            .expect("write bundle executable fixture");
+        let launch_agents = home.join("Library/LaunchAgents");
+        std::fs::create_dir_all(&launch_agents).expect("create LaunchAgents fixture");
+        let destination = launch_agents.join("dev.wakezilla.tray.plist");
+        std::fs::write(&destination, b"old contents").expect("write prior LaunchAgent");
+
+        install_macos_tray_autostart_at(&home, &executable)
+            .expect("atomically replace LaunchAgent");
+        let temporary_count = std::fs::read_dir(&launch_agents)
+            .expect("read LaunchAgents")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(temporary_count, 0);
+
+        std::fs::remove_file(&destination).expect("remove installed LaunchAgent");
+        let foreign = temp.path().join("foreign-agent");
+        std::fs::write(&foreign, b"foreign contents").expect("write foreign agent");
+        std::os::unix::fs::symlink(&foreign, &destination)
+            .expect("create LaunchAgent symlink fixture");
+        assert!(install_macos_tray_autostart_at(&home, &executable).is_err());
+        assert_eq!(
+            std::fs::read(&foreign).expect("read preserved foreign agent"),
+            b"foreign contents"
+        );
+    }
+
+    #[test]
     fn dashboard_url_uses_proxy_port_from_config() {
         let mut config = config::Config::default();
         config.server.proxy_port = 4567;
@@ -957,9 +1917,220 @@ mod tests {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn desktop_entry_quote_escapes_quotes() {
-        assert_eq!(desktop_entry_quote("/tmp/a\"b%20"), "\"/tmp/a\\\"b%%20\"");
+        assert_eq!(
+            desktop_entry_quote("/tmp/a\"b%20").expect("quote desktop entry"),
+            "\"/tmp/a\\\\\"b%%20\""
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn desktop_entry_quote_rejects_ascii_controls() {
+        assert!(desktop_entry_quote("/tmp/bad\npath").is_err());
+        assert!(desktop_entry_quote("/tmp/bad\u{1b}path").is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_autostart_is_canonical_atomic_and_removes_owned_legacy() {
+        let temp = tempfile::tempdir().expect("temporary config home");
+        let helper = temp.path().join("bin with spaces/wakezilla-tray");
+        std::fs::create_dir_all(helper.parent().expect("helper parent"))
+            .expect("create helper parent");
+        std::fs::write(&helper, b"helper").expect("write helper fixture");
+        let autostart = temp.path().join("autostart");
+        std::fs::create_dir_all(&autostart).expect("create autostart fixture");
+        let legacy = autostart.join("wakezilla-tray.desktop");
+        std::fs::write(
+            &legacy,
+            b"[Desktop Entry]\nType=Application\nName=Wakezilla Tray\nExec=/old/wakezilla-tray\n",
+        )
+        .expect("write owned legacy entry");
+        let canonical = autostart.join("dev.wakezilla.tray.desktop");
+        std::fs::write(&canonical, b"old canonical contents").expect("write old canonical entry");
+
+        let installed = install_linux_tray_autostart_at(temp.path(), &helper)
+            .expect("install canonical Linux autostart");
+
+        assert_eq!(installed, canonical);
+        assert!(!legacy.exists(), "owned legacy entry must be removed");
+        let content = std::fs::read_to_string(&installed).expect("read canonical entry");
+        assert!(content.contains("Name=Wakezilla"));
+        assert!(content.contains(&format!("Exec=\"{}\"", helper.display())));
+        assert!(!content.contains(" wakezilla tray"));
+        assert!(!content.contains("Version=0.1"));
+        let temporary_entries = std::fs::read_dir(&autostart)
+            .expect("read autostart directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(temporary_entries, 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_autostart_preserves_foreign_legacy_named_entry() {
+        let temp = tempfile::tempdir().expect("temporary config home");
+        let helper = temp.path().join("wakezilla-tray");
+        std::fs::write(&helper, b"helper").expect("write helper fixture");
+        let autostart = temp.path().join("autostart");
+        std::fs::create_dir_all(&autostart).expect("create autostart fixture");
+        let legacy = autostart.join("wakezilla-tray.desktop");
+        let foreign = "[Other Group]\nName=Wakezilla Tray\nExec=/old/wakezilla-tray\n\
+                       [Desktop Entry]\nType=Application\nName=Another App\nExec=/other/app\n";
+        std::fs::write(&legacy, foreign).expect("write foreign legacy entry");
+
+        install_linux_tray_autostart_at(temp.path(), &helper)
+            .expect("install canonical Linux autostart");
+
+        assert_eq!(
+            std::fs::read_to_string(&legacy).expect("read preserved legacy entry"),
+            foreign
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_legacy_autostart_matcher_requires_one_exact_owned_group() {
+        assert!(linux_legacy_autostart_is_owned(
+            "[Desktop Entry]\nType=Application\nName=Wakezilla Tray\nExec=/old/bin/wakezilla-tray\n"
+        ));
+        assert!(linux_legacy_autostart_is_owned(
+            "[Desktop Entry]\nType=Application\nName=Wakezilla\nExec=\"/old/bin/wakezilla\" tray\n"
+        ));
+        assert!(!linux_legacy_autostart_is_owned(
+            "[Desktop Entry]\nType=Application\nName=Wakezilla Tray\nExec=/other/not-wakezilla-tray-helper\n"
+        ));
+        assert!(!linux_legacy_autostart_is_owned(
+            "[Desktop Entry]\nType=Application\nName=Wakezilla Tray\n[Desktop Entry]\nExec=/old/bin/wakezilla-tray\n"
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_autostart_directory_is_private_without_chmodding_existing_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temporary config home");
+        let new_config = temp.path().join("new-config");
+        let helper = temp.path().join("wakezilla-tray");
+        std::fs::write(&helper, b"helper").expect("write helper fixture");
+        install_linux_tray_autostart_at(&new_config, &helper)
+            .expect("install into new config home");
+        let new_mode = std::fs::metadata(new_config.join("autostart"))
+            .expect("new autostart metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(new_mode, 0o700);
+
+        let existing_config = temp.path().join("existing-config");
+        let existing_autostart = existing_config.join("autostart");
+        std::fs::create_dir_all(&existing_autostart).expect("create existing autostart");
+        std::fs::set_permissions(&existing_autostart, std::fs::Permissions::from_mode(0o755))
+            .expect("set existing directory mode");
+        install_linux_tray_autostart_at(&existing_config, &helper)
+            .expect("install into existing config home");
+        let existing_mode = std::fs::metadata(&existing_autostart)
+            .expect("existing autostart metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(existing_mode, 0o755);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_config_home_requires_an_absolute_path_with_home_fallback() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            resolve_linux_config_home(Some(OsStr::new("/xdg/config")), Some(OsStr::new("/home/u")))
+                .expect("absolute XDG config home"),
+            PathBuf::from("/xdg/config")
+        );
+        for invalid_xdg in ["", "relative/config"] {
+            assert_eq!(
+                resolve_linux_config_home(
+                    Some(OsStr::new(invalid_xdg)),
+                    Some(OsStr::new("/home/u"))
+                )
+                .expect("absolute HOME fallback"),
+                PathBuf::from("/home/u/.config")
+            );
+        }
+        assert!(resolve_linux_config_home(None, Some(OsStr::new("relative-home"))).is_err());
+        assert!(resolve_linux_config_home(None, None).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_autostart_rejects_non_utf8_helper_before_publish() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let temp = tempfile::tempdir().expect("temporary config home");
+        let helper = temp.path().join(std::ffi::OsString::from_vec(vec![
+            b'w', b'a', b'k', b'e', b'z', b'i', b'l', b'l', b'a', b'-', 0xff,
+        ]));
+
+        assert!(install_linux_tray_autostart_at(temp.path(), &helper).is_err());
+        assert!(!temp
+            .path()
+            .join("autostart/dev.wakezilla.tray.desktop")
+            .exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_autostart_preserves_non_utf8_legacy_as_foreign() {
+        let temp = tempfile::tempdir().expect("temporary config home");
+        let helper = temp.path().join("wakezilla-tray");
+        std::fs::write(&helper, b"helper").expect("write helper fixture");
+        let autostart = temp.path().join("autostart");
+        std::fs::create_dir_all(&autostart).expect("create autostart fixture");
+        let legacy = autostart.join("wakezilla-tray.desktop");
+        let foreign = b"[Desktop Entry]\nType=Application\nName=Wakezilla Tray\nExec=/old/wakezilla-tray\n\xff";
+        std::fs::write(&legacy, foreign).expect("write non-UTF-8 legacy entry");
+
+        let canonical = install_linux_tray_autostart_at(temp.path(), &helper)
+            .expect("install with foreign non-UTF-8 legacy");
+
+        assert!(canonical.is_file());
+        assert_eq!(
+            std::fs::read(&legacy).expect("read preserved legacy"),
+            foreign
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_autostart_preserves_unreadable_legacy_as_foreign() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temporary config home");
+        let helper = temp.path().join("wakezilla-tray");
+        std::fs::write(&helper, b"helper").expect("write helper fixture");
+        let autostart = temp.path().join("autostart");
+        std::fs::create_dir_all(&autostart).expect("create autostart fixture");
+        let legacy = autostart.join("wakezilla-tray.desktop");
+        std::fs::write(
+            &legacy,
+            b"[Desktop Entry]\nType=Application\nName=Wakezilla Tray\nExec=/old/wakezilla-tray\n",
+        )
+        .expect("write legacy entry");
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o000))
+            .expect("make legacy unreadable");
+        if std::fs::read(&legacy).is_ok() {
+            return;
+        }
+
+        let canonical = install_linux_tray_autostart_at(temp.path(), &helper)
+            .expect("install with unreadable foreign legacy");
+
+        assert!(canonical.is_file());
+        assert!(legacy.exists());
     }
 }

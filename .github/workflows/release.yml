@@ -98,42 +98,46 @@ jobs:
         run: |
           set -euo pipefail
           TARGET="${{ matrix.target }}"
-          FEATURES=()
-          if [[ "${TARGET}" != *linux-musl* ]]; then
-            FEATURES+=(--features desktop-tray)
+          if [[ "${TARGET}" == *linux-musl* ]]; then
+            cargo build --release --target "${TARGET}" --bin wakezilla
+          else
+            cargo build --release --target "${TARGET}" \
+              --bin wakezilla \
+              --bin wakezilla-tray \
+              --features desktop-tray
           fi
-          cargo build --release --target "${TARGET}" "${FEATURES[@]}"
 
-      - name: Build Windows tray binary
-        if: ${{ contains(matrix.target, 'windows') }}
-        shell: bash
-        run: cargo build --release --target ${{ matrix.target }} --bin wakezilla-tray --features desktop-tray
-
-      - name: Create release archive
+      - name: Build Linux musl tray helper
+        if: ${{ contains(matrix.target, 'linux-musl') }}
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ steps.tag_version.outputs.version }}"
           TARGET="${{ matrix.target }}"
-          ARCHIVE="wakezilla-${VERSION}-${TARGET}.tar.gz"
-          BIN="wakezilla"
-          if [[ "${TARGET}" == *windows* ]]; then
-            BIN="wakezilla.exe"
-          fi
-          ARCHIVE_ITEMS=("${BIN}")
-          mkdir -p release
-          cp "target/${TARGET}/release/${BIN}" "release/${BIN}"
-          chmod +x "release/${BIN}"
-          if [[ "${TARGET}" == *windows* ]]; then
-            extra_bin="wakezilla-tray.exe"
-            cp "target/${TARGET}/release/${extra_bin}" "release/${extra_bin}"
-            chmod +x "release/${extra_bin}"
-            ARCHIVE_ITEMS+=("${extra_bin}")
-          fi
-          tar -C release -czf "release/${ARCHIVE}" "${ARCHIVE_ITEMS[@]}"
-          for archive_item in "${ARCHIVE_ITEMS[@]}"; do
-            rm -f "release/${archive_item}"
-          done
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            -e TARGET="${TARGET}" \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            rust:1-alpine \
+            sh -lc '
+              set -eu
+              export PATH=/usr/local/cargo/bin:$PATH
+              apk add --no-cache build-base pkgconf gtk+3.0-dev libayatana-appindicator-dev
+              CARGO_TARGET_DIR=target/musl-tray cargo build --release --target "$TARGET" --bin wakezilla-tray --features desktop-tray
+              cp "target/musl-tray/$TARGET/release/wakezilla-tray" "target/$TARGET/release/wakezilla-tray"
+            '
+
+      - name: Create release archive
+        shell: bash
+        env:
+          VERSION: ${{ steps.tag_version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          sh scripts/release/package_archive.sh \
+            "$VERSION" \
+            "$TARGET" \
+            "target/$TARGET/release" \
+            release
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

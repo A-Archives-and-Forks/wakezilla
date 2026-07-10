@@ -205,8 +205,12 @@ Official release binaries for Linux GNU, macOS, and Windows are built with
 wakezilla tray
 ```
 
-Linux musl release binaries remain server-only because the tray backend depends
-on the desktop GTK/AppIndicator stack.
+Linux musl release archives keep the main `wakezilla` binary server-only so it
+continues to run on headless/static-libc systems without desktop libraries. Musl
+desktop archives may also include a separate `wakezilla-tray` helper; when it is
+installed next to `wakezilla`, `wakezilla tray` delegates to it. That helper is a
+dynamic desktop build and requires GTK/AppIndicator runtime libraries on the
+target system.
 
 The tray menu can open the local dashboard, copy its URL, show proxy/client
 status, open logs, check for updates, and request start/stop/restart for
@@ -216,11 +220,11 @@ wizard for proxy/client boot startup.
 
 Linux desktop-tray builds require GTK/AppIndicator development packages from
 your distro, such as `libgtk-3-dev` and `libayatana-appindicator3-dev` on
-Debian/Ubuntu. Running the tray also requires the matching runtime libraries,
-typically installed automatically as dependencies of those packages. The tray
-process is meant to start with the user's graphical login; the proxy/client
-services should continue to be installed through `wakezilla setup` so they can
-start at boot.
+Debian/Ubuntu, or `gtk+3.0-dev`, `libayatana-appindicator-dev`, and `pkgconf` on
+Alpine. Running the tray also requires the matching runtime libraries, typically
+installed automatically as dependencies of those packages. The tray process is
+meant to start with the user's graphical login; the proxy/client services should
+continue to be installed through `wakezilla setup` so they can start at boot.
 
 ### Set up auto-start (system service)
 
