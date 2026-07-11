@@ -385,6 +385,22 @@ impl ApplicationHandler<UserEvent> for TrayApp {
         }
     }
 
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "linux")]
+        {
+            while gtk::events_pending() {
+                gtk::main_iteration();
+            }
+
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                std::time::Instant::now() + Duration::from_millis(50),
+            ));
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        let _ = event_loop;
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Menu(id) => self.handle_menu_event(event_loop, &id),
