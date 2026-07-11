@@ -822,7 +822,7 @@ fn load_tray_icon() -> Result<Icon> {
 #[cfg(target_os = "macos")]
 fn macos_template_rgba(rgba: &mut [u8], width: u32, height: u32) {
     const OUTLINE_LUMA_MAX: u16 = 100;
-    const OUTLINE_RADIUS: usize = 4;
+    const OUTLINE_RADIUS: usize = 3;
 
     let width = usize::try_from(width).expect("tray icon width must fit usize");
     let height = usize::try_from(height).expect("tray icon height must fit usize");
@@ -1643,15 +1643,16 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_template_mask_thickens_dark_outline_pixels() {
-        let mut rgba = [
-            220, 100, 60, 255, // mascot fill
-            80, 30, 20, 255, // dark outline
-            220, 100, 60, 255, // mascot fill
-        ];
+        let mut rgba = vec![220, 100, 60, 255].repeat(9);
+        rgba[4 * 4..4 * 5].copy_from_slice(&[80, 30, 20, 255]);
 
-        macos_template_rgba(&mut rgba, 3, 1);
+        macos_template_rgba(&mut rgba, 9, 1);
 
-        assert_eq!(rgba, [0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]);
+        let alpha = rgba
+            .chunks_exact(4)
+            .map(|pixel| pixel[3])
+            .collect::<Vec<_>>();
+        assert_eq!(alpha, [0, 255, 255, 255, 255, 255, 255, 255, 0]);
     }
 
     #[test]
