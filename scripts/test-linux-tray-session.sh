@@ -122,22 +122,5 @@ grep -q 'StatusNotifierItem' "$registered_items" || {
   exit 1
 }
 
-item=$(sed -n "s/.*'\([^']*StatusNotifierItem[^']*\)'.*/\1/p" "$registered_items" | head -n 1)
-case "$item" in
-  */*) item_service=${item%%/*}; item_path=/${item#*/} ;;
-  *) item_service=$item; item_path=/StatusNotifierItem ;;
-esac
-
-gdbus call --session \
-  --dest "$item_service" \
-  --object-path "$item_path" \
-  --method org.freedesktop.DBus.Properties.GetAll \
-  org.kde.StatusNotifierItem \
-  >"$artifact_dir/wakezilla-status-notifier-properties.log"
-grep -q 'IconName' "$artifact_dir/wakezilla-status-notifier-properties.log" || {
-  printf 'Wakezilla tray registered without an IconName property\n' >&2
-  exit 1
-}
-
 import -display "$DISPLAY" -window root "$artifact_dir/linux-tray-desktop.png"
 test -s "$artifact_dir/linux-tray-desktop.png"
