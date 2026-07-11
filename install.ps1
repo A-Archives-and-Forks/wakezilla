@@ -471,6 +471,15 @@ function Get-RegularReleaseFile {
     $item.FullName
 }
 
+function Publish-WakezillaFile {
+    param(
+        [string]$Source,
+        [string]$Destination
+    )
+
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+}
+
 function New-WakezillaShortcut {
     param(
         [string]$Path,
@@ -571,11 +580,11 @@ function Install-WakezillaDesktopIntegration {
         }
         Stop-WakezillaProcessesForInstall -ExecutablePath $cli
         Stop-WakezillaProcessesForInstall -ExecutablePath $tray
-        Move-Item -LiteralPath (Join-Path $temporary "wakezilla.exe") -Destination $cli -Force
+        Publish-WakezillaFile -Source (Join-Path $temporary "wakezilla.exe") -Destination $cli
         $published += $cli
-        Move-Item -LiteralPath (Join-Path $temporary "wakezilla-tray.exe") -Destination $tray -Force
+        Publish-WakezillaFile -Source (Join-Path $temporary "wakezilla-tray.exe") -Destination $tray
         $published += $tray
-        Move-Item -LiteralPath (Join-Path $temporary "wakezilla.ico") -Destination $icon -Force
+        Publish-WakezillaFile -Source (Join-Path $temporary "wakezilla.ico") -Destination $icon
         $published += $icon
         $uninstaller = Get-WakezillaUninstallScript -InstallRoot $installRoot
         New-WakezillaShortcut -Path $programShortcut -TargetPath $tray -WorkingDirectory $BinDir -IconPath $icon
