@@ -811,10 +811,14 @@ fn load_tray_icon() -> Result<Icon> {
         .next_frame(&mut buffer)
         .context("failed to read tray icon frame")?;
     let bytes = &buffer[..frame.buffer_size()];
-    let mut rgba = rgba_from_png_frame(bytes, frame.color_type)?;
+    let rgba = rgba_from_png_frame(bytes, frame.color_type)?;
 
     #[cfg(target_os = "macos")]
-    macos_white_mascot_rgba(&mut rgba, frame.width, frame.height);
+    let rgba = {
+        let mut rgba = rgba;
+        macos_white_mascot_rgba(&mut rgba, frame.width, frame.height);
+        rgba
+    };
 
     Icon::from_rgba(rgba, frame.width, frame.height).context("failed to create tray icon")
 }
@@ -1630,7 +1634,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_white_mascot_keeps_only_interior_dark_lines() {
-        let mut rgba = vec![140, 90, 60, 255].repeat(25);
+        let mut rgba = [140, 90, 60, 255].repeat(25);
         rgba[12 * 4..13 * 4].copy_from_slice(&[60, 60, 60, 255]);
 
         macos_white_mascot_rgba(&mut rgba, 5, 5);
