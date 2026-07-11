@@ -422,11 +422,16 @@ impl TrayApp {
         let (root_menu, tray_menu) = build_menu()?;
         let icon = load_tray_icon()?;
 
-        let tray_icon = TrayIconBuilder::new()
+        let tray_icon_builder = TrayIconBuilder::new()
             .with_tooltip("Wakezilla")
             .with_icon(icon)
             .with_menu(Box::new(root_menu))
-            .with_menu_on_left_click(true)
+            .with_menu_on_left_click(true);
+
+        #[cfg(target_os = "macos")]
+        let tray_icon_builder = tray_icon_builder.with_icon_as_template(false);
+
+        let tray_icon = tray_icon_builder
             .build()
             .context("failed to build tray icon")?;
 
@@ -808,7 +813,65 @@ fn load_tray_icon() -> Result<Icon> {
     let bytes = &buffer[..frame.buffer_size()];
     let rgba = rgba_from_png_frame(bytes, frame.color_type)?;
 
+    #[cfg(target_os = "macos")]
+    let rgba = {
+        let mut rgba = rgba;
+        macos_white_mascot_rgba(&mut rgba, frame.width, frame.height);
+        rgba
+    };
+
     Icon::from_rgba(rgba, frame.width, frame.height).context("failed to create tray icon")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_white_mascot_rgba(rgba: &mut [u8], width: u32, height: u32) {
+    const DARK_LINE_LUMA_MAX: u16 = 100;
+    const INNER_LINE_MARGIN: usize = 2;
+
+    let width = usize::try_from(width).expect("tray icon width must fit usize");
+    let height = usize::try_from(height).expect("tray icon height must fit usize");
+    let pixel_count = width
+        .checked_mul(height)
+        .expect("tray icon pixel count must fit usize");
+    assert_eq!(rgba.len(), pixel_count * 4, "tray icon must be RGBA");
+
+    let alpha = rgba
+        .chunks_exact(4)
+        .map(|pixel| pixel[3])
+        .collect::<Vec<_>>();
+    let dark = rgba
+        .chunks_exact(4)
+        .map(|pixel| {
+            let luma =
+                (54 * u16::from(pixel[0]) + 183 * u16::from(pixel[1]) + 19 * u16::from(pixel[2]))
+                    / 256;
+            luma <= DARK_LINE_LUMA_MAX
+        })
+        .collect::<Vec<_>>();
+
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            let pixel = &mut rgba[index * 4..index * 4 + 4];
+            if alpha[index] == 0 {
+                continue;
+            }
+
+            let has_opaque_margin = x >= INNER_LINE_MARGIN
+                && y >= INNER_LINE_MARGIN
+                && x + INNER_LINE_MARGIN < width
+                && y + INNER_LINE_MARGIN < height
+                && (y - INNER_LINE_MARGIN..=y + INNER_LINE_MARGIN).all(|neighbor_y| {
+                    (x - INNER_LINE_MARGIN..=x + INNER_LINE_MARGIN)
+                        .all(|neighbor_x| alpha[neighbor_y * width + neighbor_x] != 0)
+                });
+            pixel[..3].fill(if dark[index] && has_opaque_margin {
+                0
+            } else {
+                255
+            });
+        }
+    }
 }
 
 fn rgba_from_png_frame(bytes: &[u8], color_type: png::ColorType) -> Result<Vec<u8>> {
@@ -1567,6 +1630,19 @@ fn powershell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_white_mascot_keeps_only_interior_dark_lines() {
+        let mut rgba = [140, 90, 60, 255].repeat(25);
+        rgba[12 * 4..13 * 4].copy_from_slice(&[60, 60, 60, 255]);
+
+        macos_white_mascot_rgba(&mut rgba, 5, 5);
+
+        let mut expected = vec![255; 25 * 4];
+        expected[12 * 4..13 * 4].copy_from_slice(&[0, 0, 0, 255]);
+        assert_eq!(rgba, expected);
+    }
 
     #[test]
     fn tray_instance_rejects_a_second_guard() {
