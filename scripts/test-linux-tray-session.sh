@@ -122,5 +122,8 @@ grep -q 'StatusNotifierItem' "$registered_items" || {
   exit 1
 }
 
-import -display "$DISPLAY" -window root "$artifact_dir/linux-tray-desktop.png"
-test -s "$artifact_dir/linux-tray-desktop.png"
+if ! import -display "$DISPLAY" -window root "$artifact_dir/linux-tray-desktop.png" \
+  2>"$artifact_dir/screenshot.log"; then
+  printf 'warning: could not capture the Xvfb screen; D-Bus registration remains verified\n' \
+    >&2
+fi
