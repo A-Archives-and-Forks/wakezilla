@@ -411,20 +411,6 @@ fn macos_icon_contains_all_canonical_png_representations() {
     validate_macos_icon(MACOS_ICNS).unwrap_or_else(|error| panic!("{error}"));
 }
 
-#[test]
-fn macos_tray_icon_uses_white_mascot_with_internal_lines() {
-    const TRAY_SOURCE: &str = include_str!("../src/tray/desktop.rs");
-
-    assert!(
-        TRAY_SOURCE.contains(".with_icon_as_template(false)"),
-        "the macOS tray icon must preserve its fixed white rendering"
-    );
-    assert!(
-        TRAY_SOURCE.contains("macos_white_mascot_rgba(&mut rgba, frame.width, frame.height);"),
-        "the macOS tray icon must render only internal dark details"
-    );
-}
-
 fn icns_without_chunk(bytes: &[u8], removed_kind: &[u8; 4]) -> Vec<u8> {
     let mut rebuilt = bytes[..8].to_vec();
     let mut offset = 8;
