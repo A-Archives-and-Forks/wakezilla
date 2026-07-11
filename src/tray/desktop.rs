@@ -429,7 +429,7 @@ impl TrayApp {
             .with_menu_on_left_click(true);
 
         #[cfg(target_os = "macos")]
-        let tray_icon_builder = tray_icon_builder.with_icon_as_template(true);
+        let tray_icon_builder = tray_icon_builder.with_icon_as_template(false);
 
         let tray_icon = tray_icon_builder
             .build()
@@ -814,58 +814,28 @@ fn load_tray_icon() -> Result<Icon> {
     let mut rgba = rgba_from_png_frame(bytes, frame.color_type)?;
 
     #[cfg(target_os = "macos")]
-    macos_template_rgba(&mut rgba, frame.width, frame.height);
+    macos_monochrome_rgba(&mut rgba);
 
     Icon::from_rgba(rgba, frame.width, frame.height).context("failed to create tray icon")
 }
 
 #[cfg(target_os = "macos")]
-fn macos_template_rgba(rgba: &mut [u8], width: u32, height: u32) {
-    const OUTLINE_LUMA_MAX: u16 = 100;
-    const OUTLINE_RADIUS: usize = 3;
+fn macos_monochrome_rgba(rgba: &mut [u8]) {
+    const WHITE_LUMA_MIN: u16 = 180;
+    const GRAY_LUMA_MIN: u16 = 100;
 
-    let width = usize::try_from(width).expect("tray icon width must fit usize");
-    let height = usize::try_from(height).expect("tray icon height must fit usize");
-    let pixel_count = width
-        .checked_mul(height)
-        .expect("tray icon pixel count must fit usize");
-    assert_eq!(rgba.len(), pixel_count * 4, "tray icon must be RGBA");
-
-    let alpha = rgba
-        .chunks_exact(4)
-        .map(|pixel| pixel[3])
-        .collect::<Vec<_>>();
-    let dark_outline = rgba
-        .chunks_exact(4)
-        .map(|pixel| {
-            let luma =
-                54 * u16::from(pixel[0]) + 183 * u16::from(pixel[1]) + 19 * u16::from(pixel[2]);
-            pixel[3] != 0 && luma / 256 <= OUTLINE_LUMA_MAX
-        })
-        .collect::<Vec<_>>();
-    let mut outline_alpha = vec![0; pixel_count];
-
-    for y in 0..height {
-        for x in 0..width {
-            if !dark_outline[y * width + x] {
-                continue;
-            }
-            let y_start = y.saturating_sub(OUTLINE_RADIUS);
-            let y_end = y.saturating_add(OUTLINE_RADIUS).min(height - 1);
-            let x_start = x.saturating_sub(OUTLINE_RADIUS);
-            let x_end = x.saturating_add(OUTLINE_RADIUS).min(width - 1);
-            for target_y in y_start..=y_end {
-                for target_x in x_start..=x_end {
-                    let target = target_y * width + target_x;
-                    outline_alpha[target] = outline_alpha[target].max(alpha[target]);
-                }
-            }
+    for pixel in rgba.chunks_exact_mut(4) {
+        if pixel[3] == 0 {
+            continue;
         }
-    }
-
-    for (pixel, alpha) in rgba.chunks_exact_mut(4).zip(outline_alpha) {
-        pixel[..3].fill(0);
-        pixel[3] = alpha;
+        let luma =
+            (54 * u16::from(pixel[0]) + 183 * u16::from(pixel[1]) + 19 * u16::from(pixel[2])) / 256;
+        let tone = match luma {
+            WHITE_LUMA_MIN.. => 255,
+            GRAY_LUMA_MIN.. => 128,
+            _ => 0,
+        };
+        pixel[..3].fill(tone);
     }
 }
 
@@ -1628,31 +1598,20 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_template_mask_keeps_dark_outline_pixels() {
+    fn macos_monochrome_icon_preserves_three_tones_and_alpha() {
         let mut rgba = [
-            220, 100, 60, 0, // transparent background
-            80, 30, 20, 180, // dark outline
+            240, 240, 240, 255, // white
+            128, 128, 128, 180, // gray
+            60, 60, 60, 200, // black
             220, 100, 60, 0, // transparent background
         ];
 
-        macos_template_rgba(&mut rgba, 3, 1);
+        macos_monochrome_rgba(&mut rgba);
 
-        assert_eq!(rgba, [0, 0, 0, 0, 0, 0, 0, 180, 0, 0, 0, 0]);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_template_mask_thickens_dark_outline_pixels() {
-        let mut rgba = vec![220, 100, 60, 255].repeat(9);
-        rgba[4 * 4..4 * 5].copy_from_slice(&[80, 30, 20, 255]);
-
-        macos_template_rgba(&mut rgba, 9, 1);
-
-        let alpha = rgba
-            .chunks_exact(4)
-            .map(|pixel| pixel[3])
-            .collect::<Vec<_>>();
-        assert_eq!(alpha, [0, 255, 255, 255, 255, 255, 255, 255, 0]);
+        assert_eq!(
+            rgba,
+            [255, 255, 255, 255, 128, 128, 128, 180, 0, 0, 0, 200, 220, 100, 60, 0,]
+        );
     }
 
     #[test]
