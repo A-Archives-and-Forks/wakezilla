@@ -831,9 +831,8 @@ fn macos_monochrome_rgba(rgba: &mut [u8]) {
         let luma =
             (54 * u16::from(pixel[0]) + 183 * u16::from(pixel[1]) + 19 * u16::from(pixel[2])) / 256;
         let tone = match luma {
-            WHITE_LUMA_MIN.. => 255,
-            GRAY_LUMA_MIN.. => 128,
-            _ => 0,
+            GRAY_LUMA_MIN..WHITE_LUMA_MIN => 128,
+            _ => 255,
         };
         pixel[..3].fill(tone);
     }
@@ -1598,11 +1597,11 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_monochrome_icon_preserves_three_tones_and_alpha() {
+    fn macos_monochrome_icon_replaces_black_with_white_and_preserves_alpha() {
         let mut rgba = [
             240, 240, 240, 255, // white
             128, 128, 128, 180, // gray
-            60, 60, 60, 200, // black
+            60, 60, 60, 200, // replaced with white
             220, 100, 60, 0, // transparent background
         ];
 
@@ -1610,7 +1609,7 @@ mod tests {
 
         assert_eq!(
             rgba,
-            [255, 255, 255, 255, 128, 128, 128, 180, 0, 0, 0, 200, 220, 100, 60, 0,]
+            [255, 255, 255, 255, 128, 128, 128, 180, 255, 255, 255, 200, 220, 100, 60, 0,]
         );
     }
 
