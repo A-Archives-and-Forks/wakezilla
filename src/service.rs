@@ -126,7 +126,20 @@ pub fn windows_image_path_uses_protected_binary(
             .to_ascii_lowercase()
     }
 
-    normalized(image_path) == normalized(&windows_service_binary_path_in(program_files, mode))
+    let protected = windows_service_binary_path_in(program_files, mode);
+    if normalized(image_path) == normalized(&protected) {
+        return true;
+    }
+
+    let image_path = image_path.to_string_lossy();
+    let Some(command) = image_path.strip_prefix('"') else {
+        return false;
+    };
+    let Some((executable, arguments)) = command.split_once('"') else {
+        return false;
+    };
+    let expected_arguments = format!(" {}", windows_service_program_args(mode).join(" "));
+    normalized(Path::new(executable)) == normalized(&protected) && arguments == expected_arguments
 }
 
 /// Protected DACL for the Windows service directory: full control for only
@@ -1097,6 +1110,14 @@ fn windows_security_sddl(path: &Path) -> Result<String> {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_security_matches_expected(path: &Path, directory: bool) -> Result<bool> {
+    let expected = windows_full_security_sddl(directory);
+    let actual = windows_security_sddl(path)?;
+    let auto_inherited = expected.replacen("D:P", "D:PAI", 1);
+    Ok(actual == expected || actual == auto_inherited)
+}
+
+#[cfg(target_os = "windows")]
 fn apply_windows_protected_security(path: &Path, directory: bool) -> Result<()> {
     use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{
@@ -1166,7 +1187,7 @@ fn apply_windows_protected_security(path: &Path, directory: bool) -> Result<()> 
             status
         );
     }
-    if windows_security_sddl(path)? != expected {
+    if !windows_security_matches_expected(path, directory)? {
         anyhow::bail!(
             "protected Windows ACL verification failed for {}",
             path.display()
@@ -1399,7 +1420,7 @@ fn begin_protected_binary_update(
                 destination.display()
             );
         }
-        if windows_security_sddl(&destination)? != windows_full_security_sddl(false) {
+        if !windows_security_matches_expected(&destination, false)? {
             anyhow::bail!(
                 "existing protected service binary {} has an unsafe ACL; remove it manually and rerun setup",
                 destination.display()
@@ -1456,7 +1477,7 @@ fn begin_protected_binary_update(
     };
     let validation = (|| -> Result<()> {
         windows_path_has_no_reparse_components(&update.destination)?;
-        if windows_security_sddl(&update.destination)? != windows_full_security_sddl(false) {
+        if !windows_security_matches_expected(&update.destination, false)? {
             anyhow::bail!(
                 "published protected service binary {} has an unsafe ACL",
                 update.destination.display()
@@ -1480,7 +1501,7 @@ fn validate_windows_protected_binary(mode: Mode) -> Result<PathBuf> {
     let path = protected_service_binary_path(mode)?;
     windows_path_has_no_reparse_components(&path)?;
     if !std::fs::symlink_metadata(&path)?.file_type().is_file()
-        || windows_security_sddl(&path)? != windows_full_security_sddl(false)
+        || !windows_security_matches_expected(&path, false)?
     {
         anyhow::bail!(
             "protected Windows service binary {} is missing or has unsafe metadata",
@@ -1811,7 +1832,7 @@ fn remove_protected_service_binary(mode: Mode) -> Result<()> {
         Ok(metadata) => {
             windows_path_has_no_reparse_components(&binary)?;
             if !metadata.file_type().is_file()
-                || windows_security_sddl(&binary)? != windows_full_security_sddl(false)
+                || !windows_security_matches_expected(&binary, false)?
             {
                 anyhow::bail!(
                     "refusing to remove unsafe or foreign protected Windows binary {}",

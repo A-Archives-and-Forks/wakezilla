@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
         }
         Commands::Setup(args) => {
             if let Err(e) = setup::run(args) {
-                error!("Setup error: {}", e);
+                error!("Setup error: {e:#}");
                 std::process::exit(1);
             }
         }

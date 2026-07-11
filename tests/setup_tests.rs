@@ -168,6 +168,27 @@ fn windows_image_path_validation_rejects_user_writable_legacy_binary() {
 }
 
 #[test]
+fn windows_image_path_validation_accepts_only_the_canonical_service_command() {
+    let program_files = Path::new("C:/Program Files");
+    let canonical = Path::new(
+        r#""C:\Program Files\Wakezilla\Service\wakezilla-client.exe" --no-update-check windows-service client"#,
+    );
+    assert!(service::windows_image_path_uses_protected_binary(
+        program_files,
+        Mode::Client,
+        canonical
+    ));
+
+    let unexpected_args =
+        Path::new(r#""C:\Program Files\Wakezilla\Service\wakezilla-client.exe" client-server"#);
+    assert!(!service::windows_image_path_uses_protected_binary(
+        program_files,
+        Mode::Client,
+        unexpected_args
+    ));
+}
+
+#[test]
 fn windows_protected_acl_contract_allows_only_system_and_administrators() {
     let directory = service::windows_service_directory_sddl();
     let file = service::windows_service_file_sddl();

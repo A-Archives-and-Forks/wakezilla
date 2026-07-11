@@ -291,6 +291,34 @@ function Restart-WakezillaServicesAfterInstall {
     }
 }
 
+function Test-WakezillaServiceUsesProtectedBinary {
+    param([string]$ServiceName)
+
+    try {
+        $service = Get-CimInstance Win32_Service -Filter "Name = '$ServiceName'" -ErrorAction Stop
+        if (-not $service -or -not $service.PathName) {
+            return $false
+        }
+
+        $imagePath = [string]$service.PathName
+        if ($imagePath -notmatch '^\s*"([^"]+)"') {
+            return $false
+        }
+
+        $programFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+        if (-not $programFiles) {
+            return $false
+        }
+
+        $protectedBinary = Join-Path (Join-Path $programFiles "Wakezilla\Service") "$serviceName.exe"
+        Test-SamePath $Matches[1] $protectedBinary
+    }
+    catch {
+        Write-Warn "failed to inspect Windows service '$serviceName' before updating ${ExeName}: $($_.Exception.Message)"
+        $false
+    }
+}
+
 function Stop-WakezillaServicesForInstall {
     param([string[]]$ServiceNames = $WakezillaServiceNames)
 
@@ -298,6 +326,10 @@ function Stop-WakezillaServicesForInstall {
     foreach ($serviceName in $ServiceNames) {
         $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
         if (-not $service) {
+            continue
+        }
+
+        if (Test-WakezillaServiceUsesProtectedBinary -ServiceName $serviceName) {
             continue
         }
 
