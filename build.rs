@@ -1,3 +1,5 @@
+mod build_support;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,6 +14,8 @@ fn main() {
     println!("cargo:rerun-if-changed=frontend/Cargo.lock");
     println!("cargo:rerun-if-changed=frontend/public");
     println!("cargo:rerun-if-changed=frontend-dist");
+    println!("cargo:rerun-if-changed=build_support.rs");
+    println!("cargo:rerun-if-env-changed=WAKEZILLA_USE_PREBUILT_FRONTEND");
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR");
     let frontend_dir = Path::new(&manifest_dir).join("frontend");
@@ -28,7 +32,12 @@ fn main() {
 
     let is_release = env::var("PROFILE").as_deref() == Ok("release");
     let frontend_index = frontend_dist_dir.join("index.html");
-    let must_build = is_release || !frontend_index.is_file();
+    let use_prebuilt_frontend = env::var("WAKEZILLA_USE_PREBUILT_FRONTEND").as_deref() == Ok("1");
+    let must_build = build_support::frontend_build_is_required(
+        is_release,
+        frontend_index.is_file(),
+        use_prebuilt_frontend,
+    );
 
     // Keep debug builds fast when frontend assets already exist.
     if !must_build {
