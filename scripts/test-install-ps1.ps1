@@ -132,6 +132,23 @@ function Test-ArchiveAndInstall {
     }
 }
 
+function Test-ExistingFileReplacement {
+    $tempDir = New-Item -ItemType Directory -Force -Path (Join-Path ([System.IO.Path]::GetTempPath()) "wakezilla-ps1-replacement-$PID")
+    try {
+        $source = Join-Path $tempDir "wakezilla.exe.new"
+        $destination = Join-Path $tempDir "wakezilla.exe"
+        Set-Content -NoNewline -Path $source -Value "new executable"
+        Set-Content -NoNewline -Path $destination -Value "old executable"
+
+        Move-Item -LiteralPath $source -Destination $destination -Force
+
+        Assert-Equal "new executable" (Get-Content -Raw -Path $destination) "replacement binary contents"
+    }
+    finally {
+        Remove-Item -Recurse -Force $tempDir
+    }
+}
+
 function New-MockService {
     param(
         [string]$Name,
@@ -295,6 +312,7 @@ Test-ReleaseHelpers
 Test-GuiInstallationContracts
 Test-ChecksumHelpers
 Test-ArchiveAndInstall
+Test-ExistingFileReplacement
 Test-ServiceStopAndRestartHelpers
 Test-ProcessStopHelper
 
