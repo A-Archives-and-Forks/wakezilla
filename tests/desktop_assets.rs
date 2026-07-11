@@ -419,6 +419,10 @@ fn macos_tray_icon_is_configured_as_a_template() {
         TRAY_SOURCE.contains(".with_icon_as_template(true)"),
         "the macOS tray icon must use template rendering so the system supplies monochrome colors"
     );
+    assert!(
+        TRAY_SOURCE.contains("macos_template_rgba(&mut rgba, frame.width, frame.height);"),
+        "the macOS tray icon must keep only the mascot's outline before template rendering"
+    );
 }
 
 fn icns_without_chunk(bytes: &[u8], removed_kind: &[u8; 4]) -> Vec<u8> {

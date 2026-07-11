@@ -811,9 +811,62 @@ fn load_tray_icon() -> Result<Icon> {
         .next_frame(&mut buffer)
         .context("failed to read tray icon frame")?;
     let bytes = &buffer[..frame.buffer_size()];
-    let rgba = rgba_from_png_frame(bytes, frame.color_type)?;
+    let mut rgba = rgba_from_png_frame(bytes, frame.color_type)?;
+
+    #[cfg(target_os = "macos")]
+    macos_template_rgba(&mut rgba, frame.width, frame.height);
 
     Icon::from_rgba(rgba, frame.width, frame.height).context("failed to create tray icon")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_template_rgba(rgba: &mut [u8], width: u32, height: u32) {
+    const OUTLINE_LUMA_MAX: u16 = 100;
+    const OUTLINE_RADIUS: usize = 4;
+
+    let width = usize::try_from(width).expect("tray icon width must fit usize");
+    let height = usize::try_from(height).expect("tray icon height must fit usize");
+    let pixel_count = width
+        .checked_mul(height)
+        .expect("tray icon pixel count must fit usize");
+    assert_eq!(rgba.len(), pixel_count * 4, "tray icon must be RGBA");
+
+    let alpha = rgba
+        .chunks_exact(4)
+        .map(|pixel| pixel[3])
+        .collect::<Vec<_>>();
+    let dark_outline = rgba
+        .chunks_exact(4)
+        .map(|pixel| {
+            let luma =
+                54 * u16::from(pixel[0]) + 183 * u16::from(pixel[1]) + 19 * u16::from(pixel[2]);
+            pixel[3] != 0 && luma / 256 <= OUTLINE_LUMA_MAX
+        })
+        .collect::<Vec<_>>();
+    let mut outline_alpha = vec![0; pixel_count];
+
+    for y in 0..height {
+        for x in 0..width {
+            if !dark_outline[y * width + x] {
+                continue;
+            }
+            let y_start = y.saturating_sub(OUTLINE_RADIUS);
+            let y_end = y.saturating_add(OUTLINE_RADIUS).min(height - 1);
+            let x_start = x.saturating_sub(OUTLINE_RADIUS);
+            let x_end = x.saturating_add(OUTLINE_RADIUS).min(width - 1);
+            for target_y in y_start..=y_end {
+                for target_x in x_start..=x_end {
+                    let target = target_y * width + target_x;
+                    outline_alpha[target] = outline_alpha[target].max(alpha[target]);
+                }
+            }
+        }
+    }
+
+    for (pixel, alpha) in rgba.chunks_exact_mut(4).zip(outline_alpha) {
+        pixel[..3].fill(0);
+        pixel[3] = alpha;
+    }
 }
 
 fn rgba_from_png_frame(bytes: &[u8], color_type: png::ColorType) -> Result<Vec<u8>> {
@@ -1572,6 +1625,34 @@ fn powershell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_template_mask_keeps_dark_outline_pixels() {
+        let mut rgba = [
+            220, 100, 60, 0, // transparent background
+            80, 30, 20, 180, // dark outline
+            220, 100, 60, 0, // transparent background
+        ];
+
+        macos_template_rgba(&mut rgba, 3, 1);
+
+        assert_eq!(rgba, [0, 0, 0, 0, 0, 0, 0, 180, 0, 0, 0, 0]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_template_mask_thickens_dark_outline_pixels() {
+        let mut rgba = [
+            220, 100, 60, 255, // mascot fill
+            80, 30, 20, 255, // dark outline
+            220, 100, 60, 255, // mascot fill
+        ];
+
+        macos_template_rgba(&mut rgba, 3, 1);
+
+        assert_eq!(rgba, [0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]);
+    }
 
     #[test]
     fn tray_instance_rejects_a_second_guard() {
