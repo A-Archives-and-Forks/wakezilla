@@ -388,9 +388,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_os = "linux")]
         {
-            while gtk::events_pending() {
-                gtk::main_iteration();
-            }
+            gtk::main_iteration_do(false);
 
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 std::time::Instant::now() + Duration::from_millis(50),
