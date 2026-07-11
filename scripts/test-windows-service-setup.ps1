@@ -31,6 +31,13 @@ try {
     Invoke-Wakezilla @("--no-update-check", "setup", "--mode", "client", "--port", "$secondPort", "--yes")
     Invoke-Wakezilla @("service", "status", "--mode", "client")
 }
+catch {
+    if (Test-Path $serviceRoot) {
+        $serviceAcl = Get-Acl -LiteralPath $serviceRoot
+        Write-Host "Wakezilla service directory SDDL: $($serviceAcl.Sddl)"
+    }
+    throw
+}
 finally {
     & $wakezilla "uninstall"
     if ($LASTEXITCODE -ne 0) {
