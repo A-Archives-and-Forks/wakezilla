@@ -104,9 +104,12 @@ jobs:
         run: |
           set -euo pipefail
           TARGET="${{ matrix.target }}"
+          mkdir -p target/musl-tray
+          cp -a target/frontend-dist target/musl-tray/frontend-dist
           docker run --rm \
             -e CARGO_TERM_COLOR=always \
             -e TARGET="${TARGET}" \
+            -e WAKEZILLA_USE_PREBUILT_FRONTEND=1 \
             -v "$PWD:/workspace" \
             -w /workspace \
             rust:1-alpine \

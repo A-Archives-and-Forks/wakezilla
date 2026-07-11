@@ -46,6 +46,7 @@ include = [
     "frontend/public/**",
     "frontend-dist/**",
     "build.rs",
+    "build_support.rs",
     "common/Cargo.toml",
     "common/src/**",
     "Cargo.toml",
