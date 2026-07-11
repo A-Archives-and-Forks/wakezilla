@@ -814,27 +814,59 @@ fn load_tray_icon() -> Result<Icon> {
     let mut rgba = rgba_from_png_frame(bytes, frame.color_type)?;
 
     #[cfg(target_os = "macos")]
-    macos_monochrome_rgba(&mut rgba);
+    macos_white_mascot_rgba(&mut rgba, frame.width, frame.height);
 
     Icon::from_rgba(rgba, frame.width, frame.height).context("failed to create tray icon")
 }
 
 #[cfg(target_os = "macos")]
-fn macos_monochrome_rgba(rgba: &mut [u8]) {
-    const WHITE_LUMA_MIN: u16 = 180;
-    const GRAY_LUMA_MIN: u16 = 100;
+fn macos_white_mascot_rgba(rgba: &mut [u8], width: u32, height: u32) {
+    const DARK_LINE_LUMA_MAX: u16 = 100;
+    const INNER_LINE_MARGIN: usize = 2;
 
-    for pixel in rgba.chunks_exact_mut(4) {
-        if pixel[3] == 0 {
-            continue;
+    let width = usize::try_from(width).expect("tray icon width must fit usize");
+    let height = usize::try_from(height).expect("tray icon height must fit usize");
+    let pixel_count = width
+        .checked_mul(height)
+        .expect("tray icon pixel count must fit usize");
+    assert_eq!(rgba.len(), pixel_count * 4, "tray icon must be RGBA");
+
+    let alpha = rgba
+        .chunks_exact(4)
+        .map(|pixel| pixel[3])
+        .collect::<Vec<_>>();
+    let dark = rgba
+        .chunks_exact(4)
+        .map(|pixel| {
+            let luma =
+                (54 * u16::from(pixel[0]) + 183 * u16::from(pixel[1]) + 19 * u16::from(pixel[2]))
+                    / 256;
+            luma <= DARK_LINE_LUMA_MAX
+        })
+        .collect::<Vec<_>>();
+
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            let pixel = &mut rgba[index * 4..index * 4 + 4];
+            if alpha[index] == 0 {
+                continue;
+            }
+
+            let has_opaque_margin = x >= INNER_LINE_MARGIN
+                && y >= INNER_LINE_MARGIN
+                && x + INNER_LINE_MARGIN < width
+                && y + INNER_LINE_MARGIN < height
+                && (y - INNER_LINE_MARGIN..=y + INNER_LINE_MARGIN).all(|neighbor_y| {
+                    (x - INNER_LINE_MARGIN..=x + INNER_LINE_MARGIN)
+                        .all(|neighbor_x| alpha[neighbor_y * width + neighbor_x] != 0)
+                });
+            pixel[..3].fill(if dark[index] && has_opaque_margin {
+                0
+            } else {
+                255
+            });
         }
-        let luma =
-            (54 * u16::from(pixel[0]) + 183 * u16::from(pixel[1]) + 19 * u16::from(pixel[2])) / 256;
-        let tone = match luma {
-            GRAY_LUMA_MIN..WHITE_LUMA_MIN => 128,
-            _ => 255,
-        };
-        pixel[..3].fill(tone);
     }
 }
 
@@ -1597,20 +1629,15 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_monochrome_icon_replaces_black_with_white_and_preserves_alpha() {
-        let mut rgba = [
-            240, 240, 240, 255, // white
-            128, 128, 128, 180, // gray
-            60, 60, 60, 200, // replaced with white
-            220, 100, 60, 0, // transparent background
-        ];
+    fn macos_white_mascot_keeps_only_interior_dark_lines() {
+        let mut rgba = vec![140, 90, 60, 255].repeat(25);
+        rgba[12 * 4..13 * 4].copy_from_slice(&[60, 60, 60, 255]);
 
-        macos_monochrome_rgba(&mut rgba);
+        macos_white_mascot_rgba(&mut rgba, 5, 5);
 
-        assert_eq!(
-            rgba,
-            [255, 255, 255, 255, 128, 128, 128, 180, 255, 255, 255, 200, 220, 100, 60, 0,]
-        );
+        let mut expected = vec![255; 25 * 4];
+        expected[12 * 4..13 * 4].copy_from_slice(&[0, 0, 0, 255]);
+        assert_eq!(rgba, expected);
     }
 
     #[test]

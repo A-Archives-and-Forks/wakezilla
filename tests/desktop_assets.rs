@@ -412,16 +412,16 @@ fn macos_icon_contains_all_canonical_png_representations() {
 }
 
 #[test]
-fn macos_tray_icon_uses_white_and_gray_rendering() {
+fn macos_tray_icon_uses_white_mascot_with_internal_lines() {
     const TRAY_SOURCE: &str = include_str!("../src/tray/desktop.rs");
 
     assert!(
         TRAY_SOURCE.contains(".with_icon_as_template(false)"),
-        "the macOS tray icon must preserve white and gray tones"
+        "the macOS tray icon must preserve its fixed white rendering"
     );
     assert!(
-        TRAY_SOURCE.contains("macos_monochrome_rgba(&mut rgba);"),
-        "the macOS tray icon must convert the full mascot to monochrome tones"
+        TRAY_SOURCE.contains("macos_white_mascot_rgba(&mut rgba, frame.width, frame.height);"),
+        "the macOS tray icon must render only internal dark details"
     );
 }
 
