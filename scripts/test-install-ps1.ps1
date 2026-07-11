@@ -140,7 +140,7 @@ function Test-ExistingFileReplacement {
         Set-Content -NoNewline -Path $source -Value "new executable"
         Set-Content -NoNewline -Path $destination -Value "old executable"
 
-        Move-Item -LiteralPath $source -Destination $destination -Force
+        Publish-WakezillaFile -Source $source -Destination $destination
 
         Assert-Equal "new executable" (Get-Content -Raw -Path $destination) "replacement binary contents"
     }
