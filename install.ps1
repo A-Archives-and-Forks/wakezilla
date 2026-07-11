@@ -306,7 +306,7 @@ function Stop-WakezillaServicesForInstall {
             try {
                 Write-Info "stopping Windows service $serviceName before updating $ExeName..."
                 Stop-Service -Name $serviceName -Force -ErrorAction Stop
-                $service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(30))
+                $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
             }
             catch {
                 if ($restartServices.Count -gt 0) {
