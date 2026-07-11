@@ -285,6 +285,23 @@ function Test-ServiceStopAndRestartHelpers {
     Assert-Equal "wakezilla-proxy" $script:StartedServices[0] "started service name"
 }
 
+function Test-ProtectedServicesDoNotRequireInstallerElevation {
+    $script:MockServices = @{
+        "wakezilla-proxy" = New-MockService -Name "wakezilla-proxy" -Status "Running"
+    }
+    $script:MockServiceImages = @{
+        "wakezilla-proxy" = '"C:\Program Files\Wakezilla\Service\wakezilla-proxy.exe" --no-update-check windows-service proxy'
+    }
+    $script:StoppedServices = @()
+    $script:StartedServices = @()
+    $script:WaitedServices = @()
+
+    $restartServices = @(Stop-WakezillaServicesForInstall -ServiceNames @("wakezilla-proxy"))
+
+    Assert-Equal 0 $restartServices.Count "protected service restart count"
+    Assert-Equal 0 $script:StoppedServices.Count "protected service stop count"
+}
+
 function Test-ProcessStopHelper {
     $tempDir = New-Item -ItemType Directory -Force -Path (Join-Path ([System.IO.Path]::GetTempPath()) "wakezilla-ps1-process-$PID")
     try {
@@ -321,6 +338,7 @@ Test-ChecksumHelpers
 Test-ArchiveAndInstall
 Test-ExistingFileReplacement
 Test-ServiceStopAndRestartHelpers
+Test-ProtectedServicesDoNotRequireInstallerElevation
 Test-ProcessStopHelper
 
 Write-Host "install.ps1 tests passed"
