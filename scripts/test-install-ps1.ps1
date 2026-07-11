@@ -54,6 +54,7 @@ function New-TestRelease {
 function Test-TargetDetection {
     Assert-Equal "custom-target" (Get-WakezillaTarget -TargetOverride "custom-target") "target override"
     Assert-Equal "x86_64-pc-windows-msvc" (Get-WakezillaTarget -Architecture "X64") "windows x64 target"
+    Assert-Equal "x86_64-pc-windows-msvc" (Get-WakezillaTarget) "automatic Windows target"
 }
 
 function Test-ReleaseHelpers {
