@@ -110,14 +110,14 @@ for _ in $(seq 1 100); do
     --method org.freedesktop.DBus.Properties.Get \
     org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems \
     >"$registered_items" 2>&1 || true
-  if grep -q 'StatusNotifierItem' "$registered_items"; then
+  if grep -Eq "<\\['[^']+" "$registered_items"; then
     break
   fi
   sleep 0.1
 done
 
 cat "$registered_items"
-grep -q 'StatusNotifierItem' "$registered_items" || {
+grep -Eq "<\\['[^']+" "$registered_items" || {
   printf 'Wakezilla tray did not register a StatusNotifierItem with the graphical panel\n' >&2
   exit 1
 }
