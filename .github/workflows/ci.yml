@@ -267,6 +267,35 @@ jobs:
           if ((Get-Subsystem $cli) -ne 3) { throw 'wakezilla.exe must be a console PE (subsystem 3)' }
           if ((Get-Subsystem $tray) -ne 2) { throw 'wakezilla-tray.exe must be a GUI PE (subsystem 2)' }
 
+      - name: Reconfigure an installed Windows service
+        shell: pwsh
+        run: |
+          $logDir = Join-Path $env:RUNNER_TEMP "wakezilla-service-setup-logs"
+          $logPath = Join-Path $logDir "windows-service-setup.log"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+          try {
+            & .\scripts\test-windows-service-setup.ps1 *>&1 |
+              Tee-Object -FilePath $logPath
+          }
+          catch {
+            $_ | Format-List * -Force | Out-String |
+              Tee-Object -FilePath $logPath -Append
+            if ($_.Exception) {
+              $_.Exception | Format-List * -Force | Out-String |
+                Tee-Object -FilePath $logPath -Append
+            }
+            throw
+          }
+
+      - name: Upload Windows service setup logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-service-setup-logs
+          path: ${{ runner.temp }}\wakezilla-service-setup-logs
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Run Windows backend tests
         run: cargo test -p wakezilla -p wakezilla-common --locked
 
