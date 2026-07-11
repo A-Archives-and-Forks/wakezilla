@@ -422,11 +422,16 @@ impl TrayApp {
         let (root_menu, tray_menu) = build_menu()?;
         let icon = load_tray_icon()?;
 
-        let tray_icon = TrayIconBuilder::new()
+        let tray_icon_builder = TrayIconBuilder::new()
             .with_tooltip("Wakezilla")
             .with_icon(icon)
             .with_menu(Box::new(root_menu))
-            .with_menu_on_left_click(true)
+            .with_menu_on_left_click(true);
+
+        #[cfg(target_os = "macos")]
+        let tray_icon_builder = tray_icon_builder.with_icon_as_template(true);
+
+        let tray_icon = tray_icon_builder
             .build()
             .context("failed to build tray icon")?;
 

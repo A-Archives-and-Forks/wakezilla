@@ -411,6 +411,16 @@ fn macos_icon_contains_all_canonical_png_representations() {
     validate_macos_icon(MACOS_ICNS).unwrap_or_else(|error| panic!("{error}"));
 }
 
+#[test]
+fn macos_tray_icon_is_configured_as_a_template() {
+    const TRAY_SOURCE: &str = include_str!("../src/tray/desktop.rs");
+
+    assert!(
+        TRAY_SOURCE.contains(".with_icon_as_template(true)"),
+        "the macOS tray icon must use template rendering so the system supplies monochrome colors"
+    );
+}
+
 fn icns_without_chunk(bytes: &[u8], removed_kind: &[u8; 4]) -> Vec<u8> {
     let mut rebuilt = bytes[..8].to_vec();
     let mut offset = 8;
