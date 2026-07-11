@@ -126,7 +126,20 @@ pub fn windows_image_path_uses_protected_binary(
             .to_ascii_lowercase()
     }
 
-    normalized(image_path) == normalized(&windows_service_binary_path_in(program_files, mode))
+    let protected = windows_service_binary_path_in(program_files, mode);
+    if normalized(image_path) == normalized(&protected) {
+        return true;
+    }
+
+    let image_path = image_path.to_string_lossy();
+    let Some(command) = image_path.strip_prefix('"') else {
+        return false;
+    };
+    let Some((executable, arguments)) = command.split_once('"') else {
+        return false;
+    };
+    let expected_arguments = format!(" {}", windows_service_program_args(mode).join(" "));
+    normalized(Path::new(executable)) == normalized(&protected) && arguments == expected_arguments
 }
 
 /// Protected DACL for the Windows service directory: full control for only
