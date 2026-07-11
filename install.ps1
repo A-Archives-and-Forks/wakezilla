@@ -314,7 +314,7 @@ function Test-WakezillaServiceUsesProtectedBinary {
         Test-SamePath $Matches[1] $protectedBinary
     }
     catch {
-        Write-Warn "failed to inspect Windows service '$serviceName' before updating $ExeName: $($_.Exception.Message)"
+        Write-Warn "failed to inspect Windows service '$serviceName' before updating ${ExeName}: $($_.Exception.Message)"
         $false
     }
 }
