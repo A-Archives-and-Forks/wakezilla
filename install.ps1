@@ -644,6 +644,7 @@ function Invoke-WakezillaInstall {
         Remove-Item -Recurse -Force $tmpDir
     }
     New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    $servicesToRestart = @()
     try {
         $assetName = [System.IO.Path]::GetFileName(([System.Uri]$assetUrl).LocalPath)
         $archive = Join-Path $tmpDir $assetName
@@ -658,6 +659,7 @@ function Invoke-WakezillaInstall {
 
         $extractDir = Join-Path $tmpDir "extract"
         $binary = Expand-WakezillaArchive -Archive $archive -OutDir $extractDir
+        $servicesToRestart = @(Stop-WakezillaServicesForInstall)
         $integration = Install-WakezillaDesktopIntegration -ExtractDir $extractDir -BinDir $binDir -InstallVersion $releaseVersion
         $installed = $integration.Cli
 
@@ -689,6 +691,9 @@ function Invoke-WakezillaInstall {
         }
     }
     finally {
+        if ($servicesToRestart.Count -gt 0) {
+            Restart-WakezillaServicesAfterInstall -ServiceNames $servicesToRestart
+        }
         if (Test-Path $tmpDir) {
             Remove-Item -Recurse -Force $tmpDir
         }

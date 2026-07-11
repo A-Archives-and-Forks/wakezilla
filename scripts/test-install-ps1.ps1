@@ -86,6 +86,12 @@ function Test-GuiInstallationContracts {
     Assert-Contains $content 'Arguments = ""' "shortcut no-arguments contract"
 }
 
+function Test-InstallerServiceUpgradeContract {
+    $content = Get-Content -Raw -Path $Script
+    Assert-Contains $content '$servicesToRestart = @(Stop-WakezillaServicesForInstall)' "stop services before upgrade"
+    Assert-Contains $content 'Restart-WakezillaServicesAfterInstall -ServiceNames $servicesToRestart' "restart services after upgrade"
+}
+
 function Test-ChecksumHelpers {
     $tempDir = New-Item -ItemType Directory -Force -Path (Join-Path ([System.IO.Path]::GetTempPath()) "wakezilla-ps1-checksum-$PID")
     try {
@@ -310,6 +316,7 @@ function Test-ProcessStopHelper {
 Test-TargetDetection
 Test-ReleaseHelpers
 Test-GuiInstallationContracts
+Test-InstallerServiceUpgradeContract
 Test-ChecksumHelpers
 Test-ArchiveAndInstall
 Test-ExistingFileReplacement
