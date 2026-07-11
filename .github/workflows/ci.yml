@@ -212,6 +212,37 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-install-ps1.ps1
 
+      - name: Run Windows PowerShell 5.1 installer tests
+        shell: powershell
+        run: |
+          $logDir = Join-Path $env:RUNNER_TEMP "wakezilla-installer-logs"
+          $logPath = Join-Path $logDir "windows-powershell-5.1.log"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+          "PowerShell version: $($PSVersionTable.PSVersion)" | Tee-Object -FilePath $logPath
+          "PowerShell edition: $($PSVersionTable.PSEdition)" | Tee-Object -FilePath $logPath -Append
+          try {
+            & .\scripts\test-install-ps1.ps1 *>&1 |
+              Tee-Object -FilePath $logPath -Append
+          }
+          catch {
+            $_ | Format-List * -Force | Out-String |
+              Tee-Object -FilePath $logPath -Append
+            if ($_.Exception) {
+              $_.Exception | Format-List * -Force | Out-String |
+                Tee-Object -FilePath $logPath -Append
+            }
+            throw
+          }
+
+      - name: Upload PowerShell installer logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-powershell-installer-logs
+          path: ${{ runner.temp }}\wakezilla-installer-logs
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Check Windows backend
         run: cargo check -p wakezilla --all-targets --locked --features desktop-tray
 
