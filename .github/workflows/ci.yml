@@ -270,6 +270,49 @@ jobs:
       - name: Run Windows backend tests
         run: cargo test -p wakezilla -p wakezilla-common --locked
 
+  windows-powershell-2022:
+    name: Windows PowerShell 5.1 (2022)
+    runs-on: windows-2022
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Windows PowerShell 5.1 installer tests
+        shell: powershell
+        run: |
+          $logDir = Join-Path $env:RUNNER_TEMP "wakezilla-installer-logs"
+          $logPath = Join-Path $logDir "windows-server-2022-powershell-5.1.log"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+          "PowerShell version: $($PSVersionTable.PSVersion)" | Tee-Object -FilePath $logPath
+          "PowerShell edition: $($PSVersionTable.PSEdition)" | Tee-Object -FilePath $logPath -Append
+          try {
+            & .\scripts\test-install-ps1.ps1 *>&1 |
+              Tee-Object -FilePath $logPath -Append
+          }
+          catch {
+            $_ | Format-List * -Force | Out-String |
+              Tee-Object -FilePath $logPath -Append
+            if ($_.Exception) {
+              $_.Exception | Format-List * -Force | Out-String |
+                Tee-Object -FilePath $logPath -Append
+            }
+            throw
+          }
+
+      - name: Upload Windows PowerShell 5.1 logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-server-2022-powershell-installer-logs
+          path: ${{ runner.temp }}\wakezilla-installer-logs
+          if-no-files-found: warn
+          retention-days: 7
+
   frontend:
     name: frontend
     runs-on: ubuntu-latest
