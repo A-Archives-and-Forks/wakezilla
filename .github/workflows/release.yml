@@ -117,7 +117,10 @@ jobs:
               set -eu
               export PATH=/usr/local/cargo/bin:$PATH
               apk add --no-cache build-base pkgconf gtk+3.0-dev libayatana-appindicator-dev
-              CARGO_TARGET_DIR=target/musl-tray cargo build --release --target "$TARGET" --bin wakezilla-tray --features desktop-tray
+              # The helper needs GTK/AppIndicator shared objects, unlike the
+              # server-only musl binary which remains statically linked.
+              RUSTFLAGS="-C target-feature=-crt-static" \
+                CARGO_TARGET_DIR=target/musl-tray cargo build --release --target "$TARGET" --bin wakezilla-tray --features desktop-tray
               cp "target/musl-tray/$TARGET/release/wakezilla-tray" "target/$TARGET/release/wakezilla-tray"
             '
 
