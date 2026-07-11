@@ -231,6 +231,17 @@ function Get-CimInstance {
         [object[]]$Remaining
     )
 
+    if ($ClassName -eq "Win32_Service" -and $Filter -match "^Name = '(.+)'$") {
+        $name = $Matches[1]
+        if ($script:MockServiceImages -and $script:MockServiceImages.ContainsKey($name)) {
+            return [pscustomobject]@{
+                Name = $name
+                PathName = $script:MockServiceImages[$name]
+            }
+        }
+        return @()
+    }
+
     if ($ClassName -ne "Win32_Process" -or -not $script:MockProcesses) {
         return @()
     }
