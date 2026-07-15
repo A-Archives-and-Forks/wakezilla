@@ -17,6 +17,10 @@ terminal UI, or desktop tray.
 [Quick start](https://wakezilla.dev/docs/getting-started/quick-start/) ·
 [Releases](https://github.com/guibeira/wakezilla/releases)
 
+## See it in action
+
+![Wakezilla lifecycle: request, wake, proxy, response, and idle shutdown](docs/assets/wakezilla-lifecycle.gif)
+
 ## Features
 
 - Wake machines remotely with Wake-on-LAN.
