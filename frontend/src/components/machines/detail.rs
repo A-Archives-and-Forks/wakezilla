@@ -100,6 +100,13 @@ fn shutdown_setup_message(status: ShutdownSetupStatus) -> &'static str {
     }
 }
 
+fn shutdown_control_is_visible(status: Option<ShutdownSetupStatus>) -> bool {
+    matches!(
+        status,
+        Some(ShutdownSetupStatus::Legacy | ShutdownSetupStatus::Verified)
+    )
+}
+
 async fn monitor_shutdown_setup(
     mac: String,
     set_shutdown_setup: WriteSignal<Option<ShutdownSetup>>,
@@ -922,20 +929,29 @@ pub fn MachineDetailPage() -> impl IntoView {
                     >
                         {move || if wake_loading.get() { "Waking..." } else { "Wake machine" }}
                     </button>
-                    <button
-                        type="button"
-                        class="btn btn-danger"
-                        on:click=trigger_turn_off
-                        disabled=move || turn_off_loading.get() || !can_turn_off_machine.get()
+                    <Show
+                        when=move || {
+                            shutdown_control_is_visible(
+                                shutdown_setup.get().map(|setup| setup.status),
+                            )
+                        }
+                        fallback=|| view! { <></> }
                     >
-                        {move || {
-                            if turn_off_loading.get() {
-                                "Turning off..."
-                            } else {
-                                "Turn off machine"
-                            }
-                        }}
-                    </button>
+                        <button
+                            type="button"
+                            class="btn btn-danger"
+                            on:click=trigger_turn_off
+                            disabled=move || turn_off_loading.get() || !can_turn_off_machine.get()
+                        >
+                            {move || {
+                                if turn_off_loading.get() {
+                                    "Turning off..."
+                                } else {
+                                    "Turn off machine"
+                                }
+                            }}
+                        </button>
+                    </Show>
                 </div>
                 {move || {
                     if let Some((success, message)) = wake_feedback.get() {
@@ -967,7 +983,14 @@ pub fn MachineDetailPage() -> impl IntoView {
                         view! { <p class=class>{empty}</p> }
                     }
                 }}
-                <Show when=move || !can_turn_off_machine.get() fallback=|| view! { <></> }>
+                <Show
+                    when=move || {
+                        shutdown_control_is_visible(
+                            shutdown_setup.get().map(|setup| setup.status),
+                        ) && !can_turn_off_machine.get()
+                    }
+                    fallback=|| view! { <></> }
+                >
                     <p class="field-help">
                         "Configure a remote shutdown port on the machine to activate this action."
                     </p>
@@ -1070,5 +1093,25 @@ mod tests {
             shutdown_setup_message(ShutdownSetupStatus::KeyMismatch),
             "The client responded, but its key does not match. Run the setup command again."
         );
+    }
+
+    #[test]
+    fn shutdown_control_is_visible_only_for_configured_clients() {
+        assert!(shutdown_control_is_visible(Some(
+            ShutdownSetupStatus::Legacy
+        )));
+        assert!(shutdown_control_is_visible(Some(
+            ShutdownSetupStatus::Verified
+        )));
+
+        for status in [
+            None,
+            Some(ShutdownSetupStatus::Disabled),
+            Some(ShutdownSetupStatus::Pending),
+            Some(ShutdownSetupStatus::Unreachable),
+            Some(ShutdownSetupStatus::KeyMismatch),
+        ] {
+            assert!(!shutdown_control_is_visible(status));
+        }
     }
 }
