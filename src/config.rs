@@ -186,9 +186,7 @@ pub(crate) fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), anyh
 
     #[cfg(target_os = "windows")]
     {
-        std::fs::write(path, contents)?;
-        apply_windows_secret_file_security(path)?;
-        Ok(())
+        write_file_after_security(path, contents, apply_windows_secret_file_security)
     }
 
     #[cfg(not(any(unix, target_os = "windows")))]
@@ -196,6 +194,23 @@ pub(crate) fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), anyh
         std::fs::write(path, contents)?;
         Ok(())
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn write_file_after_security(
+    path: &Path,
+    contents: &[u8],
+    secure: impl FnOnce(&Path) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    secure(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -280,6 +295,23 @@ mod secret_file_tests {
             super::windows_secret_file_sddl(),
             "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
         );
+    }
+
+    #[test]
+    fn security_is_applied_before_secret_contents_are_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("secret");
+        let mut security_applied = false;
+
+        super::write_file_after_security(&path, b"secret", |secured_path| {
+            security_applied = true;
+            assert_eq!(std::fs::read(secured_path).expect("empty file"), b"");
+            Ok(())
+        })
+        .expect("secret write should succeed");
+
+        assert!(security_applied);
+        assert_eq!(std::fs::read(path).expect("secret file"), b"secret");
     }
 }
 

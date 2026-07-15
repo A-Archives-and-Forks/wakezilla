@@ -346,9 +346,11 @@ async fn verify_shutdown_setup(
             if machines[index].shutdown_auth_key.as_deref() != Some(key.as_str()) {
                 return Ok(Json(shutdown_setup_for_machine(&machines[index])));
             }
+            let previous_verified = machines[index].shutdown_auth_verified;
             machines[index].shutdown_auth_verified = true;
             let setup = shutdown_setup_for_machine(&machines[index]);
             if let Err(error) = web::save_machines_with_config(&machines, &state.config) {
+                machines[index].shutdown_auth_verified = previous_verified;
                 error!("failed to persist verified shutdown setup: {error}");
                 return Err(shutdown_setup_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -375,20 +377,25 @@ async fn rotate_shutdown_key(
     Path(mac): Path<String>,
 ) -> Result<Json<wakezilla_common::ShutdownSetup>, ShutdownSetupError> {
     let mut machines = state.machines.write().await;
-    let machine = machines
-        .iter_mut()
-        .find(|machine| machine.mac == mac)
+    let index = machines
+        .iter()
+        .position(|machine| machine.mac == mac)
         .ok_or_else(|| shutdown_setup_error(StatusCode::NOT_FOUND, "Machine not found"))?;
+    let machine = &mut machines[index];
     if !machine.can_be_turned_off || machine.turn_off_port.is_none() {
         return Err(shutdown_setup_error(
             StatusCode::BAD_REQUEST,
             "Remote shutdown is disabled",
         ));
     }
+    let previous_key = machine.shutdown_auth_key.clone();
+    let previous_verified = machine.shutdown_auth_verified;
     machine.shutdown_auth_key = Some(crate::shutdown_auth::generate_key());
     machine.shutdown_auth_verified = false;
     let setup = shutdown_setup_for_machine(machine);
     if let Err(error) = web::save_machines_with_config(&machines, &state.config) {
+        machines[index].shutdown_auth_key = previous_key;
+        machines[index].shutdown_auth_verified = previous_verified;
         error!("failed to persist rotated shutdown key: {error}");
         return Err(shutdown_setup_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1101,6 +1108,61 @@ mod tests {
         let machines = state.machines.read().await;
         assert_ne!(machines[0].shutdown_auth_key, original_key);
         assert!(!machines[0].shutdown_auth_verified);
+    }
+
+    #[tokio::test]
+    async fn rotate_shutdown_key_rolls_back_when_persistence_fails() {
+        let mut machine = sample_machine();
+        machine.can_be_turned_off = true;
+        machine.shutdown_auth_key = Some(crate::shutdown_auth::generate_key());
+        machine.shutdown_auth_verified = true;
+        let original_key = machine.shutdown_auth_key.clone();
+        let mut state = state_with_machines(vec![machine]);
+        let directory = tempdir().unwrap();
+        Arc::make_mut(&mut state.config).storage.machines_db_path =
+            directory.path().to_string_lossy().into_owned();
+
+        let result =
+            rotate_shutdown_key(State(state.clone()), Path("AA:BB:CC:DD:EE:FF".to_string())).await;
+
+        assert!(result.is_err());
+        let machines = state.machines.read().await;
+        assert_eq!(machines[0].shutdown_auth_key, original_key);
+        assert!(machines[0].shutdown_auth_verified);
+    }
+
+    #[tokio::test]
+    async fn verify_shutdown_setup_rolls_back_when_persistence_fails() {
+        let key = crate::shutdown_auth::generate_key();
+        let key_for_server = key.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                crate::client_server::build_router(Some(key_for_server)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut machine = sample_machine();
+        machine.ip = addr.ip().to_string().parse().unwrap();
+        machine.turn_off_port = Some(addr.port());
+        machine.can_be_turned_off = true;
+        machine.shutdown_auth_key = Some(key);
+        let mut state = state_with_machines(vec![machine]);
+        let directory = tempdir().unwrap();
+        Arc::make_mut(&mut state.config).storage.machines_db_path =
+            directory.path().to_string_lossy().into_owned();
+
+        let result =
+            verify_shutdown_setup(State(state.clone()), Path("AA:BB:CC:DD:EE:FF".to_string()))
+                .await;
+
+        assert!(result.is_err());
+        assert!(!state.machines.read().await[0].shutdown_auth_verified);
+        server.abort();
     }
 
     #[tokio::test]

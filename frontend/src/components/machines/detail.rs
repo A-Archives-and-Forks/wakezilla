@@ -187,11 +187,14 @@ async fn monitor_shutdown_setup(
     mac: String,
     set_shutdown_setup: WriteSignal<Option<ShutdownSetup>>,
 ) {
+    const INITIAL_POLL_DELAY_MS: u32 = 3_000;
+
     let mut setup = match get_shutdown_setup(&mac).await {
         Ok(setup) => setup,
         Err(_) => return,
     };
     set_shutdown_setup.set(Some(setup.clone()));
+    let mut poll_delay_ms = INITIAL_POLL_DELAY_MS;
 
     while matches!(
         setup.status,
@@ -199,18 +202,35 @@ async fn monitor_shutdown_setup(
             | ShutdownSetupStatus::Unreachable
             | ShutdownSetupStatus::KeyMismatch
     ) {
-        gloo_timers::future::TimeoutFuture::new(3_000).await;
+        gloo_timers::future::TimeoutFuture::new(poll_delay_ms).await;
         match verify_shutdown_setup(&mac).await {
             Ok(next) => {
                 setup = next;
                 set_shutdown_setup.set(Some(setup.clone()));
+                poll_delay_ms = next_shutdown_poll_delay(poll_delay_ms, true);
             }
             Err(_) => {
                 setup.status = ShutdownSetupStatus::Unreachable;
                 set_shutdown_setup.set(Some(setup.clone()));
+                poll_delay_ms = next_shutdown_poll_delay(poll_delay_ms, false);
             }
         }
     }
+}
+
+fn next_shutdown_poll_delay(current_ms: u32, request_succeeded: bool) -> u32 {
+    const INITIAL_POLL_DELAY_MS: u32 = 3_000;
+    const MAX_POLL_DELAY_MS: u32 = 30_000;
+
+    if request_succeeded {
+        INITIAL_POLL_DELAY_MS
+    } else {
+        current_ms.saturating_mul(2).min(MAX_POLL_DELAY_MS)
+    }
+}
+
+fn rotation_failure_message(message: &str) -> String {
+    format!("Failed to rotate shutdown key: {message}")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -289,6 +309,7 @@ pub fn MachineDetailPage() -> impl IntoView {
     let (machine_details, set_machine_details) = signal::<Machine>(Machine::default());
     let (shutdown_setup, set_shutdown_setup) = signal::<Option<ShutdownSetup>>(None);
     let (setup_loading, set_setup_loading) = signal(false);
+    let (shutdown_setup_refresh, set_shutdown_setup_refresh) = signal(0u32);
 
     // Load initial machine details
     Effect::new(move || {
@@ -301,7 +322,11 @@ pub fn MachineDetailPage() -> impl IntoView {
 
     Effect::new(move || {
         let mac = mac();
-        leptos::task::spawn_local(monitor_shutdown_setup(mac, set_shutdown_setup));
+        shutdown_setup_refresh.get();
+        leptos::task::spawn_local_scoped_with_cancellation(monitor_shutdown_setup(
+            mac,
+            set_shutdown_setup,
+        ));
     });
 
     let (access_history, set_access_history) = signal::<Option<AccessHistory>>(None);
@@ -412,10 +437,7 @@ pub fn MachineDetailPage() -> impl IntoView {
                     if let Ok(updated_details) = get_details_machine(&updated_mac).await {
                         set_machine_details.set(updated_details);
                     }
-                    leptos::task::spawn_local(monitor_shutdown_setup(
-                        updated_mac.clone(),
-                        set_shutdown_setup,
-                    ));
+                    set_shutdown_setup_refresh.update(|refresh| *refresh += 1);
                     window()
                         .unwrap()
                         .alert_with_message("Machine updated successfully!")
@@ -522,9 +544,16 @@ pub fn MachineDetailPage() -> impl IntoView {
         let mac = mac();
         set_setup_loading.set(true);
         leptos::task::spawn_local(async move {
-            if let Ok(setup) = rotate_shutdown_key(&mac).await {
-                set_shutdown_setup.set(Some(setup));
-                leptos::task::spawn_local(monitor_shutdown_setup(mac, set_shutdown_setup));
+            match rotate_shutdown_key(&mac).await {
+                Ok(setup) => {
+                    set_shutdown_setup.set(Some(setup));
+                    set_shutdown_setup_refresh.update(|refresh| *refresh += 1);
+                }
+                Err(message) => {
+                    if let Some(window) = window() {
+                        let _ = window.alert_with_message(&rotation_failure_message(&message));
+                    }
+                }
             }
             set_setup_loading.set(false);
         });
@@ -1216,5 +1245,21 @@ mod tests {
     #[test]
     fn raw_machine_data_visibility_matches_the_build_profile() {
         assert_eq!(raw_machine_data_is_visible(), cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn shutdown_poll_backoff_resets_after_success_and_is_capped() {
+        assert_eq!(next_shutdown_poll_delay(3_000, false), 6_000);
+        assert_eq!(next_shutdown_poll_delay(24_000, false), 30_000);
+        assert_eq!(next_shutdown_poll_delay(30_000, false), 30_000);
+        assert_eq!(next_shutdown_poll_delay(30_000, true), 3_000);
+    }
+
+    #[test]
+    fn rotation_failure_message_includes_the_backend_error() {
+        assert_eq!(
+            rotation_failure_message("disk full"),
+            "Failed to rotate shutdown key: disk full"
+        );
     }
 }
