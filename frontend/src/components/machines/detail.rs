@@ -53,6 +53,32 @@ extern "C" {
     fn copy_to_clipboard(value: &str);
 }
 
+const UNIX_INSTALL_COMMAND: &str = "curl -fsSL https://wakezilla.dev/install.sh | sh";
+const WINDOWS_INSTALL_COMMAND: &str = "irm https://wakezilla.dev/install.ps1 | iex";
+
+#[component]
+fn SetupCommandStep(label: &'static str, command: String) -> impl IntoView {
+    let command_to_copy = command.clone();
+    let copy_label = format!("Copy {label}");
+
+    view! {
+        <div class="setup-command">
+            <div class="field-header">
+                <strong>{label}</strong>
+                <button
+                    type="button"
+                    class="btn btn-soft btn-sm"
+                    aria-label=copy_label
+                    on:click=move |_| copy_to_clipboard(&command_to_copy)
+                >
+                    "Copy command"
+                </button>
+            </div>
+            <pre class="code-block">{command}</pre>
+        </div>
+    }
+}
+
 fn shutdown_setup_message(status: ShutdownSetupStatus) -> &'static str {
     match status {
         ShutdownSetupStatus::Disabled => "Remote shutdown is disabled.",
@@ -428,6 +454,138 @@ pub fn MachineDetailPage() -> impl IntoView {
                 <span>"Back to dashboard"</span>
             </a>
 
+            <Show
+                when=move || {
+                    shutdown_setup
+                        .get()
+                        .map(|setup| setup.status != ShutdownSetupStatus::Disabled)
+                        .unwrap_or(false)
+                }
+                fallback=|| view! { <></> }
+            >
+                <div class="card">
+                    <header class="card-header">
+                        <h3 class="card-title">
+                            {move || {
+                                let needs_setup = shutdown_setup
+                                    .get()
+                                    .map(|setup| {
+                                        setup.unix_command.is_some()
+                                            || setup.windows_command.is_some()
+                                    })
+                                    .unwrap_or(false);
+                                if needs_setup {
+                                    "Finish setting up your client server"
+                                } else {
+                                    "Secure remote shutdown"
+                                }
+                            }}
+                        </h3>
+                        <p class="card-subtitle">
+                            {move || {
+                                shutdown_setup
+                                    .get()
+                                    .map(|setup| shutdown_setup_message(setup.status))
+                                    .unwrap_or_default()
+                            }}
+                        </p>
+                    </header>
+
+                    <Show
+                        when=move || {
+                            shutdown_setup
+                                .get()
+                                .map(|setup| {
+                                    setup.unix_command.is_some()
+                                        || setup.windows_command.is_some()
+                                })
+                                .unwrap_or(false)
+                        }
+                        fallback=|| view! { <></> }
+                    >
+                        <div class="setup-platform">
+                            <h4 class="setup-platform__title">"Linux / macOS"</h4>
+                            <SetupCommandStep
+                                label="1. Install Wakezilla"
+                                command=UNIX_INSTALL_COMMAND.to_string()
+                            />
+                            {move || {
+                                shutdown_setup
+                                    .get()
+                                    .and_then(|setup| setup.unix_command)
+                                    .map(|command| {
+                                        view! {
+                                            <SetupCommandStep
+                                                label="2. Configure the client server"
+                                                command=command
+                                            />
+                                        }
+                                    })
+                            }}
+                        </div>
+
+                        <div class="setup-platform">
+                            <h4 class="setup-platform__title">
+                                "Windows (Administrator terminal)"
+                            </h4>
+                            <SetupCommandStep
+                                label="1. Install Wakezilla"
+                                command=WINDOWS_INSTALL_COMMAND.to_string()
+                            />
+                            {move || {
+                                shutdown_setup
+                                    .get()
+                                    .and_then(|setup| setup.windows_command)
+                                    .map(|command| {
+                                        view! {
+                                            <SetupCommandStep
+                                                label="2. Configure the client server"
+                                                command=command
+                                            />
+                                        }
+                                    })
+                            }}
+                        </div>
+                    </Show>
+
+                    <Show
+                        when=move || {
+                            shutdown_setup
+                                .get()
+                                .map(|setup| {
+                                    matches!(
+                                        setup.status,
+                                        ShutdownSetupStatus::Legacy | ShutdownSetupStatus::Verified
+                                    )
+                                })
+                                .unwrap_or(false)
+                        }
+                        fallback=|| view! { <></> }
+                    >
+                        <div class="actions-row">
+                            <button
+                                type="button"
+                                class="btn btn-soft"
+                                disabled=move || setup_loading.get()
+                                on:click=rotate_setup
+                            >
+                                {move || {
+                                    if setup_loading.get() {
+                                        "Generating..."
+                                    } else if shutdown_setup.get().map(|setup| setup.status)
+                                        == Some(ShutdownSetupStatus::Legacy)
+                                    {
+                                        "Secure now"
+                                    } else {
+                                        "Reconfigure security"
+                                    }
+                                }}
+                            </button>
+                        </div>
+                    </Show>
+                </div>
+            </Show>
+
             <div class="card">
                 <header class="card-header">
                     <h2 class="card-title">
@@ -749,107 +907,6 @@ pub fn MachineDetailPage() -> impl IntoView {
                     </div>
                 </form>
             </div>
-
-            <Show
-                when=move || {
-                    shutdown_setup
-                        .get()
-                        .map(|setup| setup.status != ShutdownSetupStatus::Disabled)
-                        .unwrap_or(false)
-                }
-                fallback=|| view! { <></> }
-            >
-                <div class="card">
-                    <header class="card-header">
-                        <h3 class="card-title">"Secure remote shutdown"</h3>
-                        <p class="card-subtitle">
-                            {move || {
-                                shutdown_setup
-                                    .get()
-                                    .map(|setup| shutdown_setup_message(setup.status))
-                                    .unwrap_or_default()
-                            }}
-                        </p>
-                    </header>
-
-                    {move || {
-                        shutdown_setup.get().and_then(|setup| setup.unix_command).map(|command| {
-                            let command_to_copy = command.clone();
-                            view! {
-                                <div class="setup-command">
-                                    <div class="field-header">
-                                        <strong>"Linux / macOS"</strong>
-                                        <button
-                                            type="button"
-                                            class="btn btn-soft btn-sm"
-                                            on:click=move |_| copy_to_clipboard(&command_to_copy)
-                                        >
-                                            "Copy command"
-                                        </button>
-                                    </div>
-                                    <pre class="code-block">{command}</pre>
-                                </div>
-                            }
-                        })
-                    }}
-                    {move || {
-                        shutdown_setup.get().and_then(|setup| setup.windows_command).map(|command| {
-                            let command_to_copy = command.clone();
-                            view! {
-                                <div class="setup-command">
-                                    <div class="field-header">
-                                        <strong>"Windows (Administrator terminal)"</strong>
-                                        <button
-                                            type="button"
-                                            class="btn btn-soft btn-sm"
-                                            on:click=move |_| copy_to_clipboard(&command_to_copy)
-                                        >
-                                            "Copy command"
-                                        </button>
-                                    </div>
-                                    <pre class="code-block">{command}</pre>
-                                </div>
-                            }
-                        })
-                    }}
-
-                    <Show
-                        when=move || {
-                            shutdown_setup
-                                .get()
-                                .map(|setup| {
-                                    matches!(
-                                        setup.status,
-                                        ShutdownSetupStatus::Legacy | ShutdownSetupStatus::Verified
-                                    )
-                                })
-                                .unwrap_or(false)
-                        }
-                        fallback=|| view! { <></> }
-                    >
-                        <div class="actions-row">
-                            <button
-                                type="button"
-                                class="btn btn-soft"
-                                disabled=move || setup_loading.get()
-                                on:click=rotate_setup
-                            >
-                                {move || {
-                                    if setup_loading.get() {
-                                        "Generating..."
-                                    } else if shutdown_setup.get().map(|setup| setup.status)
-                                        == Some(ShutdownSetupStatus::Legacy)
-                                    {
-                                        "Secure now"
-                                    } else {
-                                        "Reconfigure security"
-                                    }
-                                }}
-                            </button>
-                        </div>
-                    </Show>
-                </div>
-            </Show>
 
             <div class="card card-actions">
                 <header class="card-header">
