@@ -48,19 +48,9 @@ service setup, and the first machine configuration:
 2. Follow the [quick start](https://wakezilla.dev/docs/getting-started/quick-start/).
 3. Open the [web dashboard guide](https://wakezilla.dev/docs/guides/web-dashboard/).
 
-## Documentation
+## Docs
 
-| Topic | Guide |
-| --- | --- |
-| Machines, port forwarding, and inactivity | [Configuration guides](https://wakezilla.dev/docs/configuration/machines/) |
-| System services and startup | [System services](https://wakezilla.dev/docs/guides/system-services/) |
-| Terminal and desktop interfaces | [Terminal UI](https://wakezilla.dev/docs/guides/terminal-ui/) · [Desktop tray](https://wakezilla.dev/docs/guides/desktop-tray/) |
-| CLI, configuration, and HTTP API | [CLI reference](https://wakezilla.dev/docs/reference/cli/) · [Configuration reference](https://wakezilla.dev/docs/reference/configuration/) · [HTTP API](https://wakezilla.dev/docs/reference/http-api/) |
-| Security and storage | [Security](https://wakezilla.dev/docs/reference/security/) · [Storage](https://wakezilla.dev/docs/reference/storage/) |
-| Updates, logs, and troubleshooting | [Updates and uninstall](https://wakezilla.dev/docs/help/updates-uninstall/) · [Logs](https://wakezilla.dev/docs/help/logs/) · [Troubleshooting](https://wakezilla.dev/docs/help/troubleshooting/) |
-
-Browse the [complete documentation](https://wakezilla.dev/docs/) for all guides
-and platform-specific behavior.
+[Read the Wakezilla documentation](https://wakezilla.dev/docs/).
 
 ## Development
 
