@@ -7,7 +7,7 @@ use crate::config::{self, Config};
 use crate::service::{self, Mode};
 
 /// CLI arguments for the `setup` subcommand.
-#[derive(Parser, Debug, Default)]
+#[derive(Parser, Default)]
 #[command()]
 pub struct SetupArgs {
     /// Pre-select the mode ("proxy" or "client"); skips the TUI prompt if combined with --port.
@@ -18,9 +18,25 @@ pub struct SetupArgs {
     #[arg(long, help_heading = "Setup Options")]
     pub port: Option<u16>,
 
+    /// HMAC key used to authenticate shutdown requests (client mode only).
+    #[arg(long, value_name = "KEY", help_heading = "Setup Options")]
+    pub key: Option<String>,
+
     /// Skip the overwrite confirmation prompt (for non-interactive use).
     #[arg(long, short = 'y', help_heading = "Setup Options")]
     pub yes: bool,
+}
+
+impl std::fmt::Debug for SetupArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SetupArgs")
+            .field("mode", &self.mode)
+            .field("port", &self.port)
+            .field("key", &self.key.as_ref().map(|_| "[REDACTED]"))
+            .field("yes", &self.yes)
+            .finish()
+    }
 }
 
 /// Action for the `service` subcommand.
@@ -77,7 +93,11 @@ pub fn build_config(mode: Mode, port: u16) -> Config {
 ///
 /// If a config file already exists, its other settings (e.g. the other server's
 /// port) are preserved; only the target mode's port is updated.
-pub fn apply(mode: Mode, port: u16) -> Result<std::path::PathBuf> {
+pub fn apply_with_key(
+    mode: Mode,
+    port: u16,
+    client_key: Option<&str>,
+) -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe().context("failed to resolve current executable path")?;
 
     let path = config::config_path();
@@ -88,7 +108,13 @@ pub fn apply(mode: Mode, port: u16) -> Result<std::path::PathBuf> {
     };
     match mode {
         Mode::Proxy => cfg.server.proxy_port = port,
-        Mode::Client => cfg.server.client_port = port,
+        Mode::Client => {
+            cfg.server.client_port = port;
+            if let Some(key) = client_key {
+                crate::shutdown_auth::validate_key(key).context("invalid client shutdown key")?;
+                cfg.security.client_shutdown_key = Some(key.to_string());
+            }
+        }
     }
     if cfg.storage.machines_db_path == config::DEFAULT_MACHINES_DB_PATH {
         cfg.storage.machines_db_path = config::data_path(config::DEFAULT_MACHINES_DB_PATH)
@@ -190,6 +216,7 @@ pub fn run(args: SetupArgs) -> Result<()> {
     }
 
     let skip_confirm = args.yes;
+    let client_key = args.key.clone();
 
     // Headless path: both flags provided.
     if let (Some(mode_str), Some(port)) = (&args.mode, args.port) {
@@ -199,7 +226,10 @@ pub fn run(args: SetupArgs) -> Result<()> {
             println!("Aborted; no changes made.");
             return Ok(());
         }
-        let path = apply(mode, port)?;
+        if args.key.is_some() && mode != Mode::Client {
+            anyhow::bail!("--key is only valid with --mode client");
+        }
+        let path = apply_with_key(mode, port, args.key.as_deref())?;
         println!(
             "Configured {} on port {port}. Config written to {}.",
             mode.subcommand(),
@@ -213,7 +243,10 @@ pub fn run(args: SetupArgs) -> Result<()> {
         println!("Aborted; no changes made.");
         return Ok(());
     }
-    let path = apply(mode, port)?;
+    if client_key.is_some() && mode != Mode::Client {
+        anyhow::bail!("--key is only valid with --mode client");
+    }
+    let path = apply_with_key(mode, port, client_key.as_deref())?;
     println!(
         "Configured {} on port {port}. Config written to {}.",
         mode.subcommand(),

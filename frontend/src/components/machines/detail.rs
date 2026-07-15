@@ -8,8 +8,13 @@ use leptos_router::hooks::use_params_map;
 
 use web_sys::SubmitEvent;
 
-use crate::api::{get_details_machine, turn_off_machine, wake_machine};
-use crate::models::{Machine, PortForward, UpdateMachinePayload};
+use crate::api::{
+    get_details_machine, get_shutdown_setup, rotate_shutdown_key, turn_off_machine,
+    verify_shutdown_setup, wake_machine,
+};
+use crate::models::{
+    Machine, PortForward, ShutdownSetup, ShutdownSetupStatus, UpdateMachinePayload,
+};
 
 use crate::api::get_access_history;
 use crate::models::AccessHistory;
@@ -39,9 +44,64 @@ export function render_usage_chart(canvas_id, labels_json, datasets_json) {
         }
     });
 }
+export function copy_to_clipboard(value) {
+    if (navigator.clipboard) { navigator.clipboard.writeText(value); }
+}
 "#)]
 extern "C" {
     fn render_usage_chart(canvas_id: &str, labels_json: &str, datasets_json: &str);
+    fn copy_to_clipboard(value: &str);
+}
+
+fn shutdown_setup_message(status: ShutdownSetupStatus) -> &'static str {
+    match status {
+        ShutdownSetupStatus::Disabled => "Remote shutdown is disabled.",
+        ShutdownSetupStatus::Legacy => {
+            "Remote shutdown is using legacy unsigned requests. Secure it to restrict access."
+        }
+        ShutdownSetupStatus::Pending => {
+            "Run this command on the client machine. This page will verify it automatically."
+        }
+        ShutdownSetupStatus::Verified => {
+            "The client is paired and shutdown requests are authenticated."
+        }
+        ShutdownSetupStatus::Unreachable => {
+            "Waiting for the client to become reachable. The setup command will remain available."
+        }
+        ShutdownSetupStatus::KeyMismatch => {
+            "The client responded, but its key does not match. Run the setup command again."
+        }
+    }
+}
+
+async fn monitor_shutdown_setup(
+    mac: String,
+    set_shutdown_setup: WriteSignal<Option<ShutdownSetup>>,
+) {
+    let mut setup = match get_shutdown_setup(&mac).await {
+        Ok(setup) => setup,
+        Err(_) => return,
+    };
+    set_shutdown_setup.set(Some(setup.clone()));
+
+    while matches!(
+        setup.status,
+        ShutdownSetupStatus::Pending
+            | ShutdownSetupStatus::Unreachable
+            | ShutdownSetupStatus::KeyMismatch
+    ) {
+        gloo_timers::future::TimeoutFuture::new(3_000).await;
+        match verify_shutdown_setup(&mac).await {
+            Ok(next) => {
+                setup = next;
+                set_shutdown_setup.set(Some(setup.clone()));
+            }
+            Err(_) => {
+                setup.status = ShutdownSetupStatus::Unreachable;
+                set_shutdown_setup.set(Some(setup.clone()));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,6 +178,8 @@ pub fn MachineDetailPage() -> impl IntoView {
     let mac = move || params.read().get("mac").unwrap_or_default();
     let (loading, set_loading) = signal(false);
     let (machine_details, set_machine_details) = signal::<Machine>(Machine::default());
+    let (shutdown_setup, set_shutdown_setup) = signal::<Option<ShutdownSetup>>(None);
+    let (setup_loading, set_setup_loading) = signal(false);
 
     // Load initial machine details
     Effect::new(move || {
@@ -126,6 +188,11 @@ pub fn MachineDetailPage() -> impl IntoView {
                 set_machine_details.set(cats);
             }
         });
+    });
+
+    Effect::new(move || {
+        let mac = mac();
+        leptos::task::spawn_local(monitor_shutdown_setup(mac, set_shutdown_setup));
     });
 
     let (access_history, set_access_history) = signal::<Option<AccessHistory>>(None);
@@ -236,6 +303,10 @@ pub fn MachineDetailPage() -> impl IntoView {
                     if let Ok(updated_details) = get_details_machine(&updated_mac).await {
                         set_machine_details.set(updated_details);
                     }
+                    leptos::task::spawn_local(monitor_shutdown_setup(
+                        updated_mac.clone(),
+                        set_shutdown_setup,
+                    ));
                     window()
                         .unwrap()
                         .alert_with_message("Machine updated successfully!")
@@ -316,6 +387,37 @@ pub fn MachineDetailPage() -> impl IntoView {
                 }
             }
             set_wake_loading.set(false);
+        });
+    };
+
+    let rotate_setup = move |_| {
+        if setup_loading.get() {
+            return;
+        }
+        let status = shutdown_setup.get().map(|setup| setup.status);
+        if status == Some(ShutdownSetupStatus::Verified) {
+            let confirmed = window()
+                .and_then(|window| {
+                    window
+                        .confirm_with_message(
+                            "Generate a new shutdown key? The current client will stop authenticating until the new command is run.",
+                        )
+                        .ok()
+                })
+                .unwrap_or(false);
+            if !confirmed {
+                return;
+            }
+        }
+
+        let mac = mac();
+        set_setup_loading.set(true);
+        leptos::task::spawn_local(async move {
+            if let Ok(setup) = rotate_shutdown_key(&mac).await {
+                set_shutdown_setup.set(Some(setup));
+                leptos::task::spawn_local(monitor_shutdown_setup(mac, set_shutdown_setup));
+            }
+            set_setup_loading.set(false);
         });
     };
 
@@ -648,6 +750,107 @@ pub fn MachineDetailPage() -> impl IntoView {
                 </form>
             </div>
 
+            <Show
+                when=move || {
+                    shutdown_setup
+                        .get()
+                        .map(|setup| setup.status != ShutdownSetupStatus::Disabled)
+                        .unwrap_or(false)
+                }
+                fallback=|| view! { <></> }
+            >
+                <div class="card">
+                    <header class="card-header">
+                        <h3 class="card-title">"Secure remote shutdown"</h3>
+                        <p class="card-subtitle">
+                            {move || {
+                                shutdown_setup
+                                    .get()
+                                    .map(|setup| shutdown_setup_message(setup.status))
+                                    .unwrap_or_default()
+                            }}
+                        </p>
+                    </header>
+
+                    {move || {
+                        shutdown_setup.get().and_then(|setup| setup.unix_command).map(|command| {
+                            let command_to_copy = command.clone();
+                            view! {
+                                <div class="setup-command">
+                                    <div class="field-header">
+                                        <strong>"Linux / macOS"</strong>
+                                        <button
+                                            type="button"
+                                            class="btn btn-soft btn-sm"
+                                            on:click=move |_| copy_to_clipboard(&command_to_copy)
+                                        >
+                                            "Copy command"
+                                        </button>
+                                    </div>
+                                    <pre class="code-block">{command}</pre>
+                                </div>
+                            }
+                        })
+                    }}
+                    {move || {
+                        shutdown_setup.get().and_then(|setup| setup.windows_command).map(|command| {
+                            let command_to_copy = command.clone();
+                            view! {
+                                <div class="setup-command">
+                                    <div class="field-header">
+                                        <strong>"Windows (Administrator terminal)"</strong>
+                                        <button
+                                            type="button"
+                                            class="btn btn-soft btn-sm"
+                                            on:click=move |_| copy_to_clipboard(&command_to_copy)
+                                        >
+                                            "Copy command"
+                                        </button>
+                                    </div>
+                                    <pre class="code-block">{command}</pre>
+                                </div>
+                            }
+                        })
+                    }}
+
+                    <Show
+                        when=move || {
+                            shutdown_setup
+                                .get()
+                                .map(|setup| {
+                                    matches!(
+                                        setup.status,
+                                        ShutdownSetupStatus::Legacy | ShutdownSetupStatus::Verified
+                                    )
+                                })
+                                .unwrap_or(false)
+                        }
+                        fallback=|| view! { <></> }
+                    >
+                        <div class="actions-row">
+                            <button
+                                type="button"
+                                class="btn btn-soft"
+                                disabled=move || setup_loading.get()
+                                on:click=rotate_setup
+                            >
+                                {move || {
+                                    if setup_loading.get() {
+                                        "Generating..."
+                                    } else if shutdown_setup.get().map(|setup| setup.status)
+                                        == Some(ShutdownSetupStatus::Legacy)
+                                    {
+                                        "Secure now"
+                                    } else {
+                                        "Reconfigure security"
+                                    }
+                                }}
+                            </button>
+                        </div>
+                    </Show>
+                </div>
+            </Show>
+
             <div class="card card-actions">
                 <header class="card-header">
                     <h3 class="card-title">"Remote controls"</h3>
@@ -802,5 +1005,13 @@ mod tests {
         assert_eq!(labels, vec!["2024-W01", "2024-W02"]);
         assert_eq!(datasets[0]["label"], serde_json::json!("ssh"));
         assert_eq!(datasets[0]["data"], serde_json::json!([2, 1]));
+    }
+
+    #[test]
+    fn shutdown_setup_message_explains_key_mismatch() {
+        assert_eq!(
+            shutdown_setup_message(ShutdownSetupStatus::KeyMismatch),
+            "The client responded, but its key does not match. Run the setup command again."
+        );
     }
 }

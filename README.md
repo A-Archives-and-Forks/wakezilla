@@ -354,11 +354,16 @@ Key bindings:
 ### Configuring Automatic Shutdown
 1. When adding or editing a machine, enable "Can be turned off remotely"
 2. Set the "Turn Off Port" (typically 3001 for the client server)
-3. Configure the Inactivity Period:
+3. For a new protected client, copy the setup command shown on the machine details page and run it on the target machine. For example:
+   ```bash
+   sudo wakezilla setup --mode client --port 3001 --key <generated-key> --yes
+   ```
+   The dashboard verifies the client automatically and hides the command after the first authenticated health response.
+4. Configure the Inactivity Period:
    - Set the number of minutes of inactivity before automatic shutdown
    - The system monitors when the last request was received for each machine
    - If no requests are received within the inactivity period, the machine will be automatically shut down
-4. The machine will automatically shut down after the configured inactivity period of no activity
+5. The machine will automatically shut down after the configured inactivity period of no activity
 
 ### Port Forwarding
 1. Add a machine to the system
@@ -399,7 +404,11 @@ Each machine can be configured with:
 
 - The server should be run on a trusted network
 - Access to the web interface should be restricted if exposed to the internet
-- The turn-off endpoint on clients should only be accessible from the server
+- Newly configured clients authenticate shutdown requests with a per-machine HMAC key. Signed requests include a timestamp and one-time nonce to prevent captured requests from being replayed.
+- Existing clients without a key remain in legacy compatibility mode and accept unsigned shutdown requests. Use **Secure now** on the machine details page to migrate them.
+- Setup keys are stored in the system configuration and machines database with restricted file permissions. The generated command includes the key, so consider removing it from shell history after setup.
+- The public `/health` endpoint remains available for diagnostics; `/health/secure` verifies that the proxy and client share the same key.
+- This protection covers the proxy-to-client link. Restrict access to the Wakezilla dashboard/API separately.
 
 ## Development
 ### Prerequisites

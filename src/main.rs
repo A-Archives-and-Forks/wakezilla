@@ -15,6 +15,7 @@ mod proxy_server;
 mod scanner;
 mod service;
 mod setup;
+mod shutdown_auth;
 mod system;
 #[cfg(test)]
 mod test_support;
@@ -66,7 +67,12 @@ async fn main() -> Result<()> {
         Commands::ClientServer(_args) => {
             let config = config::Config::load();
             log_config(&config);
-            if let Err(e) = client_server::start(config.server.client_port).await {
+            if let Err(e) = client_server::start(
+                config.server.client_port,
+                config.security.client_shutdown_key.clone(),
+            )
+            .await
+            {
                 error!("Client server error: {}", e);
                 std::process::exit(1);
             }

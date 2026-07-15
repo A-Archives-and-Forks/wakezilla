@@ -1,5 +1,5 @@
 use crate::models::{
-    AccessHistory, DiscoveredDevice, Machine, NetworkInterface, UpdateMachinePayload,
+    AccessHistory, DiscoveredDevice, Machine, NetworkInterface, ShutdownSetup, UpdateMachinePayload,
 };
 use std::sync::LazyLock;
 
@@ -211,4 +211,49 @@ pub async fn is_machine_online(mac: &str) -> bool {
     };
 
     response.status() == 200
+}
+
+pub async fn get_shutdown_setup(mac: &str) -> Result<ShutdownSetup, String> {
+    let mac = encode_path_segment(mac);
+    Request::get(&format!(
+        "{}/machines/{}/shutdown-setup",
+        API_BASE.as_str(),
+        mac
+    ))
+    .send()
+    .await
+    .map_err(|error| error.to_string())?
+    .json()
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub async fn verify_shutdown_setup(mac: &str) -> Result<ShutdownSetup, String> {
+    let mac = encode_path_segment(mac);
+    Request::post(&format!(
+        "{}/machines/{}/shutdown-setup/verify",
+        API_BASE.as_str(),
+        mac
+    ))
+    .send()
+    .await
+    .map_err(|error| error.to_string())?
+    .json()
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub async fn rotate_shutdown_key(mac: &str) -> Result<ShutdownSetup, String> {
+    let mac = encode_path_segment(mac);
+    Request::post(&format!(
+        "{}/machines/{}/shutdown-setup/rotate",
+        API_BASE.as_str(),
+        mac
+    ))
+    .send()
+    .await
+    .map_err(|error| error.to_string())?
+    .json()
+    .await
+    .map_err(|error| error.to_string())
 }

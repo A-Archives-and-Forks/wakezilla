@@ -7,6 +7,7 @@
 //! - Validates configuration at runtime
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Default configuration file path for machines database
@@ -35,6 +36,29 @@ pub struct Config {
     /// Health check configuration
     #[serde(default)]
     pub health: HealthConfig,
+
+    /// Authentication settings for destructive client operations.
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct SecurityConfig {
+    /// Shared HMAC key used by a client server to authenticate its proxy.
+    #[serde(default)]
+    pub client_shutdown_key: Option<String>,
+}
+
+impl std::fmt::Debug for SecurityConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecurityConfig")
+            .field(
+                "client_shutdown_key",
+                &self.client_shutdown_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl Config {
@@ -107,12 +131,8 @@ pub fn config_path() -> PathBuf {
 impl Config {
     /// Serialize this config to a TOML file, creating parent directories.
     pub fn save_to(&self, path: &Path) -> Result<(), anyhow::Error> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let toml_str = toml::to_string_pretty(self)?;
-        std::fs::write(path, toml_str)?;
-        Ok(())
+        write_secret_file(path, toml_str.as_bytes())
     }
 
     /// Load config from a TOML file (optional) merged with `WAKEZILLA__*` env vars.
@@ -139,6 +159,127 @@ impl Config {
             );
             Self::default()
         })
+    }
+}
+
+pub(crate) fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), anyhow::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::fs::write(path, contents)?;
+        apply_windows_secret_file_security(path)?;
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        std::fs::write(path, contents)?;
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_secret_file_sddl() -> &'static str {
+    "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_secret_file_security(path: &Path) -> Result<(), anyhow::Error> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let mut wide_sddl: Vec<u16> = std::ffi::OsStr::new(windows_secret_file_sddl())
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut descriptor = std::ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide_sddl.as_mut_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if converted == 0 || descriptor.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let mut present = 0;
+    let mut dacl = std::ptr::null_mut();
+    let mut defaulted = 0;
+    let dacl_ok = unsafe {
+        GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) != 0
+            && present != 0
+            && !dacl.is_null()
+    };
+    if !dacl_ok {
+        unsafe { LocalFree(descriptor.cast()) };
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let mut wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide_path.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null(),
+        )
+    };
+    unsafe { LocalFree(descriptor.cast()) };
+    if status != ERROR_SUCCESS {
+        anyhow::bail!(
+            "failed to protect secret file {} with error {}",
+            path.display(),
+            status
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod secret_file_tests {
+    #[test]
+    fn windows_secret_acl_allows_owner_system_and_administrators_only() {
+        assert_eq!(
+            super::windows_secret_file_sddl(),
+            "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+        );
     }
 }
 

@@ -1,6 +1,8 @@
 use std::path::Path;
 
+use clap::Parser;
 use wakezilla::service::{self, Mode};
+use wakezilla::setup::SetupArgs;
 
 #[test]
 fn mode_parses_from_str() {
@@ -230,4 +232,16 @@ fn build_config_sets_correct_port_for_mode() {
     let client = wakezilla::setup::build_config(Mode::Client, 6000);
     assert_eq!(client.server.client_port, 6000);
     assert_eq!(client.server.proxy_port, 3000); // untouched default
+}
+
+#[test]
+fn setup_accepts_a_valid_client_key() {
+    let key = wakezilla::shutdown_auth::generate_key();
+    let args = SetupArgs::try_parse_from([
+        "setup", "--mode", "client", "--port", "3001", "--key", &key, "--yes",
+    ])
+    .expect("client key should parse");
+
+    assert_eq!(args.key.as_deref(), Some(key.as_str()));
+    assert!(!format!("{args:?}").contains(&key));
 }

@@ -1,4 +1,5 @@
 use wakezilla_common::{AddMachinePayload, Machine, PortForward, UpdateMachinePayload};
+use wakezilla_common::{ShutdownSetup, ShutdownSetupStatus};
 
 #[test]
 fn machine_deserializes_with_null_port_forward_name() {
@@ -15,6 +16,18 @@ fn machine_deserializes_with_null_port_forward_name() {
 
     let parsed: Machine = serde_json::from_str(json).unwrap();
     assert_eq!(parsed.port_forwards[0].name, None);
+}
+
+#[test]
+fn shutdown_setup_status_uses_stable_snake_case_values() {
+    let setup = ShutdownSetup {
+        status: ShutdownSetupStatus::KeyMismatch,
+        unix_command: None,
+        windows_command: None,
+    };
+
+    let json = serde_json::to_value(setup).unwrap();
+    assert_eq!(json["status"], "key_mismatch");
 }
 
 #[test]

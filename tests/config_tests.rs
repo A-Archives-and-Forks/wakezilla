@@ -40,6 +40,7 @@ fn config_defaults_match_expected_values() {
     assert_eq!(cfg.server.proxy_port, 3000);
     assert_eq!(cfg.server.client_port, 3001);
     assert_eq!(cfg.server.health_timeout_secs, 5);
+    assert_eq!(cfg.security.client_shutdown_key, None);
     assert_eq!(cfg.wol.default_port, 9);
     assert_eq!(cfg.network.scan_duration_secs, 5);
     assert_eq!(cfg.health.check_interval_ms, 30_000);
@@ -87,6 +88,7 @@ fn config_save_load_round_trip_preserves_ports() {
     let mut cfg = Config::default();
     cfg.server.proxy_port = 4567;
     cfg.server.client_port = 7654;
+    cfg.security.client_shutdown_key = Some(wakezilla::shutdown_auth::generate_key());
 
     cfg.save_to(&path).expect("save_to writes toml");
     assert!(path.exists(), "config file should be written");
@@ -94,6 +96,10 @@ fn config_save_load_round_trip_preserves_ports() {
     let loaded = Config::load_from(&path).expect("load_from reads toml");
     assert_eq!(loaded.server.proxy_port, 4567);
     assert_eq!(loaded.server.client_port, 7654);
+    assert_eq!(
+        loaded.security.client_shutdown_key,
+        cfg.security.client_shutdown_key
+    );
 }
 
 #[test]
@@ -106,4 +112,30 @@ fn config_load_from_missing_file_returns_defaults() {
 
     let loaded = Config::load_from(&path).expect("missing file falls back to defaults");
     assert_eq!(loaded.server.proxy_port, 3000);
+}
+
+#[cfg(unix)]
+#[test]
+fn config_file_is_owner_readable_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    Config::default().save_to(&path).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn config_debug_output_redacts_shutdown_key() {
+    let mut config = Config::default();
+    let key = wakezilla::shutdown_auth::generate_key();
+    config.security.client_shutdown_key = Some(key.clone());
+
+    let output = format!("{config:?}");
+    assert!(!output.contains(&key));
+    assert!(output.contains("REDACTED"));
 }

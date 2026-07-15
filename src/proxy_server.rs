@@ -27,6 +27,66 @@ use std::path::{Component, Path as StdPath};
 
 static FRONTEND_DIST: Dir<'_> = include_dir!("$WAKEZILLA_FRONTEND_DIST");
 
+fn shutdown_setup_for_machine(machine: &web::Machine) -> wakezilla_common::ShutdownSetup {
+    use wakezilla_common::{ShutdownSetup, ShutdownSetupStatus};
+
+    if !machine.can_be_turned_off || machine.turn_off_port.is_none() {
+        return ShutdownSetup {
+            status: ShutdownSetupStatus::Disabled,
+            unix_command: None,
+            windows_command: None,
+        };
+    }
+    let Some(key) = machine.shutdown_auth_key.as_deref() else {
+        return ShutdownSetup {
+            status: ShutdownSetupStatus::Legacy,
+            unix_command: None,
+            windows_command: None,
+        };
+    };
+    if machine.shutdown_auth_verified {
+        return ShutdownSetup {
+            status: ShutdownSetupStatus::Verified,
+            unix_command: None,
+            windows_command: None,
+        };
+    }
+
+    let port = machine.turn_off_port.expect("checked above");
+    let args = format!("wakezilla setup --mode client --port {port} --key {key} --yes");
+    ShutdownSetup {
+        status: ShutdownSetupStatus::Pending,
+        unix_command: Some(format!("sudo {args}")),
+        windows_command: Some(args),
+    }
+}
+
+fn apply_shutdown_security(old: Option<&web::Machine>, new: &mut web::Machine) {
+    if !new.can_be_turned_off || new.turn_off_port.is_none() {
+        new.shutdown_auth_key = None;
+        new.shutdown_auth_verified = false;
+        return;
+    }
+
+    let Some(old) = old.filter(|old| old.can_be_turned_off && old.turn_off_port.is_some()) else {
+        new.shutdown_auth_key = Some(crate::shutdown_auth::generate_key());
+        new.shutdown_auth_verified = false;
+        return;
+    };
+    let Some(key) = old.shutdown_auth_key.clone() else {
+        // Preserve intentionally compatible legacy installations until the user
+        // explicitly chooses to secure them.
+        new.shutdown_auth_key = None;
+        new.shutdown_auth_verified = false;
+        return;
+    };
+
+    let connection_unchanged =
+        old.mac == new.mac && old.ip == new.ip && old.turn_off_port == new.turn_off_port;
+    new.shutdown_auth_key = Some(key);
+    new.shutdown_auth_verified = old.shutdown_auth_verified && connection_unchanged;
+}
+
 fn respond_with_file(file: &include_dir::File<'_>) -> Response<Body> {
     let mime = from_path(file.path()).first_or_octet_stream();
     Response::builder()
@@ -212,8 +272,130 @@ pub fn api_routes(state: AppState) -> Router {
         )
         .route("/api/machines/:mac/wake", post(api_wake_machine))
         .route("/api/machines/:mac/is-on", get(is_machine_on_api))
+        .route("/api/machines/:mac/shutdown-setup", get(get_shutdown_setup))
+        .route(
+            "/api/machines/:mac/shutdown-setup/verify",
+            post(verify_shutdown_setup),
+        )
+        .route(
+            "/api/machines/:mac/shutdown-setup/rotate",
+            post(rotate_shutdown_key),
+        )
         .route("/api/machines/delete", delete(delete_machine_api))
         .with_state(state)
+}
+
+type ShutdownSetupError = (axum::http::StatusCode, Json<serde_json::Value>);
+
+fn shutdown_setup_error(status: StatusCode, message: &str) -> ShutdownSetupError {
+    (status, Json(serde_json::json!({ "error": message })))
+}
+
+async fn get_shutdown_setup(
+    State(state): State<AppState>,
+    Path(mac): Path<String>,
+) -> Result<Json<wakezilla_common::ShutdownSetup>, ShutdownSetupError> {
+    let machines = state.machines.read().await;
+    let machine = machines
+        .iter()
+        .find(|machine| machine.mac == mac)
+        .ok_or_else(|| shutdown_setup_error(StatusCode::NOT_FOUND, "Machine not found"))?;
+    Ok(Json(shutdown_setup_for_machine(machine)))
+}
+
+async fn verify_shutdown_setup(
+    State(state): State<AppState>,
+    Path(mac): Path<String>,
+) -> Result<Json<wakezilla_common::ShutdownSetup>, ShutdownSetupError> {
+    use wakezilla_common::ShutdownSetupStatus;
+
+    let (machine, key) = {
+        let machines = state.machines.read().await;
+        let machine = machines
+            .iter()
+            .find(|machine| machine.mac == mac)
+            .cloned()
+            .ok_or_else(|| shutdown_setup_error(StatusCode::NOT_FOUND, "Machine not found"))?;
+        let setup = shutdown_setup_for_machine(&machine);
+        if setup.status != ShutdownSetupStatus::Pending {
+            return Ok(Json(setup));
+        }
+        let key = machine
+            .shutdown_auth_key
+            .clone()
+            .expect("pending setup always has a key");
+        (machine, key)
+    };
+
+    let verification = forward::verify_remote_client(
+        &machine.ip.to_string(),
+        machine
+            .turn_off_port
+            .expect("pending setup always has a port"),
+        &key,
+    )
+    .await;
+
+    match verification {
+        forward::ClientVerification::Verified => {
+            let mut machines = state.machines.write().await;
+            let index = machines
+                .iter_mut()
+                .position(|candidate| candidate.mac == mac)
+                .ok_or_else(|| shutdown_setup_error(StatusCode::NOT_FOUND, "Machine not found"))?;
+            if machines[index].shutdown_auth_key.as_deref() != Some(key.as_str()) {
+                return Ok(Json(shutdown_setup_for_machine(&machines[index])));
+            }
+            machines[index].shutdown_auth_verified = true;
+            let setup = shutdown_setup_for_machine(&machines[index]);
+            if let Err(error) = web::save_machines_with_config(&machines, &state.config) {
+                error!("failed to persist verified shutdown setup: {error}");
+                return Err(shutdown_setup_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to persist shutdown setup",
+                ));
+            }
+            Ok(Json(setup))
+        }
+        forward::ClientVerification::KeyMismatch => {
+            let mut setup = shutdown_setup_for_machine(&machine);
+            setup.status = ShutdownSetupStatus::KeyMismatch;
+            Ok(Json(setup))
+        }
+        forward::ClientVerification::Unreachable => {
+            let mut setup = shutdown_setup_for_machine(&machine);
+            setup.status = ShutdownSetupStatus::Unreachable;
+            Ok(Json(setup))
+        }
+    }
+}
+
+async fn rotate_shutdown_key(
+    State(state): State<AppState>,
+    Path(mac): Path<String>,
+) -> Result<Json<wakezilla_common::ShutdownSetup>, ShutdownSetupError> {
+    let mut machines = state.machines.write().await;
+    let machine = machines
+        .iter_mut()
+        .find(|machine| machine.mac == mac)
+        .ok_or_else(|| shutdown_setup_error(StatusCode::NOT_FOUND, "Machine not found"))?;
+    if !machine.can_be_turned_off || machine.turn_off_port.is_none() {
+        return Err(shutdown_setup_error(
+            StatusCode::BAD_REQUEST,
+            "Remote shutdown is disabled",
+        ));
+    }
+    machine.shutdown_auth_key = Some(crate::shutdown_auth::generate_key());
+    machine.shutdown_auth_verified = false;
+    let setup = shutdown_setup_for_machine(machine);
+    if let Err(error) = web::save_machines_with_config(&machines, &state.config) {
+        error!("failed to persist rotated shutdown key: {error}");
+        return Err(shutdown_setup_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to persist shutdown setup",
+        ));
+    }
+    Ok(Json(setup))
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -336,7 +518,7 @@ async fn add_machine_api(
             .unwrap_or(web::get_default_inactivity_period()),
         port_forwards: payload.port_forwards.unwrap_or_default(),
     };
-    let new_machine = match web::api_machine_to_internal(&api_machine) {
+    let mut new_machine = match web::api_machine_to_internal(&api_machine) {
         Ok(machine) => machine,
         Err(err) => {
             return (
@@ -347,6 +529,9 @@ async fn add_machine_api(
             );
         }
     };
+    if new_machine.can_be_turned_off && new_machine.turn_off_port.is_some() {
+        new_machine.shutdown_auth_key = Some(crate::shutdown_auth::generate_key());
+    }
 
     let mut machines = state.machines.write().await;
     web::start_proxy_if_configured(&new_machine, &state);
@@ -462,7 +647,7 @@ async fn update_machine_api(
             .unwrap_or(web::get_default_inactivity_period()),
         port_forwards: payload.port_forwards.clone().unwrap_or_default(),
     };
-    let new_machine = match web::api_machine_to_internal(&api_machine) {
+    let mut new_machine = match web::api_machine_to_internal(&api_machine) {
         Ok(machine) => machine,
         Err(err) => {
             return Err((
@@ -473,6 +658,7 @@ async fn update_machine_api(
             ));
         }
     };
+    apply_shutdown_security(old_machine.as_ref(), &mut new_machine);
 
     machines.push(new_machine.clone());
     if let Err(e) = web::save_machines_with_config(&machines, &state.config) {
@@ -557,7 +743,13 @@ async fn execute_remote_turn_off(state: &AppState, mac: &str) -> (axum::http::St
     if let Some(machine) = machine {
         if let Some(port) = machine.turn_off_port {
             info!("Sending turn-off request to {}:{}", machine.ip, port);
-            match forward::turn_off_remote_machine(&machine.ip.to_string(), port).await {
+            match forward::turn_off_remote_machine(
+                &machine.ip.to_string(),
+                port,
+                machine.shutdown_auth_key.as_deref(),
+            )
+            .await
+            {
                 Ok(_) => {
                     return (
                         axum::http::StatusCode::OK,
@@ -705,6 +897,8 @@ mod tests {
             description: Some("Desc".to_string()),
             turn_off_port: Some(8080),
             can_be_turned_off: false,
+            shutdown_auth_key: None,
+            shutdown_auth_verified: false,
             inactivity_period: 30,
             port_forwards: vec![],
         }
@@ -795,6 +989,118 @@ mod tests {
         assert_eq!(machines[0].mac, "AA:BB:CC:DD:EE:FF");
         assert_eq!(machines[0].name, "New machine");
         assert_eq!(machines[0].inactivity_period, 6);
+        assert!(machines[0].shutdown_auth_key.is_some());
+        assert!(!machines[0].shutdown_auth_verified);
+    }
+
+    #[test]
+    fn pending_shutdown_setup_contains_platform_commands() {
+        let mut machine = sample_machine();
+        machine.can_be_turned_off = true;
+        machine.shutdown_auth_key = Some(crate::shutdown_auth::generate_key());
+
+        let setup = shutdown_setup_for_machine(&machine);
+
+        assert_eq!(setup.status, wakezilla_common::ShutdownSetupStatus::Pending);
+        assert!(setup
+            .unix_command
+            .unwrap()
+            .starts_with("sudo wakezilla setup --mode client --port 8080 --key "));
+        assert!(setup
+            .windows_command
+            .unwrap()
+            .starts_with("wakezilla setup --mode client --port 8080 --key "));
+    }
+
+    #[test]
+    fn verified_shutdown_setup_does_not_expose_commands() {
+        let mut machine = sample_machine();
+        machine.can_be_turned_off = true;
+        machine.shutdown_auth_key = Some(crate::shutdown_auth::generate_key());
+        machine.shutdown_auth_verified = true;
+
+        let setup = shutdown_setup_for_machine(&machine);
+
+        assert_eq!(
+            setup.status,
+            wakezilla_common::ShutdownSetupStatus::Verified
+        );
+        assert_eq!(setup.unix_command, None);
+        assert_eq!(setup.windows_command, None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn verify_shutdown_setup_persists_first_success() {
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = tempdir().unwrap();
+        let file_path = tmp_dir.path().join("machines.json");
+        let _guard = EnvGuard::set_path("WAKEZILLA__STORAGE__MACHINES_DB_PATH", &file_path);
+
+        let key = crate::shutdown_auth::generate_key();
+        let key_for_server = key.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                crate::client_server::build_router(Some(key_for_server)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut machine = sample_machine();
+        machine.ip = addr.ip().to_string().parse().unwrap();
+        machine.turn_off_port = Some(addr.port());
+        machine.can_be_turned_off = true;
+        machine.shutdown_auth_key = Some(key);
+        let state = state_with_machines(vec![machine]);
+
+        let response =
+            verify_shutdown_setup(State(state.clone()), Path("AA:BB:CC:DD:EE:FF".to_string()))
+                .await
+                .expect("verification should succeed");
+
+        assert_eq!(
+            response.0.status,
+            wakezilla_common::ShutdownSetupStatus::Verified
+        );
+        assert!(state.machines.read().await[0].shutdown_auth_verified);
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rotate_shutdown_key_replaces_key_and_marks_pending() {
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = tempdir().unwrap();
+        let file_path = tmp_dir.path().join("machines.json");
+        let _guard = EnvGuard::set_path("WAKEZILLA__STORAGE__MACHINES_DB_PATH", &file_path);
+
+        let mut machine = sample_machine();
+        machine.can_be_turned_off = true;
+        machine.shutdown_auth_key = Some(crate::shutdown_auth::generate_key());
+        machine.shutdown_auth_verified = true;
+        let original_key = machine.shutdown_auth_key.clone();
+        let state = state_with_machines(vec![machine]);
+
+        let response =
+            rotate_shutdown_key(State(state.clone()), Path("AA:BB:CC:DD:EE:FF".to_string()))
+                .await
+                .expect("rotation should succeed");
+
+        assert_eq!(
+            response.0.status,
+            wakezilla_common::ShutdownSetupStatus::Pending
+        );
+        let machines = state.machines.read().await;
+        assert_ne!(machines[0].shutdown_auth_key, original_key);
+        assert!(!machines[0].shutdown_auth_verified);
     }
 
     #[tokio::test]
@@ -936,6 +1242,48 @@ mod tests {
         assert_eq!(updated.inactivity_period, 12);
         assert_eq!(updated.turn_off_port, Some(9090));
         assert_eq!(updated.ip, Ipv4Addr::new(10, 0, 0, 2));
+        assert!(updated.shutdown_auth_key.is_some());
+        assert!(!updated.shutdown_auth_verified);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn update_machine_preserves_verified_key_when_connection_details_do_not_change() {
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = tempdir().unwrap();
+        let file_path = tmp_dir.path().join("machines.json");
+        let _guard = EnvGuard::set_path("WAKEZILLA__STORAGE__MACHINES_DB_PATH", &file_path);
+
+        let mut machine = sample_machine();
+        machine.can_be_turned_off = true;
+        machine.shutdown_auth_key = Some(crate::shutdown_auth::generate_key());
+        machine.shutdown_auth_verified = true;
+        let original_key = machine.shutdown_auth_key.clone();
+        let state = state_with_machines(vec![machine]);
+        let payload = wakezilla_common::UpdateMachinePayload {
+            mac: "AA:BB:CC:DD:EE:FF".to_string(),
+            ip: "10.0.0.1".to_string(),
+            name: "Renamed".to_string(),
+            description: None,
+            turn_off_port: Some(8080),
+            can_be_turned_off: true,
+            inactivity_period: Some(30),
+            port_forwards: Some(vec![]),
+        };
+
+        let _ = update_machine_api(
+            State(state.clone()),
+            Path("AA:BB:CC:DD:EE:FF".to_string()),
+            Json(payload),
+        )
+        .await
+        .unwrap();
+
+        let machines = state.machines.read().await;
+        assert_eq!(machines[0].shutdown_auth_key, original_key);
+        assert!(machines[0].shutdown_auth_verified);
     }
 
     #[tokio::test]

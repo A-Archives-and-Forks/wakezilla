@@ -395,6 +395,16 @@ textarea {
     overflow-x: auto;
 }
 
+.setup-command + .setup-command {
+    margin-top: 1rem;
+}
+
+.setup-command .code-block {
+    margin: 0.5rem 0 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
 .table-card {
     padding: 0;
 }

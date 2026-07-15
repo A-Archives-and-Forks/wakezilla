@@ -1,3 +1,4 @@
+use wakezilla::config::Config;
 use wakezilla::web::{self, Machine, PortForward};
 
 struct EnvGuard {
@@ -33,6 +34,8 @@ fn save_and_load_machines_round_trip() {
         description: Some("Main desktop".into()),
         turn_off_port: Some(4000),
         can_be_turned_off: true,
+        shutdown_auth_key: Some(wakezilla::shutdown_auth::generate_key()),
+        shutdown_auth_verified: true,
         inactivity_period: 15,
         port_forwards: vec![PortForward {
             name: "SSH".into(),
@@ -55,6 +58,8 @@ fn save_and_load_machines_round_trip() {
     assert_eq!(loaded_machine.description, original.description);
     assert_eq!(loaded_machine.turn_off_port, original.turn_off_port);
     assert_eq!(loaded_machine.can_be_turned_off, original.can_be_turned_off);
+    assert_eq!(loaded_machine.shutdown_auth_key, original.shutdown_auth_key);
+    assert!(loaded_machine.shutdown_auth_verified);
     assert_eq!(loaded_machine.inactivity_period, original.inactivity_period);
     assert_eq!(loaded_machine.port_forwards.len(), 1);
     let loaded_pf = &loaded_machine.port_forwards[0];
@@ -62,4 +67,21 @@ fn save_and_load_machines_round_trip() {
     assert_eq!(loaded_pf.name, original_pf.name);
     assert_eq!(loaded_pf.local_port, original_pf.local_port);
     assert_eq!(loaded_pf.target_port, original_pf.target_port);
+}
+
+#[cfg(unix)]
+#[test]
+fn machines_database_is_owner_readable_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("machines.json");
+    let mut config = Config::default();
+    config.storage.machines_db_path = db_path.to_string_lossy().into_owned();
+    web::save_machines_with_config(&[], &config).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(db_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
