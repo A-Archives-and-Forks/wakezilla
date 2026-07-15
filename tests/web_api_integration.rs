@@ -61,6 +61,8 @@ fn sample_machine() -> InternalMachine {
         description: Some("Primary workstation".to_string()),
         turn_off_port: None,
         can_be_turned_off: false,
+        shutdown_auth_key: None,
+        shutdown_auth_verified: false,
         inactivity_period: 60,
         port_forwards: Vec::new(),
     }

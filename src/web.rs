@@ -60,7 +60,7 @@ fn machines_db_path_from_config(config: &Config) -> PathBuf {
     absolute_storage_path(&config.storage.machines_db_path)
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct Machine {
     pub mac: String,
     #[serde(
@@ -72,10 +72,35 @@ pub struct Machine {
     pub description: Option<String>,
     pub turn_off_port: Option<u16>,
     pub can_be_turned_off: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_auth_key: Option<String>,
+    #[serde(default)]
+    pub shutdown_auth_verified: bool,
     #[serde(default = "get_default_inactivity_period")]
     pub inactivity_period: u32,
 
     pub port_forwards: Vec<PortForward>,
+}
+
+impl std::fmt::Debug for Machine {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Machine")
+            .field("mac", &self.mac)
+            .field("ip", &self.ip)
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("turn_off_port", &self.turn_off_port)
+            .field("can_be_turned_off", &self.can_be_turned_off)
+            .field(
+                "shutdown_auth_key",
+                &self.shutdown_auth_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("shutdown_auth_verified", &self.shutdown_auth_verified)
+            .field("inactivity_period", &self.inactivity_period)
+            .field("port_forwards", &self.port_forwards)
+            .finish()
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -167,6 +192,8 @@ pub fn api_machine_to_internal(api: &wakezilla_common::Machine) -> Result<Machin
         description: api.description.clone(),
         turn_off_port: api.turn_off_port,
         can_be_turned_off: api.can_be_turned_off,
+        shutdown_auth_key: None,
+        shutdown_auth_verified: false,
         inactivity_period: api.inactivity_period,
         port_forwards: api
             .port_forwards
@@ -225,7 +252,7 @@ fn save_machines_to_path(machines: &[Machine], path: PathBuf) -> Result<()> {
             .with_context(|| format!("Failed to create storage directory {}", parent.display()))?;
     }
     info!("Saving machines database to {}", path.display());
-    fs::write(&path, data)
+    config::write_secret_file(&path, data.as_bytes())
         .with_context(|| format!("Failed to write machines database to {}", path.display()))
 }
 
@@ -365,6 +392,8 @@ mod tests {
         assert_eq!(machines.len(), 1);
         assert_eq!(machines[0].mac, "AA:BB:CC:DD:EE:FF");
         assert_eq!(machines[0].ip, Ipv4Addr::new(192, 168, 1, 10));
+        assert_eq!(machines[0].shutdown_auth_key, None);
+        assert!(!machines[0].shutdown_auth_verified);
     }
 
     #[test]
@@ -383,6 +412,8 @@ mod tests {
             description: Some("Example".to_string()),
             turn_off_port: Some(9000),
             can_be_turned_off: true,
+            shutdown_auth_key: None,
+            shutdown_auth_verified: false,
             inactivity_period: get_default_inactivity_period(),
             port_forwards: vec![],
         }];

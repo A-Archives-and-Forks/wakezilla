@@ -1,5 +1,5 @@
 use crate::models::{
-    AccessHistory, DiscoveredDevice, Machine, NetworkInterface, UpdateMachinePayload,
+    AccessHistory, DiscoveredDevice, Machine, NetworkInterface, ShutdownSetup, UpdateMachinePayload,
 };
 use std::sync::LazyLock;
 
@@ -211,4 +211,99 @@ pub async fn is_machine_online(mac: &str) -> bool {
     };
 
     response.status() == 200
+}
+
+pub async fn get_shutdown_setup(mac: &str) -> Result<ShutdownSetup, String> {
+    let mac = encode_path_segment(mac);
+    let response = Request::get(&format!(
+        "{}/machines/{}/shutdown-setup",
+        API_BASE.as_str(),
+        mac
+    ))
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+    decode_shutdown_setup_http_response(response).await
+}
+
+pub async fn verify_shutdown_setup(mac: &str) -> Result<ShutdownSetup, String> {
+    let mac = encode_path_segment(mac);
+    let response = Request::post(&format!(
+        "{}/machines/{}/shutdown-setup/verify",
+        API_BASE.as_str(),
+        mac
+    ))
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+    decode_shutdown_setup_http_response(response).await
+}
+
+pub async fn rotate_shutdown_key(mac: &str) -> Result<ShutdownSetup, String> {
+    let mac = encode_path_segment(mac);
+    let response = Request::post(&format!(
+        "{}/machines/{}/shutdown-setup/rotate",
+        API_BASE.as_str(),
+        mac
+    ))
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+    decode_shutdown_setup_http_response(response).await
+}
+
+async fn decode_shutdown_setup_http_response(
+    response: gloo_net::http::Response,
+) -> Result<ShutdownSetup, String> {
+    let is_success = response.ok();
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| error.to_string())?;
+    decode_shutdown_setup_response(is_success, body)
+}
+
+fn decode_shutdown_setup_response(
+    is_success: bool,
+    body: serde_json::Value,
+) -> Result<ShutdownSetup, String> {
+    if !is_success {
+        return Err(body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| body.to_string()));
+    }
+
+    serde_json::from_value(body).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_setup_error_preserves_backend_message() {
+        let result = decode_shutdown_setup_response(
+            false,
+            serde_json::json!({ "error": "Failed to persist shutdown setup" }),
+        );
+
+        assert_eq!(result, Err("Failed to persist shutdown setup".to_string()));
+    }
+
+    #[test]
+    fn shutdown_setup_success_deserializes_the_setup() {
+        let result = decode_shutdown_setup_response(
+            true,
+            serde_json::json!({
+                "status": "verified",
+                "unix_command": null,
+                "windows_command": null
+            }),
+        )
+        .expect("successful response should deserialize");
+
+        assert_eq!(result.status, crate::models::ShutdownSetupStatus::Verified);
+    }
 }

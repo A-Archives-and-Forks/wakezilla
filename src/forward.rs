@@ -17,10 +17,58 @@ fn turn_off_url(remote_ip: &str, turn_off_port: u16) -> String {
     format!("http://{}:{}/machines/turn-off", remote_ip, turn_off_port)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientVerification {
+    Verified,
+    KeyMismatch,
+    Unreachable,
+}
+
+pub async fn verify_remote_client(
+    remote_ip: &str,
+    client_port: u16,
+    shutdown_auth_key: &str,
+) -> ClientVerification {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return ClientVerification::Unreachable,
+    };
+    let signed =
+        match crate::shutdown_auth::sign_request(shutdown_auth_key, "GET", "/health/secure") {
+            Ok(signed) => signed,
+            Err(_) => return ClientVerification::KeyMismatch,
+        };
+    let url = format!("http://{remote_ip}:{client_port}/health/secure");
+    match client
+        .get(url)
+        .header(crate::shutdown_auth::TIMESTAMP_HEADER, signed.timestamp)
+        .header(crate::shutdown_auth::NONCE_HEADER, signed.nonce)
+        .header(crate::shutdown_auth::SIGNATURE_HEADER, signed.signature)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => ClientVerification::Verified,
+        Ok(response)
+            if matches!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) =>
+        {
+            ClientVerification::KeyMismatch
+        }
+        Ok(_) | Err(_) => ClientVerification::Unreachable,
+    }
+}
+
 struct MachineConfig {
     window: Duration,
     turn_off_port: u16,
     mac: String,
+    shutdown_auth_key: Option<String>,
     triggered: AtomicBool,
     last_request: Instant,
 }
@@ -50,6 +98,7 @@ impl TurnOffLimiter {
             window: Duration::from_secs(window_secs as u64),
             turn_off_port,
             mac: machine.mac.clone(),
+            shutdown_auth_key: machine.shutdown_auth_key.clone(),
             triggered: AtomicBool::new(false),
             last_request: Instant::now(),
         };
@@ -67,6 +116,7 @@ impl TurnOffLimiter {
             config.window = Duration::from_secs(window_secs as u64);
             config.turn_off_port = turn_off_port;
             config.mac = machine.mac.clone();
+            config.shutdown_auth_key = machine.shutdown_auth_key.clone();
             // Reset triggered flag so it can trigger again if needed
             config.triggered.store(false, Ordering::SeqCst);
             debug!(
@@ -99,7 +149,7 @@ impl TurnOffLimiter {
             loop {
                 interval.tick().await;
                 let now = Instant::now();
-                let machines_to_check: Vec<(Ipv4Addr, u16, String)> = {
+                let machines_to_check: Vec<(Ipv4Addr, u16, String, Option<String>)> = {
                     let machines = limiter.machines.lock().unwrap();
                     machines
                         .iter()
@@ -116,7 +166,12 @@ impl TurnOffLimiter {
                                         "Machine {} (IP: {}) has been inactive for {:?}, exceeding window of {:?}",
                                         config.mac, ip, time_since_last_request, config.window
                                     );
-                                    Some((*ip, config.turn_off_port, config.mac.clone()))
+                                    Some((
+                                        *ip,
+                                        config.turn_off_port,
+                                        config.mac.clone(),
+                                        config.shutdown_auth_key.clone(),
+                                    ))
                                 } else {
                                     None
                                 }
@@ -127,14 +182,20 @@ impl TurnOffLimiter {
                         .collect()
                 };
 
-                for (ip, turn_off_port, mac) in machines_to_check {
+                for (ip, turn_off_port, mac, shutdown_auth_key) in machines_to_check {
                     let remote_ip = ip.to_string();
                     debug!(
                         "Sending turn-off signal for inactive machine {} (IP: {})",
                         mac, remote_ip
                     );
                     tokio::spawn(async move {
-                        if let Err(e) = turn_off_remote_machine(&remote_ip, turn_off_port).await {
+                        if let Err(e) = turn_off_remote_machine(
+                            &remote_ip,
+                            turn_off_port,
+                            shutdown_auth_key.as_deref(),
+                        )
+                        .await
+                        {
                             error!(
                                 "Failed to send turn-off signal for inactive machine {} on {}:{}: {}",
                                 mac, remote_ip, turn_off_port, e
@@ -342,7 +403,8 @@ impl TurnOffLimiter {
 pub async fn turn_off_remote_machine(
     remote_ip: &str,
     turn_off_port: u16,
-) -> Result<(), reqwest::Error> {
+    shutdown_auth_key: Option<&str>,
+) -> Result<()> {
     let url = turn_off_url(remote_ip, turn_off_port);
     info!("Sending turn-off signal to {}", url);
     let client = reqwest::Client::builder()
@@ -350,20 +412,20 @@ pub async fn turn_off_remote_machine(
         .timeout(Duration::from_secs(5))
         .build()?;
 
-    let response = client.post(&url).send().await?;
-    if response.status().is_success() {
-        info!(
-            "Successfully sent turn-off signal to {}:{}",
-            remote_ip, turn_off_port
-        );
-    } else {
-        error!(
-            "Failed to send turn-off signal to {}:{}, status: {}",
-            remote_ip,
-            turn_off_port,
-            response.status()
-        );
+    let mut request = client.post(&url);
+    if let Some(key) = shutdown_auth_key {
+        let signed = crate::shutdown_auth::sign_request(key, "POST", "/machines/turn-off")
+            .context("failed to sign turn-off request")?;
+        request = request
+            .header(crate::shutdown_auth::TIMESTAMP_HEADER, signed.timestamp)
+            .header(crate::shutdown_auth::NONCE_HEADER, signed.nonce)
+            .header(crate::shutdown_auth::SIGNATURE_HEADER, signed.signature);
     }
+    request.send().await?.error_for_status()?;
+    info!(
+        "Successfully sent turn-off signal to {}:{}",
+        remote_ip, turn_off_port
+    );
     Ok(())
 }
 
@@ -420,7 +482,7 @@ mod tests {
             }
         });
 
-        turn_off_remote_machine(&addr.ip().to_string(), addr.port())
+        turn_off_remote_machine(&addr.ip().to_string(), addr.port(), None)
             .await
             .expect("turn_off_remote_machine should succeed");
 

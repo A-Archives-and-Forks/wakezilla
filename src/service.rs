@@ -2370,7 +2370,12 @@ fn run_windows_service_inner() -> Result<()> {
         match mode {
             Mode::Proxy => crate::proxy_server::start_with_shutdown(config, shutdown).await,
             Mode::Client => {
-                crate::client_server::start_with_shutdown(config.server.client_port, shutdown).await
+                crate::client_server::start_with_shutdown(
+                    config.server.client_port,
+                    config.security.client_shutdown_key.clone(),
+                    shutdown,
+                )
+                .await
             }
         }
     });

@@ -8,13 +8,19 @@ use leptos_router::hooks::use_params_map;
 
 use web_sys::SubmitEvent;
 
-use crate::api::{get_details_machine, turn_off_machine, wake_machine};
-use crate::models::{Machine, PortForward, UpdateMachinePayload};
+use crate::api::{
+    get_details_machine, get_shutdown_setup, rotate_shutdown_key, turn_off_machine,
+    verify_shutdown_setup, wake_machine,
+};
+use crate::models::{
+    Machine, PortForward, ShutdownSetup, ShutdownSetupStatus, UpdateMachinePayload,
+};
 
 use crate::api::get_access_history;
 use crate::models::AccessHistory;
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
 
 #[wasm_bindgen(inline_js = r#"
 export function render_usage_chart(canvas_id, labels_json, datasets_json) {
@@ -39,9 +45,192 @@ export function render_usage_chart(canvas_id, labels_json, datasets_json) {
         }
     });
 }
+export async function copy_to_clipboard(value) {
+    if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(value);
+        return;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+
+    try {
+        if (!document.execCommand('copy')) {
+            throw new Error('copy command was rejected');
+        }
+    } finally {
+        document.body.removeChild(textarea);
+    }
+}
 "#)]
 extern "C" {
     fn render_usage_chart(canvas_id: &str, labels_json: &str, datasets_json: &str);
+    fn copy_to_clipboard(value: &str) -> js_sys::Promise;
+}
+
+const UNIX_INSTALL_COMMAND: &str = "curl -fsSL https://wakezilla.dev/install.sh | sh";
+const WINDOWS_INSTALL_COMMAND: &str = "irm https://wakezilla.dev/install.ps1 | iex";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyFeedback {
+    Idle,
+    Copying,
+    Copied,
+    Failed,
+}
+
+impl CopyFeedback {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Copy command",
+            Self::Copying => "Copying...",
+            Self::Copied => "Copied!",
+            Self::Failed => "Copy failed",
+        }
+    }
+
+    fn button_class(self) -> &'static str {
+        match self {
+            Self::Idle | Self::Copying => "btn btn-soft btn-sm",
+            Self::Copied => "btn btn-success btn-sm",
+            Self::Failed => "btn btn-danger btn-sm",
+        }
+    }
+}
+
+#[component]
+fn SetupCommandStep(label: &'static str, command: String) -> impl IntoView {
+    let command_to_copy = command.clone();
+    let copy_label = format!("Copy {label}");
+    let (copy_feedback, set_copy_feedback) = signal(CopyFeedback::Idle);
+
+    let copy_command = move |_| {
+        let command = command_to_copy.clone();
+        set_copy_feedback.set(CopyFeedback::Copying);
+
+        leptos::task::spawn_local(async move {
+            let feedback = if JsFuture::from(copy_to_clipboard(&command)).await.is_ok() {
+                CopyFeedback::Copied
+            } else {
+                CopyFeedback::Failed
+            };
+            set_copy_feedback.set(feedback);
+            gloo_timers::future::TimeoutFuture::new(2_000).await;
+            set_copy_feedback.set(CopyFeedback::Idle);
+        });
+    };
+
+    view! {
+        <div class="setup-command">
+            <div class="field-header">
+                <strong>{label}</strong>
+                <button
+                    type="button"
+                    class=move || copy_feedback.get().button_class()
+                    aria-label=copy_label
+                    disabled=move || copy_feedback.get() != CopyFeedback::Idle
+                    on:click=copy_command
+                >
+                    {move || copy_feedback.get().label()}
+                </button>
+                <span class="sr-only" aria-live="polite">
+                    {move || match copy_feedback.get() {
+                        CopyFeedback::Copied => "Command copied to clipboard",
+                        CopyFeedback::Failed => "Could not copy command",
+                        CopyFeedback::Idle | CopyFeedback::Copying => "",
+                    }}
+                </span>
+            </div>
+            <pre class="code-block">{command}</pre>
+        </div>
+    }
+}
+
+fn shutdown_setup_message(status: ShutdownSetupStatus) -> &'static str {
+    match status {
+        ShutdownSetupStatus::Disabled => "Remote shutdown is disabled.",
+        ShutdownSetupStatus::Legacy => {
+            "Remote shutdown is using legacy unsigned requests. Secure it to restrict access."
+        }
+        ShutdownSetupStatus::Pending => {
+            "Run this command on the client machine. This page will verify it automatically."
+        }
+        ShutdownSetupStatus::Verified => {
+            "The client is paired and shutdown requests are authenticated."
+        }
+        ShutdownSetupStatus::Unreachable => {
+            "Waiting for the client to become reachable. The setup command will remain available."
+        }
+        ShutdownSetupStatus::KeyMismatch => {
+            "The client responded, but its key does not match. Run the setup command again."
+        }
+    }
+}
+
+fn shutdown_control_is_visible(status: Option<ShutdownSetupStatus>) -> bool {
+    matches!(
+        status,
+        Some(ShutdownSetupStatus::Legacy | ShutdownSetupStatus::Verified)
+    )
+}
+
+const fn raw_machine_data_is_visible() -> bool {
+    cfg!(debug_assertions)
+}
+
+async fn monitor_shutdown_setup(
+    mac: String,
+    set_shutdown_setup: WriteSignal<Option<ShutdownSetup>>,
+) {
+    const INITIAL_POLL_DELAY_MS: u32 = 3_000;
+
+    let mut setup = match get_shutdown_setup(&mac).await {
+        Ok(setup) => setup,
+        Err(_) => return,
+    };
+    set_shutdown_setup.set(Some(setup.clone()));
+    let mut poll_delay_ms = INITIAL_POLL_DELAY_MS;
+
+    while matches!(
+        setup.status,
+        ShutdownSetupStatus::Pending
+            | ShutdownSetupStatus::Unreachable
+            | ShutdownSetupStatus::KeyMismatch
+    ) {
+        gloo_timers::future::TimeoutFuture::new(poll_delay_ms).await;
+        match verify_shutdown_setup(&mac).await {
+            Ok(next) => {
+                setup = next;
+                set_shutdown_setup.set(Some(setup.clone()));
+                poll_delay_ms = next_shutdown_poll_delay(poll_delay_ms, true);
+            }
+            Err(_) => {
+                setup.status = ShutdownSetupStatus::Unreachable;
+                set_shutdown_setup.set(Some(setup.clone()));
+                poll_delay_ms = next_shutdown_poll_delay(poll_delay_ms, false);
+            }
+        }
+    }
+}
+
+fn next_shutdown_poll_delay(current_ms: u32, request_succeeded: bool) -> u32 {
+    const INITIAL_POLL_DELAY_MS: u32 = 3_000;
+    const MAX_POLL_DELAY_MS: u32 = 30_000;
+
+    if request_succeeded {
+        INITIAL_POLL_DELAY_MS
+    } else {
+        current_ms.saturating_mul(2).min(MAX_POLL_DELAY_MS)
+    }
+}
+
+fn rotation_failure_message(message: &str) -> String {
+    format!("Failed to rotate shutdown key: {message}")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,6 +307,9 @@ pub fn MachineDetailPage() -> impl IntoView {
     let mac = move || params.read().get("mac").unwrap_or_default();
     let (loading, set_loading) = signal(false);
     let (machine_details, set_machine_details) = signal::<Machine>(Machine::default());
+    let (shutdown_setup, set_shutdown_setup) = signal::<Option<ShutdownSetup>>(None);
+    let (setup_loading, set_setup_loading) = signal(false);
+    let (shutdown_setup_refresh, set_shutdown_setup_refresh) = signal(0u32);
 
     // Load initial machine details
     Effect::new(move || {
@@ -126,6 +318,15 @@ pub fn MachineDetailPage() -> impl IntoView {
                 set_machine_details.set(cats);
             }
         });
+    });
+
+    Effect::new(move || {
+        let mac = mac();
+        shutdown_setup_refresh.get();
+        leptos::task::spawn_local_scoped_with_cancellation(monitor_shutdown_setup(
+            mac,
+            set_shutdown_setup,
+        ));
     });
 
     let (access_history, set_access_history) = signal::<Option<AccessHistory>>(None);
@@ -236,6 +437,7 @@ pub fn MachineDetailPage() -> impl IntoView {
                     if let Ok(updated_details) = get_details_machine(&updated_mac).await {
                         set_machine_details.set(updated_details);
                     }
+                    set_shutdown_setup_refresh.update(|refresh| *refresh += 1);
                     window()
                         .unwrap()
                         .alert_with_message("Machine updated successfully!")
@@ -319,12 +521,182 @@ pub fn MachineDetailPage() -> impl IntoView {
         });
     };
 
+    let rotate_setup = move |_| {
+        if setup_loading.get() {
+            return;
+        }
+        let status = shutdown_setup.get().map(|setup| setup.status);
+        if status == Some(ShutdownSetupStatus::Verified) {
+            let confirmed = window()
+                .and_then(|window| {
+                    window
+                        .confirm_with_message(
+                            "Generate a new shutdown key? The current client will stop authenticating until the new command is run.",
+                        )
+                        .ok()
+                })
+                .unwrap_or(false);
+            if !confirmed {
+                return;
+            }
+        }
+
+        let mac = mac();
+        set_setup_loading.set(true);
+        leptos::task::spawn_local(async move {
+            match rotate_shutdown_key(&mac).await {
+                Ok(setup) => {
+                    set_shutdown_setup.set(Some(setup));
+                    set_shutdown_setup_refresh.update(|refresh| *refresh += 1);
+                }
+                Err(message) => {
+                    if let Some(window) = window() {
+                        let _ = window.alert_with_message(&rotation_failure_message(&message));
+                    }
+                }
+            }
+            set_setup_loading.set(false);
+        });
+    };
+
     view! {
         <div class="page-stack">
             <a class="back-link" href="/">
                 <span aria-hidden="true">"←"</span>
                 <span>"Back to dashboard"</span>
             </a>
+
+            <Show
+                when=move || {
+                    shutdown_setup
+                        .get()
+                        .map(|setup| setup.status != ShutdownSetupStatus::Disabled)
+                        .unwrap_or(false)
+                }
+                fallback=|| view! { <></> }
+            >
+                <div class="card">
+                    <header class="card-header">
+                        <h3 class="card-title">
+                            {move || {
+                                let needs_setup = shutdown_setup
+                                    .get()
+                                    .map(|setup| {
+                                        setup.unix_command.is_some()
+                                            || setup.windows_command.is_some()
+                                    })
+                                    .unwrap_or(false);
+                                if needs_setup {
+                                    "Finish setting up your client server"
+                                } else {
+                                    "Secure remote shutdown"
+                                }
+                            }}
+                        </h3>
+                        <p class="card-subtitle">
+                            {move || {
+                                shutdown_setup
+                                    .get()
+                                    .map(|setup| shutdown_setup_message(setup.status))
+                                    .unwrap_or_default()
+                            }}
+                        </p>
+                    </header>
+
+                    <Show
+                        when=move || {
+                            shutdown_setup
+                                .get()
+                                .map(|setup| {
+                                    setup.unix_command.is_some()
+                                        || setup.windows_command.is_some()
+                                })
+                                .unwrap_or(false)
+                        }
+                        fallback=|| view! { <></> }
+                    >
+                        <div class="setup-platform">
+                            <h4 class="setup-platform__title">"Linux / macOS"</h4>
+                            <SetupCommandStep
+                                label="1. Install Wakezilla"
+                                command=UNIX_INSTALL_COMMAND.to_string()
+                            />
+                            {move || {
+                                shutdown_setup
+                                    .get()
+                                    .and_then(|setup| setup.unix_command)
+                                    .map(|command| {
+                                        view! {
+                                            <SetupCommandStep
+                                                label="2. Configure the client server"
+                                                command=command
+                                            />
+                                        }
+                                    })
+                            }}
+                        </div>
+
+                        <div class="setup-platform">
+                            <h4 class="setup-platform__title">
+                                "Windows (Administrator terminal)"
+                            </h4>
+                            <SetupCommandStep
+                                label="1. Install Wakezilla"
+                                command=WINDOWS_INSTALL_COMMAND.to_string()
+                            />
+                            {move || {
+                                shutdown_setup
+                                    .get()
+                                    .and_then(|setup| setup.windows_command)
+                                    .map(|command| {
+                                        view! {
+                                            <SetupCommandStep
+                                                label="2. Configure the client server"
+                                                command=command
+                                            />
+                                        }
+                                    })
+                            }}
+                        </div>
+                    </Show>
+
+                    <Show
+                        when=move || {
+                            shutdown_setup
+                                .get()
+                                .map(|setup| {
+                                    matches!(
+                                        setup.status,
+                                        ShutdownSetupStatus::Legacy | ShutdownSetupStatus::Verified
+                                    )
+                                })
+                                .unwrap_or(false)
+                        }
+                        fallback=|| view! { <></> }
+                    >
+                        <div class="actions-row">
+                            <button
+                                type="button"
+                                class="btn btn-soft"
+                                disabled=move || setup_loading.get()
+                                on:click=rotate_setup
+                            >
+                                {move || {
+                                    if setup_loading.get() {
+                                        "Generating..."
+                                    } else if shutdown_setup.get().map(|setup| setup.status)
+                                        == Some(ShutdownSetupStatus::Legacy)
+                                    {
+                                        "Secure now"
+                                    } else {
+                                        "Reconfigure security"
+                                    }
+                                }}
+                            </button>
+                        </div>
+                    </Show>
+                </div>
+            </Show>
 
             <div class="card">
                 <header class="card-header">
@@ -662,20 +1034,29 @@ pub fn MachineDetailPage() -> impl IntoView {
                     >
                         {move || if wake_loading.get() { "Waking..." } else { "Wake machine" }}
                     </button>
-                    <button
-                        type="button"
-                        class="btn btn-danger"
-                        on:click=trigger_turn_off
-                        disabled=move || turn_off_loading.get() || !can_turn_off_machine.get()
+                    <Show
+                        when=move || {
+                            shutdown_control_is_visible(
+                                shutdown_setup.get().map(|setup| setup.status),
+                            )
+                        }
+                        fallback=|| view! { <></> }
                     >
-                        {move || {
-                            if turn_off_loading.get() {
-                                "Turning off..."
-                            } else {
-                                "Turn off machine"
-                            }
-                        }}
-                    </button>
+                        <button
+                            type="button"
+                            class="btn btn-danger"
+                            on:click=trigger_turn_off
+                            disabled=move || turn_off_loading.get() || !can_turn_off_machine.get()
+                        >
+                            {move || {
+                                if turn_off_loading.get() {
+                                    "Turning off..."
+                                } else {
+                                    "Turn off machine"
+                                }
+                            }}
+                        </button>
+                    </Show>
                 </div>
                 {move || {
                     if let Some((success, message)) = wake_feedback.get() {
@@ -707,7 +1088,14 @@ pub fn MachineDetailPage() -> impl IntoView {
                         view! { <p class=class>{empty}</p> }
                     }
                 }}
-                <Show when=move || !can_turn_off_machine.get() fallback=|| view! { <></> }>
+                <Show
+                    when=move || {
+                        shutdown_control_is_visible(
+                            shutdown_setup.get().map(|setup| setup.status),
+                        ) && !can_turn_off_machine.get()
+                    }
+                    fallback=|| view! { <></> }
+                >
                     <p class="field-help">
                         "Configure a remote shutdown port on the machine to activate this action."
                     </p>
@@ -759,17 +1147,20 @@ pub fn MachineDetailPage() -> impl IntoView {
                 <canvas id="usage-chart"></canvas>
             </div>
 
-            <div class="card">
-                <header class="card-header">
-                    <h3 class="card-title">"Raw machine data"</h3>
-                    <p class="card-subtitle">"Debug snapshot of the API payload."</p>
-                </header>
-                <pre class="code-block">
-                    {move || {
-                        serde_json::to_string_pretty(&machine_details.get()).unwrap_or_default()
-                    }}
-                </pre>
-            </div>
+            <Show when=raw_machine_data_is_visible fallback=|| view! { <></> }>
+                <div class="card">
+                    <header class="card-header">
+                        <h3 class="card-title">"Raw machine data"</h3>
+                        <p class="card-subtitle">"Debug snapshot of the API payload."</p>
+                    </header>
+                    <pre class="code-block">
+                        {move || {
+                            serde_json::to_string_pretty(&machine_details.get())
+                                .unwrap_or_default()
+                        }}
+                    </pre>
+                </div>
+            </Show>
         </div>
     }
 }
@@ -802,5 +1193,73 @@ mod tests {
         assert_eq!(labels, vec!["2024-W01", "2024-W02"]);
         assert_eq!(datasets[0]["label"], serde_json::json!("ssh"));
         assert_eq!(datasets[0]["data"], serde_json::json!([2, 1]));
+    }
+
+    #[test]
+    fn shutdown_setup_message_explains_key_mismatch() {
+        assert_eq!(
+            shutdown_setup_message(ShutdownSetupStatus::KeyMismatch),
+            "The client responded, but its key does not match. Run the setup command again."
+        );
+    }
+
+    #[test]
+    fn shutdown_control_is_visible_only_for_configured_clients() {
+        assert!(shutdown_control_is_visible(Some(
+            ShutdownSetupStatus::Legacy
+        )));
+        assert!(shutdown_control_is_visible(Some(
+            ShutdownSetupStatus::Verified
+        )));
+
+        for status in [
+            None,
+            Some(ShutdownSetupStatus::Disabled),
+            Some(ShutdownSetupStatus::Pending),
+            Some(ShutdownSetupStatus::Unreachable),
+            Some(ShutdownSetupStatus::KeyMismatch),
+        ] {
+            assert!(!shutdown_control_is_visible(status));
+        }
+    }
+
+    #[test]
+    fn copy_feedback_uses_clear_button_labels() {
+        assert_eq!(CopyFeedback::Idle.label(), "Copy command");
+        assert_eq!(CopyFeedback::Copying.label(), "Copying...");
+        assert_eq!(CopyFeedback::Copied.label(), "Copied!");
+        assert_eq!(CopyFeedback::Failed.label(), "Copy failed");
+    }
+
+    #[test]
+    fn copy_feedback_uses_visual_status_classes() {
+        assert_eq!(CopyFeedback::Idle.button_class(), "btn btn-soft btn-sm");
+        assert_eq!(CopyFeedback::Copying.button_class(), "btn btn-soft btn-sm");
+        assert_eq!(
+            CopyFeedback::Copied.button_class(),
+            "btn btn-success btn-sm"
+        );
+        assert_eq!(CopyFeedback::Failed.button_class(), "btn btn-danger btn-sm");
+    }
+
+    #[test]
+    fn raw_machine_data_visibility_matches_the_build_profile() {
+        assert_eq!(raw_machine_data_is_visible(), cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn shutdown_poll_backoff_resets_after_success_and_is_capped() {
+        assert_eq!(next_shutdown_poll_delay(3_000, false), 6_000);
+        assert_eq!(next_shutdown_poll_delay(24_000, false), 30_000);
+        assert_eq!(next_shutdown_poll_delay(30_000, false), 30_000);
+        assert_eq!(next_shutdown_poll_delay(30_000, true), 3_000);
+    }
+
+    #[test]
+    fn rotation_failure_message_includes_the_backend_error() {
+        assert_eq!(
+            rotation_failure_message("disk full"),
+            "Failed to rotate shutdown key: disk full"
+        );
     }
 }

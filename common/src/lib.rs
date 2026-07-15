@@ -1,5 +1,25 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownSetupStatus {
+    Disabled,
+    Legacy,
+    Pending,
+    Verified,
+    Unreachable,
+    KeyMismatch,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ShutdownSetup {
+    pub status: ShutdownSetupStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unix_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub windows_command: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PortForward {
     pub name: Option<String>,

@@ -7,6 +7,7 @@ pub mod proxy_server;
 pub mod scanner;
 pub mod service;
 pub mod setup;
+pub mod shutdown_auth;
 pub mod system;
 pub mod tray;
 pub mod update;
