@@ -179,6 +179,10 @@ fn shutdown_control_is_visible(status: Option<ShutdownSetupStatus>) -> bool {
     )
 }
 
+const fn raw_machine_data_is_visible() -> bool {
+    cfg!(debug_assertions)
+}
+
 async fn monitor_shutdown_setup(
     mac: String,
     set_shutdown_setup: WriteSignal<Option<ShutdownSetup>>,
@@ -1114,17 +1118,20 @@ pub fn MachineDetailPage() -> impl IntoView {
                 <canvas id="usage-chart"></canvas>
             </div>
 
-            <div class="card">
-                <header class="card-header">
-                    <h3 class="card-title">"Raw machine data"</h3>
-                    <p class="card-subtitle">"Debug snapshot of the API payload."</p>
-                </header>
-                <pre class="code-block">
-                    {move || {
-                        serde_json::to_string_pretty(&machine_details.get()).unwrap_or_default()
-                    }}
-                </pre>
-            </div>
+            <Show when=raw_machine_data_is_visible fallback=|| view! { <></> }>
+                <div class="card">
+                    <header class="card-header">
+                        <h3 class="card-title">"Raw machine data"</h3>
+                        <p class="card-subtitle">"Debug snapshot of the API payload."</p>
+                    </header>
+                    <pre class="code-block">
+                        {move || {
+                            serde_json::to_string_pretty(&machine_details.get())
+                                .unwrap_or_default()
+                        }}
+                    </pre>
+                </div>
+            </Show>
         </div>
     }
 }
@@ -1204,5 +1211,10 @@ mod tests {
             "btn btn-success btn-sm"
         );
         assert_eq!(CopyFeedback::Failed.button_class(), "btn btn-danger btn-sm");
+    }
+
+    #[test]
+    fn raw_machine_data_visibility_matches_the_build_profile() {
+        assert_eq!(raw_machine_data_is_visible(), cfg!(debug_assertions));
     }
 }
