@@ -20,6 +20,7 @@ use crate::api::get_access_history;
 use crate::models::AccessHistory;
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
 
 #[wasm_bindgen(inline_js = r#"
 export function render_usage_chart(canvas_id, labels_json, datasets_json) {
@@ -44,22 +45,85 @@ export function render_usage_chart(canvas_id, labels_json, datasets_json) {
         }
     });
 }
-export function copy_to_clipboard(value) {
-    if (navigator.clipboard) { navigator.clipboard.writeText(value); }
+export async function copy_to_clipboard(value) {
+    if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(value);
+        return;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+
+    try {
+        if (!document.execCommand('copy')) {
+            throw new Error('copy command was rejected');
+        }
+    } finally {
+        document.body.removeChild(textarea);
+    }
 }
 "#)]
 extern "C" {
     fn render_usage_chart(canvas_id: &str, labels_json: &str, datasets_json: &str);
-    fn copy_to_clipboard(value: &str);
+    fn copy_to_clipboard(value: &str) -> js_sys::Promise;
 }
 
 const UNIX_INSTALL_COMMAND: &str = "curl -fsSL https://wakezilla.dev/install.sh | sh";
 const WINDOWS_INSTALL_COMMAND: &str = "irm https://wakezilla.dev/install.ps1 | iex";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyFeedback {
+    Idle,
+    Copying,
+    Copied,
+    Failed,
+}
+
+impl CopyFeedback {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Copy command",
+            Self::Copying => "Copying...",
+            Self::Copied => "Copied!",
+            Self::Failed => "Copy failed",
+        }
+    }
+
+    fn button_class(self) -> &'static str {
+        match self {
+            Self::Idle | Self::Copying => "btn btn-soft btn-sm",
+            Self::Copied => "btn btn-success btn-sm",
+            Self::Failed => "btn btn-danger btn-sm",
+        }
+    }
+}
+
 #[component]
 fn SetupCommandStep(label: &'static str, command: String) -> impl IntoView {
     let command_to_copy = command.clone();
     let copy_label = format!("Copy {label}");
+    let (copy_feedback, set_copy_feedback) = signal(CopyFeedback::Idle);
+
+    let copy_command = move |_| {
+        let command = command_to_copy.clone();
+        set_copy_feedback.set(CopyFeedback::Copying);
+
+        leptos::task::spawn_local(async move {
+            let feedback = if JsFuture::from(copy_to_clipboard(&command)).await.is_ok() {
+                CopyFeedback::Copied
+            } else {
+                CopyFeedback::Failed
+            };
+            set_copy_feedback.set(feedback);
+            gloo_timers::future::TimeoutFuture::new(2_000).await;
+            set_copy_feedback.set(CopyFeedback::Idle);
+        });
+    };
 
     view! {
         <div class="setup-command">
@@ -67,12 +131,20 @@ fn SetupCommandStep(label: &'static str, command: String) -> impl IntoView {
                 <strong>{label}</strong>
                 <button
                     type="button"
-                    class="btn btn-soft btn-sm"
+                    class=move || copy_feedback.get().button_class()
                     aria-label=copy_label
-                    on:click=move |_| copy_to_clipboard(&command_to_copy)
+                    disabled=move || copy_feedback.get() != CopyFeedback::Idle
+                    on:click=copy_command
                 >
-                    "Copy command"
+                    {move || copy_feedback.get().label()}
                 </button>
+                <span class="sr-only" aria-live="polite">
+                    {move || match copy_feedback.get() {
+                        CopyFeedback::Copied => "Command copied to clipboard",
+                        CopyFeedback::Failed => "Could not copy command",
+                        CopyFeedback::Idle | CopyFeedback::Copying => "",
+                    }}
+                </span>
             </div>
             <pre class="code-block">{command}</pre>
         </div>
@@ -1113,5 +1185,24 @@ mod tests {
         ] {
             assert!(!shutdown_control_is_visible(status));
         }
+    }
+
+    #[test]
+    fn copy_feedback_uses_clear_button_labels() {
+        assert_eq!(CopyFeedback::Idle.label(), "Copy command");
+        assert_eq!(CopyFeedback::Copying.label(), "Copying...");
+        assert_eq!(CopyFeedback::Copied.label(), "Copied!");
+        assert_eq!(CopyFeedback::Failed.label(), "Copy failed");
+    }
+
+    #[test]
+    fn copy_feedback_uses_visual_status_classes() {
+        assert_eq!(CopyFeedback::Idle.button_class(), "btn btn-soft btn-sm");
+        assert_eq!(CopyFeedback::Copying.button_class(), "btn btn-soft btn-sm");
+        assert_eq!(
+            CopyFeedback::Copied.button_class(),
+            "btn btn-success btn-sm"
+        );
+        assert_eq!(CopyFeedback::Failed.button_class(), "btn btn-danger btn-sm");
     }
 }

@@ -5892,6 +5892,7 @@ dependencies = [
  "futures 0.3.31",
  "gloo-net",
  "gloo-timers",
+ "js-sys",
  "leptos",
  "leptos_meta",
  "leptos_router",
@@ -5902,6 +5903,7 @@ dependencies = [
  "uuid",
  "wakezilla-common",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
