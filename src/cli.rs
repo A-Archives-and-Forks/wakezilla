@@ -47,14 +47,17 @@ pub struct SendArgs {
 #[derive(Parser, Debug)]
 #[command()]
 pub struct ServeArgs {
-    /// Port to listen on for the web server
-    #[arg(
-        short,
-        long,
-        default_value_t = 3000,
-        help_heading = "Proxy Server Options"
-    )]
-    pub port: u16,
+    /// Port to listen on, overriding the configured proxy port
+    #[arg(short, long, help_heading = "Proxy Server Options")]
+    pub port: Option<u16>,
+}
+
+impl ServeArgs {
+    pub fn apply_to_config(&self, config: &mut config::Config) {
+        if let Some(port) = self.port {
+            config.server.proxy_port = port;
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -203,6 +206,36 @@ pub async fn handle_send_command(args: SendArgs, config: &config::Config) -> Res
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn proxy_port_argument_overrides_the_loaded_configuration() {
+        let cli = Cli::try_parse_from(["wakezilla", "proxy-server", "--port", "3002"])
+            .expect("proxy port parses");
+        let Commands::ProxyServer(args) = cli.command else {
+            panic!("expected ProxyServer command");
+        };
+        let mut config = config::Config::default();
+        config.server.proxy_port = 4000;
+
+        args.apply_to_config(&mut config);
+
+        assert_eq!(config.server.proxy_port, 3002);
+    }
+
+    #[test]
+    fn omitted_proxy_port_preserves_the_loaded_configuration() {
+        let cli =
+            Cli::try_parse_from(["wakezilla", "proxy-server"]).expect("proxy subcommand parses");
+        let Commands::ProxyServer(args) = cli.command else {
+            panic!("expected ProxyServer command");
+        };
+        let mut config = config::Config::default();
+        config.server.proxy_port = 4000;
+
+        args.apply_to_config(&mut config);
+
+        assert_eq!(config.server.proxy_port, 4000);
+    }
 
     #[test]
     fn cli_accepts_tui_subcommand_with_default_api_url() {
