@@ -1401,11 +1401,130 @@ code {
     padding: 0 1.5rem 1.5rem;
 }
 
+.access-chart__header {
+    flex-direction: row;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.access-chart__header .card-title,
+.access-chart__header .card-subtitle {
+    margin: 0;
+}
+
+.access-chart__display,
+.access-chart__group {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    color: #475569;
+    font-size: 0.88rem;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.access-chart__select {
+    width: auto;
+    min-width: 7.5rem;
+    padding: 0.55rem 2.2rem 0.55rem 0.75rem;
+    border-radius: 8px;
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: #334155;
+    background-color: #f1f5f9;
+}
+
+.access-chart__toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.access-chart__segments {
+    display: inline-flex;
+    padding: 0.2rem;
+    border: 1px solid var(--color-border);
+    border-radius: 10px;
+    background: #f8fafc;
+}
+
+.access-chart__segments .btn {
+    width: auto;
+    min-height: auto;
+    border-radius: 8px;
+    padding: 0.42rem 0.75rem;
+    box-shadow: none;
+    transform: none;
+}
+
+.access-chart__plot {
+    position: relative;
+    width: 100%;
+    height: clamp(320px, 42vw, 430px);
+    min-height: 320px;
+    overflow: hidden;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    background: #fff;
+}
+
+.access-chart__plot canvas {
+    display: block;
+}
+
+.access-chart__empty {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    margin: 0;
+    color: var(--color-muted);
+    background: rgba(255, 255, 255, 0.92);
+    font-size: 0.95rem;
+}
+
 @media (max-width: 640px) {
     .table-card .card-header {
         padding: 1rem 1rem 0.6rem;
     }
     .table-card .table-container {
         padding: 0 1rem 1rem;
+    }
+
+    .access-chart__header,
+    .access-chart__toolbar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .access-chart__display {
+        justify-content: space-between;
+    }
+
+    .access-chart__select {
+        width: min(100%, 10rem);
+    }
+
+    .access-chart__group {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .access-chart__segments {
+        width: 100%;
+    }
+
+    .access-chart__segments .btn {
+        flex: 1;
+    }
+
+    .access-chart__refresh {
+        width: 100%;
+    }
+
+    .access-chart__plot {
+        height: 320px;
     }
 }
