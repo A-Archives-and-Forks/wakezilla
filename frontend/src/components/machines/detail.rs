@@ -23,25 +23,55 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 #[wasm_bindgen(inline_js = r#"
-export function render_usage_chart(canvas_id, labels_json, datasets_json) {
+export function render_usage_chart(canvas_id, labels_json, datasets_json, stacked) {
     if (typeof window.Chart === 'undefined') { return; }
     const el = document.getElementById(canvas_id);
     if (!el) { return; }
     const labels = JSON.parse(labels_json);
     const datasets = JSON.parse(datasets_json);
-    const palette = ['#2563eb','#16a34a','#dc2626','#d97706','#7c3aed','#0891b2','#db2777'];
+
+    // ColorBrewer's RdBu palette, also used by the crates.io downloads chart.
+    const borderColors = ['#67001f','#b2182b','#d6604d','#f4a582','#92c5de','#4393c3','#2166ac','#053061'];
+    const backgroundColors = ['#d3b5bc','#eabdc0','#f3d0ca','#fce4d9','#deedf5','#c9deed','#a6cbe2','#8ab8d6'];
     datasets.forEach((d, i) => {
-        d.backgroundColor = palette[i % palette.length];
-        d.borderColor = palette[i % palette.length];
+        d.backgroundColor = backgroundColors[i % backgroundColors.length];
+        d.borderColor = borderColors[i % borderColors.length];
+        d.borderWidth = 2;
+        d.cubicInterpolationMode = 'monotone';
+        d.fill = stacked ? 'origin' : false;
+        d.pointRadius = 2.5;
+        d.pointHoverBorderWidth = 2;
+        d.pointHoverRadius = 5;
     });
     if (el._chart) { el._chart.destroy(); }
     el._chart = new window.Chart(el, {
-        type: 'bar',
+        type: 'line',
         data: { labels: labels, datasets: datasets },
         options: {
             responsive: true,
-            scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
-            plugins: { legend: { position: 'bottom' } }
+            maintainAspectRatio: false,
+            color: '#64748b',
+            layout: { padding: 10 },
+            scales: {
+                x: {
+                    ticks: { maxTicksLimit: 13, color: '#64748b' },
+                    grid: { color: 'rgba(15, 23, 42, 0.08)' }
+                },
+                y: {
+                    beginAtZero: true,
+                    stacked: stacked,
+                    ticks: { precision: 0, color: '#64748b' },
+                    grid: { color: 'rgba(15, 23, 42, 0.08)' }
+                }
+            },
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: { boxWidth: 38, padding: 14 }
+                },
+                tooltip: { position: 'nearest' }
+            }
         }
     });
 }
@@ -69,7 +99,7 @@ export async function copy_to_clipboard(value) {
 }
 "#)]
 extern "C" {
-    fn render_usage_chart(canvas_id: &str, labels_json: &str, datasets_json: &str);
+    fn render_usage_chart(canvas_id: &str, labels_json: &str, datasets_json: &str, stacked: bool);
     fn copy_to_clipboard(value: &str) -> js_sys::Promise;
 }
 
@@ -346,13 +376,19 @@ pub fn MachineDetailPage() -> impl IntoView {
     });
 
     let (history_bucket, set_history_bucket) = signal(AccessHistoryBucket::Day);
+    let (history_stacked, set_history_stacked) = signal(true);
 
     Effect::new(move || {
         if let Some(history) = access_history.get() {
             let (labels, datasets) = bucket_history(&history, history_bucket.get());
             let labels_json = serde_json::to_string(&labels).unwrap_or_else(|_| "[]".into());
             let datasets_json = serde_json::to_string(&datasets).unwrap_or_else(|_| "[]".into());
-            render_usage_chart("usage-chart", &labels_json, &datasets_json);
+            render_usage_chart(
+                "usage-chart",
+                &labels_json,
+                &datasets_json,
+                history_stacked.get(),
+            );
         }
     });
 
@@ -1102,49 +1138,105 @@ pub fn MachineDetailPage() -> impl IntoView {
                 </Show>
             </div>
 
-            <div class="card">
-                <header class="card-header">
-                    <h3 class="card-title">"Access history"</h3>
-                    <p class="card-subtitle">"Connections per service over time."</p>
+            <div class="card access-chart">
+                <header class="card-header access-chart__header">
+                    <div>
+                        <h3 class="card-title">"Access history"</h3>
+                        <p class="card-subtitle">"Connections per service over time."</p>
+                    </div>
+                    <label class="access-chart__display" for="access-chart-display">
+                        <span>"Display as"</span>
+                        <select
+                            id="access-chart-display"
+                            class="access-chart__select"
+                            on:change:target=move |ev| {
+                                set_history_stacked.set(ev.target().value() == "stacked");
+                            }
+                            prop:value=move || {
+                                if history_stacked.get() { "stacked" } else { "unstacked" }
+                            }
+                        >
+                            <option value="stacked">"Stacked"</option>
+                            <option value="unstacked">"Unstacked"</option>
+                        </select>
+                    </label>
                 </header>
-                <div class="actions-row">
+                <div class="access-chart__toolbar">
+                    <div class="access-chart__group">
+                        <span id="access-chart-group-label" class="access-chart__control-label">
+                            "Group by"
+                        </span>
+                        <div
+                            class="access-chart__segments"
+                            role="group"
+                            aria-labelledby="access-chart-group-label"
+                        >
+                            <button
+                                type="button"
+                                class=move || {
+                                    if history_bucket.get() == AccessHistoryBucket::Hour { "btn btn-primary btn-sm" } else { "btn btn-soft btn-sm" }
+                                }
+                                aria-pressed=move || history_bucket.get() == AccessHistoryBucket::Hour
+                                on:click=move |_| set_history_bucket.set(AccessHistoryBucket::Hour)
+                            >
+                                "Hour"
+                            </button>
+                            <button
+                                type="button"
+                                class=move || {
+                                    if history_bucket.get() == AccessHistoryBucket::Day { "btn btn-primary btn-sm" } else { "btn btn-soft btn-sm" }
+                                }
+                                aria-pressed=move || history_bucket.get() == AccessHistoryBucket::Day
+                                on:click=move |_| set_history_bucket.set(AccessHistoryBucket::Day)
+                            >
+                                "Day"
+                            </button>
+                            <button
+                                type="button"
+                                class=move || {
+                                    if history_bucket.get() == AccessHistoryBucket::Week { "btn btn-primary btn-sm" } else { "btn btn-soft btn-sm" }
+                                }
+                                aria-pressed=move || history_bucket.get() == AccessHistoryBucket::Week
+                                on:click=move |_| set_history_bucket.set(AccessHistoryBucket::Week)
+                            >
+                                "Week"
+                            </button>
+                        </div>
+                    </div>
                     <button
                         type="button"
-                        class=move || {
-                            if history_bucket.get() == AccessHistoryBucket::Day { "btn btn-primary btn-sm" } else { "btn btn-soft btn-sm" }
-                        }
-                        on:click=move |_| set_history_bucket.set(AccessHistoryBucket::Day)
-                    >
-                        "By day"
-                    </button>
-                    <button
-                        type="button"
-                        class=move || {
-                            if history_bucket.get() == AccessHistoryBucket::Week { "btn btn-primary btn-sm" } else { "btn btn-soft btn-sm" }
-                        }
-                        on:click=move |_| set_history_bucket.set(AccessHistoryBucket::Week)
-                    >
-                        "By week"
-                    </button>
-                    <button
-                        type="button"
-                        class=move || {
-                            if history_bucket.get() == AccessHistoryBucket::Hour { "btn btn-primary btn-sm" } else { "btn btn-soft btn-sm" }
-                        }
-                        on:click=move |_| set_history_bucket.set(AccessHistoryBucket::Hour)
-                    >
-                        "By hour"
-                    </button>
-                    <button
-                        type="button"
-                        class="btn btn-soft btn-sm"
+                        class="btn btn-soft btn-sm access-chart__refresh"
                         disabled=move || history_loading.get()
                         on:click=move |_| set_history_refresh.update(|n| *n += 1)
                     >
                         {move || if history_loading.get() { "Refreshing..." } else { "Refresh" }}
                     </button>
                 </div>
-                <canvas id="usage-chart"></canvas>
+                <div class="access-chart__plot">
+                    <canvas
+                        id="usage-chart"
+                        role="img"
+                        aria-label="Accesses over time, grouped by service"
+                    >
+                        "Accesses over time, grouped by service."
+                    </canvas>
+                    <Show
+                        when=move || {
+                            !history_loading.get()
+                                && access_history
+                                    .get()
+                                    .is_some_and(|history| {
+                                        history
+                                            .services
+                                            .iter()
+                                            .all(|service| service.timestamps.is_empty())
+                                    })
+                        }
+                        fallback=|| view! { <></> }
+                    >
+                        <p class="access-chart__empty">"No access records yet."</p>
+                    </Show>
+                </div>
             </div>
 
             <Show when=raw_machine_data_is_visible fallback=|| view! { <></> }>

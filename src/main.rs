@@ -56,8 +56,9 @@ async fn main() -> Result<()> {
             log_config(&config);
             handle_send_command(args, &config).await?;
         }
-        Commands::ProxyServer(_args) => {
-            let config = config::Config::load();
+        Commands::ProxyServer(args) => {
+            let mut config = config::Config::load();
+            args.apply_to_config(&mut config);
             log_config(&config);
             if let Err(e) = proxy_server::start(config.clone()).await {
                 error!("Proxy server error: {}", e);
