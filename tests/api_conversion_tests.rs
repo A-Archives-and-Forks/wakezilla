@@ -19,6 +19,7 @@ fn machine_maps_to_api_shape() {
         ip: "192.168.1.10".parse().unwrap(),
         name: "Desktop".into(),
         description: None,
+        machine_type: Default::default(),
         turn_off_port: Some(3001),
         can_be_turned_off: true,
         shutdown_auth_key: Some(wakezilla::shutdown_auth::generate_key()),

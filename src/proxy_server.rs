@@ -1,8 +1,8 @@
 use anyhow::Result;
 use axum::{
     body::Body,
-    extract::{Json as JsonExtract, Path, Query, State},
-    http::{header, Method, Request, Response, StatusCode},
+    extract::{Host, Json as JsonExtract, Path, Query, State},
+    http::{header, uri::Authority, Method, Request, Response, StatusCode},
     response::{IntoResponse, Json, Redirect},
     routing::{delete, get, post, put},
     Router,
@@ -131,11 +131,24 @@ fn asset_response(path: &str) -> Response<Body> {
     not_found()
 }
 
-async fn serve_index() -> Response<Body> {
-    // if debug build, redirect to vite dev server (localhost:3000)
+fn development_server_url(request_host: &str) -> String {
+    let hostname = request_host
+        .parse::<Authority>()
+        .map(|authority| authority.host().to_owned())
+        .unwrap_or_else(|_| "localhost".to_owned());
+    let hostname = if hostname.contains(':') && !hostname.starts_with('[') {
+        format!("[{hostname}]")
+    } else {
+        hostname
+    };
+    format!("http://{hostname}:8080")
+}
+
+async fn serve_index(Host(host): Host) -> Response<Body> {
     if cfg!(debug_assertions) {
-        return Redirect::to("http://localhost:8080").into_response();
+        return Redirect::to(&development_server_url(&host)).into_response();
     }
+
     asset_response("")
 }
 
@@ -451,7 +464,17 @@ async fn is_machine_on_api(
         return Err(axum::http::StatusCode::NOT_FOUND);
     };
 
-    match reqwest::get(&url).await {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(
+            state.config.server.health_timeout_secs.max(1),
+        ))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    match client.get(&url).send().await {
         Ok(res) => {
             if res.status() == 200 {
                 Ok((
@@ -467,7 +490,10 @@ async fn is_machine_on_api(
         }
         Err(e) => {
             info!("Network error for machine {}: {}", machine_name, e);
-            Err(axum::http::StatusCode::NOT_FOUND)
+            Ok((
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({ "is_on": false })),
+            ))
         }
     }
 }
@@ -489,6 +515,71 @@ async fn list_interfaces_handler() -> impl IntoResponse {
             error!("Failed to list interfaces: {}", e);
             Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
         }
+    }
+}
+
+fn validate_machine_config(
+    machine: &wakezilla_common::Machine,
+    machines: &[web::Machine],
+    replacing: Option<&str>,
+) -> Result<(), HashMap<String, Vec<String>>> {
+    let mut errors = HashMap::new();
+    if machine.name.trim().is_empty() {
+        errors.insert("name".into(), vec!["Name is required".into()]);
+    }
+    if machine.ip.parse::<std::net::Ipv4Addr>().is_err() {
+        errors.insert("ip".into(), vec!["Invalid IPv4 address".into()]);
+    }
+    if web::validate_mac(&machine.mac).is_err() {
+        errors.insert("mac".into(), vec!["Invalid MAC address".into()]);
+    }
+    if machine.turn_off_port == Some(0)
+        || (machine.can_be_turned_off && machine.turn_off_port.is_none())
+    {
+        errors.insert(
+            "turn_off_port".into(),
+            vec!["A client port between 1 and 65535 is required".into()],
+        );
+    }
+    let mut ports = std::collections::HashSet::new();
+    for service in &machine.port_forwards {
+        if service.local_port == 0 || service.target_port == 0 || !ports.insert(service.local_port)
+        {
+            errors.insert(
+                "port_forwards".into(),
+                vec!["Use valid, unique local ports and valid target ports".into()],
+            );
+        }
+    }
+    for existing in machines
+        .iter()
+        .filter(|existing| Some(existing.mac.as_str()) != replacing)
+    {
+        if existing
+            .mac
+            .replace('-', ":")
+            .eq_ignore_ascii_case(&machine.mac.replace('-', ":"))
+        {
+            errors.insert(
+                "mac".into(),
+                vec!["This MAC address is already registered".into()],
+            );
+        }
+        if existing
+            .port_forwards
+            .iter()
+            .any(|service| ports.contains(&service.local_port))
+        {
+            errors.insert(
+                "port_forwards".into(),
+                vec!["A local port is already assigned to another machine".into()],
+            );
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
     }
 }
 
@@ -514,6 +605,7 @@ async fn add_machine_api(
     }
 
     let api_machine = wakezilla_common::Machine {
+        machine_type: payload.machine_type.unwrap_or_default(),
         mac: payload.mac,
         ip: payload.ip,
         name: payload.name,
@@ -541,16 +633,23 @@ async fn add_machine_api(
     }
 
     let mut machines = state.machines.write().await;
-    web::start_proxy_if_configured(&new_machine, &state);
-    machines.push(new_machine);
-
-    if let Err(e) = web::save_machines_with_config(&machines, &state.config) {
+    if let Err(errors) = validate_machine_config(&api_machine, &machines, None) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "errors": errors })),
+        );
+    }
+    let mut updated = machines.clone();
+    updated.push(new_machine.clone());
+    if let Err(e) = web::save_machines_with_config(&updated, &state.config) {
         error!("Error saving machines: {}", e);
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "Failed to save machines" })),
         );
     }
+    *machines = updated;
+    web::start_proxy_if_configured(&new_machine, &state);
     (
         axum::http::StatusCode::CREATED,
         Json(serde_json::json!({ "status": "Machine added" })),
@@ -628,21 +727,16 @@ async fn update_machine_api(
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
     let mut machines = state.machines.write().await;
 
-    // check if the machine exists
-    let exists = machines.iter().any(|m| m.mac == mac);
-    if !exists {
-        return Err((
-            axum::http::StatusCode::NOT_FOUND,
+    let index = machines.iter().position(|m| m.mac == mac).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Machine not found" })),
-        ));
-    }
-    // Find the old machine to get its IP for stopping proxies
-    let old_machine = machines.iter().find(|m| m.mac == mac).cloned();
-
-    // remove the machine to update
-    machines.retain(|m| m.mac != mac);
+        )
+    })?;
+    let old_machine = machines[index].clone();
 
     let api_machine = wakezilla_common::Machine {
+        machine_type: payload.machine_type.unwrap_or(old_machine.machine_type),
         mac: payload.mac.clone(),
         ip: payload.ip.clone(),
         name: payload.name.clone(),
@@ -654,6 +748,12 @@ async fn update_machine_api(
             .unwrap_or(web::get_default_inactivity_period()),
         port_forwards: payload.port_forwards.clone().unwrap_or_default(),
     };
+    validate_machine_config(&api_machine, &machines, Some(&mac)).map_err(|errors| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "errors": errors })),
+        )
+    })?;
     let mut new_machine = match web::api_machine_to_internal(&api_machine) {
         Ok(machine) => machine,
         Err(err) => {
@@ -665,19 +765,22 @@ async fn update_machine_api(
             ));
         }
     };
-    apply_shutdown_security(old_machine.as_ref(), &mut new_machine);
+    apply_shutdown_security(Some(&old_machine), &mut new_machine);
 
-    machines.push(new_machine.clone());
-    if let Err(e) = web::save_machines_with_config(&machines, &state.config) {
+    let mut updated = machines.clone();
+    updated[index] = new_machine.clone();
+    if let Err(e) = web::save_machines_with_config(&updated, &state.config) {
         error!("Error saving machines: {}", e);
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "Failed to save machines" })),
         ));
     }
+    *machines = updated;
+    state.turn_off_limiter.remove_machine(old_machine.ip);
 
     // Stop old proxies if machine existed
-    if old_machine.is_some() {
+    {
         let mut proxies = state.proxies.write().await;
         let keys_to_stop: Vec<String> = proxies
             .keys()
@@ -709,32 +812,38 @@ async fn delete_machine_api(
     State(state): State<AppState>,
     JsonExtract(payload): JsonExtract<wakezilla_common::DeleteMachinePayload>,
 ) -> impl IntoResponse {
-    // Stop all proxies associated with this machine
-    info!("Deleting machine with MAC: {}", payload.mac);
-    let mut proxies = state.proxies.write().await;
-    proxies.retain(|key, tx| {
-        if key.starts_with(&payload.mac) {
-            if tx.send(false).is_ok() {
-                info!("Sent stop signal to proxy for MAC/key: {}", key);
-            }
-            false // Remove the entry
-        } else {
-            true // Keep the entry
-        }
-    });
-    drop(proxies); // Release the write lock
-
     let mut machines = state.machines.write().await;
-
-    machines.retain(|m| m.mac != payload.mac);
-
-    if let Err(e) = web::save_machines_with_config(&machines, &state.config) {
+    let removed = machines
+        .iter()
+        .find(|machine| machine.mac == payload.mac)
+        .cloned();
+    let updated: Vec<_> = machines
+        .iter()
+        .filter(|machine| machine.mac != payload.mac)
+        .cloned()
+        .collect();
+    if let Err(e) = web::save_machines_with_config(&updated, &state.config) {
         error!("Error saving machines: {}", e);
         return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "Failed to save machines" })),
         );
     }
+    *machines = updated;
+    if let Some(machine) = removed {
+        state.turn_off_limiter.remove_machine(machine.ip);
+    }
+    let mut proxies = state.proxies.write().await;
+    let prefix = format!("{}-", payload.mac);
+    proxies.retain(|key, tx| {
+        if key.starts_with(&prefix) {
+            let _ = tx.send(false);
+            false
+        } else {
+            true
+        }
+    });
+
     (
         axum::http::StatusCode::OK,
         Json(serde_json::json!({ "status": "Machine deleted" })),
@@ -902,6 +1011,7 @@ mod tests {
             ip: Ipv4Addr::new(10, 0, 0, 1),
             name: "Sample".to_string(),
             description: Some("Desc".to_string()),
+            machine_type: Default::default(),
             turn_off_port: Some(8080),
             can_be_turned_off: false,
             shutdown_auth_key: None,
@@ -980,6 +1090,7 @@ mod tests {
             ip: "192.168.1.10".to_string(),
             name: "New machine".to_string(),
             description: Some("Test machine".to_string()),
+            machine_type: Default::default(),
             turn_off_port: Some(8080),
             can_be_turned_off: true,
             inactivity_period: Some(6),
@@ -1173,6 +1284,7 @@ mod tests {
             ip: "not-an-ip".to_string(),
             name: "Bad".to_string(),
             description: None,
+            machine_type: Default::default(),
             turn_off_port: None,
             can_be_turned_off: false,
             inactivity_period: None,
@@ -1280,6 +1392,7 @@ mod tests {
             ip: "10.0.0.2".to_string(),
             name: "Updated".to_string(),
             description: Some("New description".to_string()),
+            machine_type: Default::default(),
             turn_off_port: Some(9090),
             can_be_turned_off: true,
             inactivity_period: Some(12),
@@ -1329,6 +1442,7 @@ mod tests {
             ip: "10.0.0.1".to_string(),
             name: "Renamed".to_string(),
             description: None,
+            machine_type: Default::default(),
             turn_off_port: Some(8080),
             can_be_turned_off: true,
             inactivity_period: Some(30),

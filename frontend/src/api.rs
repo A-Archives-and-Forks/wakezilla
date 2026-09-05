@@ -1,46 +1,18 @@
 use crate::models::{
     AccessHistory, DiscoveredDevice, Machine, NetworkInterface, ShutdownSetup, UpdateMachinePayload,
 };
-use std::sync::LazyLock;
+use gloo_net::http::{Request, Response};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 
-use leptos::leptos_dom::logging::console_log;
-
-use gloo_net::http::Request;
-use web_sys::window;
-
-const DEFAULT_API_PORT: u16 = 3000;
-
-static API_BASE: LazyLock<String> = LazyLock::new(compute_api_base);
-
-// Function to get the API base URL dynamically from the current window location
-fn compute_api_base() -> String {
-    if let Some(window) = window() {
-        let location = window.location();
-        if let (Ok(protocol), Ok(hostname), Ok(port)) =
-            (location.protocol(), location.hostname(), location.port())
-        {
-            // If the client window location does not include a port, do not include one in the API base.
-            if port.is_empty() {
-                format!("{}//{}{}", protocol, hostname, "/api")
-            } else {
-                format!("{}//{}:{}{}", protocol, hostname, DEFAULT_API_PORT, "/api")
-            }
-        } else {
-            // Fallback to default if location properties are not available
-            String::from("http://localhost:3000/api")
-        }
-    } else {
-        String::from("http://localhost:3000/api")
-    }
-}
+const API_BASE: &str = "/api";
 
 fn encode_path_segment(segment: &str) -> String {
     let mut encoded = String::with_capacity(segment.len());
-
     for byte in segment.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char);
+                encoded.push(byte as char)
             }
             _ => {
                 use std::fmt::Write as _;
@@ -48,262 +20,218 @@ fn encode_path_segment(segment: &str) -> String {
             }
         }
     }
-
     encoded
 }
 
+fn machine_url(mac: &str, action: &str) -> String {
+    format!("{API_BASE}/machines/{}{action}", encode_path_segment(mac))
+}
+
+fn response_error(status: u16, body: &Value) -> String {
+    if let Some(errors) = body.get("errors").and_then(Value::as_object) {
+        return errors
+            .iter()
+            .map(|(field, messages)| {
+                let label = match field.as_str() {
+                    "name" => "Name",
+                    "mac" => "MAC address",
+                    "ip" => "IP address",
+                    "turn_off_port" => "Client port",
+                    "port_forwards" => "Services",
+                    _ => field,
+                };
+                let messages = messages
+                    .as_array()
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                format!("{label}: {messages}")
+            })
+            .collect::<Vec<_>>()
+            .join(". ");
+    }
+    body.get("error")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("The operation could not be completed (HTTP {status})."))
+}
+
+async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, String> {
+    let status = response.status();
+    let success = response.ok();
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|_| format!("Invalid server response (HTTP {status})."))?;
+    if !success {
+        return Err(response_error(status, &body));
+    }
+    serde_json::from_value(body).map_err(|_| "The server returned unexpected data.".into())
+}
+
 pub async fn create_machine(machine: Machine) -> Result<(), String> {
-    Request::post(&format!("{}/machines", API_BASE.as_str()))
+    let response = Request::post(&format!("{API_BASE}/machines"))
         .json(&machine)
         .map_err(|e| e.to_string())?
         .send()
         .await
         .map_err(|e| e.to_string())?;
-
-    Ok(())
+    decode_response::<Value>(response).await.map(|_| ())
 }
 
 pub async fn get_details_machine(mac: &str) -> Result<Machine, String> {
-    let mac = encode_path_segment(mac);
-    Request::get(&format!("{}/machines/{}", API_BASE.as_str(), mac))
+    let response = Request::get(&machine_url(mac, ""))
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    decode_response(response).await
 }
 
 pub async fn get_access_history(mac: &str) -> Result<AccessHistory, String> {
-    let mac = encode_path_segment(mac);
-    Request::get(&format!(
-        "{}/machines/{}/access-history",
-        API_BASE.as_str(),
-        mac
-    ))
-    .send()
-    .await
-    .map_err(|e| e.to_string())?
-    .json()
-    .await
-    .map_err(|e| e.to_string())
+    let response = Request::get(&machine_url(mac, "/access-history"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    decode_response(response).await
 }
 
 pub async fn update_machine(mac: &str, payload: &UpdateMachinePayload) -> Result<(), String> {
-    let mac = encode_path_segment(mac);
-    Request::put(&format!("{}/machines/{}", API_BASE.as_str(), mac))
+    let response = Request::put(&machine_url(mac, ""))
         .json(payload)
         .map_err(|e| e.to_string())?
         .send()
         .await
         .map_err(|e| e.to_string())?;
-
-    Ok(())
+    decode_response::<Value>(response).await.map(|_| ())
 }
 
 pub async fn delete_machine(mac: &str) -> Result<(), String> {
-    let payload = serde_json::json!({ "mac": mac });
-    Request::delete(&format!("{}/machines/delete", API_BASE.as_str()))
-        .json(&payload)
+    let response = Request::delete(&format!("{API_BASE}/machines/delete"))
+        .json(&serde_json::json!({"mac":mac}))
         .map_err(|e| e.to_string())?
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    Ok(())
+    decode_response::<Value>(response).await.map(|_| ())
 }
 
 pub async fn fetch_machines() -> Result<Vec<Machine>, String> {
-    Request::get(&format!("{}/machines", API_BASE.as_str()))
+    let response = Request::get(&format!("{API_BASE}/machines"))
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    decode_response(response).await
 }
 
 pub async fn fetch_interfaces() -> Result<Vec<NetworkInterface>, String> {
-    Request::get(&format!("{}/interfaces", API_BASE.as_str()))
+    let response = Request::get(&format!("{API_BASE}/interfaces"))
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    decode_response(response).await
 }
 
 pub async fn fetch_scan_network(device: String) -> Result<Vec<DiscoveredDevice>, String> {
-    let request = Request::get(&format!("{}/scan", API_BASE.as_str()));
+    let request = Request::get(&format!("{API_BASE}/scan"));
     let request = if device.is_empty() {
         request
     } else {
         request.query([("interface", device.as_str())])
     };
-    request
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+    decode_response(request.send().await.map_err(|e| e.to_string())?).await
 }
 
-pub async fn turn_off_machine(mac: &str) -> Result<String, String> {
-    let mac = encode_path_segment(mac);
-    let response = Request::post(&format!(
-        "{}/machines/{}/remote-turn-off",
-        API_BASE.as_str(),
-        mac
-    ))
-    .send()
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let is_success = response.ok();
-    let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    let message = body
-        .get("message")
-        .and_then(|value| value.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| body.to_string());
-
-    if is_success {
-        Ok(message)
-    } else {
-        Err(message)
-    }
-}
-
-pub async fn wake_machine(mac: &str) -> Result<String, String> {
-    let mac = encode_path_segment(mac);
-    let response = Request::post(&format!("{}/machines/{}/wake", API_BASE.as_str(), mac))
+async fn machine_action(mac: &str, action: &str) -> Result<String, String> {
+    let response = Request::post(&machine_url(mac, action))
         .send()
         .await
         .map_err(|e| e.to_string())?;
-
-    let is_success = response.ok();
-    let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    let message = body
+    let body: Value = decode_response(response).await?;
+    Ok(body
         .get("message")
-        .and_then(|value| value.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| body.to_string());
-
-    if is_success {
-        Ok(message)
-    } else {
-        Err(message)
-    }
+        .and_then(Value::as_str)
+        .unwrap_or("Command sent.")
+        .to_owned())
 }
 
-pub async fn is_machine_online(mac: &str) -> bool {
-    let mac = encode_path_segment(mac);
-    let response = Request::get(&format!("{}/machines/{}/is-on", API_BASE.as_str(), mac))
+pub async fn turn_off_machine(mac: &str) -> Result<String, String> {
+    machine_action(mac, "/remote-turn-off").await
+}
+pub async fn wake_machine(mac: &str) -> Result<String, String> {
+    machine_action(mac, "/wake").await
+}
+
+#[derive(serde::Deserialize)]
+struct MachineStatus {
+    is_on: bool,
+}
+
+pub async fn get_machine_status(mac: &str) -> Result<bool, String> {
+    let response = Request::get(&machine_url(mac, "/is-on"))
         .send()
-        .await;
-
-    let response = match response {
-        Ok(response) => response,
-        Err(err) => {
-            console_log(&format!("Error checking if machine is online: {err}"));
-            return false;
-        }
-    };
-
-    response.status() == 200
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(decode_response::<MachineStatus>(response).await?.is_on)
 }
 
 pub async fn get_shutdown_setup(mac: &str) -> Result<ShutdownSetup, String> {
-    let mac = encode_path_segment(mac);
-    let response = Request::get(&format!(
-        "{}/machines/{}/shutdown-setup",
-        API_BASE.as_str(),
-        mac
-    ))
-    .send()
-    .await
-    .map_err(|error| error.to_string())?;
-    decode_shutdown_setup_http_response(response).await
+    let response = Request::get(&machine_url(mac, "/shutdown-setup"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    decode_response(response).await
 }
 
 pub async fn verify_shutdown_setup(mac: &str) -> Result<ShutdownSetup, String> {
-    let mac = encode_path_segment(mac);
-    let response = Request::post(&format!(
-        "{}/machines/{}/shutdown-setup/verify",
-        API_BASE.as_str(),
-        mac
-    ))
-    .send()
-    .await
-    .map_err(|error| error.to_string())?;
-    decode_shutdown_setup_http_response(response).await
+    let response = Request::post(&machine_url(mac, "/shutdown-setup/verify"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    decode_response(response).await
 }
 
 pub async fn rotate_shutdown_key(mac: &str) -> Result<ShutdownSetup, String> {
-    let mac = encode_path_segment(mac);
-    let response = Request::post(&format!(
-        "{}/machines/{}/shutdown-setup/rotate",
-        API_BASE.as_str(),
-        mac
-    ))
-    .send()
-    .await
-    .map_err(|error| error.to_string())?;
-    decode_shutdown_setup_http_response(response).await
-}
-
-async fn decode_shutdown_setup_http_response(
-    response: gloo_net::http::Response,
-) -> Result<ShutdownSetup, String> {
-    let is_success = response.ok();
-    let body = response
-        .json::<serde_json::Value>()
+    let response = Request::post(&machine_url(mac, "/shutdown-setup/rotate"))
+        .send()
         .await
-        .map_err(|error| error.to_string())?;
-    decode_shutdown_setup_response(is_success, body)
-}
-
-fn decode_shutdown_setup_response(
-    is_success: bool,
-    body: serde_json::Value,
-) -> Result<ShutdownSetup, String> {
-    if !is_success {
-        return Err(body
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| body.to_string()));
-    }
-
-    serde_json::from_value(body).map_err(|error| error.to_string())
+        .map_err(|e| e.to_string())?;
+    decode_response(response).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn shutdown_setup_error_preserves_backend_message() {
-        let result = decode_shutdown_setup_response(
-            false,
-            serde_json::json!({ "error": "Failed to persist shutdown setup" }),
+    fn machine_urls_use_current_origin_and_escape_identifiers() {
+        assert_eq!(
+            machine_url("AA:BB/CC", "/wake"),
+            "/api/machines/AA%3ABB%2FCC/wake"
         );
-
-        assert_eq!(result, Err("Failed to persist shutdown setup".to_string()));
     }
-
     #[test]
-    fn shutdown_setup_success_deserializes_the_setup() {
-        let result = decode_shutdown_setup_response(
-            true,
-            serde_json::json!({
-                "status": "verified",
-                "unix_command": null,
-                "windows_command": null
-            }),
-        )
-        .expect("successful response should deserialize");
-
-        assert_eq!(result.status, crate::models::ShutdownSetupStatus::Verified);
+    fn offline_json_is_not_confused_with_http_success() {
+        let status: MachineStatus =
+            serde_json::from_value(serde_json::json!({"is_on":false})).unwrap();
+        assert!(!status.is_on);
+    }
+    #[test]
+    fn api_errors_preserve_actionable_server_details() {
+        assert_eq!(
+            response_error(500, &serde_json::json!({"error":"Failed to save machines"})),
+            "Failed to save machines"
+        );
+        assert!(
+            response_error(
+                400,
+                &serde_json::json!({"errors":{"mac":["Invalid MAC address"]}})
+            )
+            .contains("MAC address")
+        );
     }
 }

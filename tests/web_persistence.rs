@@ -32,6 +32,7 @@ fn save_and_load_machines_round_trip() {
         ip: "192.168.1.10".parse().unwrap(),
         name: "Desktop".into(),
         description: Some("Main desktop".into()),
+        machine_type: Default::default(),
         turn_off_port: Some(4000),
         can_be_turned_off: true,
         shutdown_auth_key: Some(wakezilla::shutdown_auth::generate_key()),

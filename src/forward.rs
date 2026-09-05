@@ -92,7 +92,11 @@ impl TurnOffLimiter {
     }
 
     pub fn initialize_machine(&self, machine: &Machine, turn_off_port: u16) {
-        let window_minutes = machine.inactivity_period.max(1);
+        if !machine.can_be_turned_off || machine.inactivity_period == 0 {
+            self.remove_machine(machine.ip);
+            return;
+        }
+        let window_minutes = machine.inactivity_period;
         let window_secs = window_minutes.saturating_mul(60);
         let config = MachineConfig {
             window: Duration::from_secs(window_secs as u64),
@@ -108,7 +112,11 @@ impl TurnOffLimiter {
 
     #[allow(dead_code)]
     pub fn update_machine(&self, machine: &Machine, turn_off_port: u16) {
-        let window_minutes = machine.inactivity_period.max(1);
+        if !machine.can_be_turned_off || machine.inactivity_period == 0 {
+            self.remove_machine(machine.ip);
+            return;
+        }
+        let window_minutes = machine.inactivity_period;
         let window_secs = window_minutes.saturating_mul(60);
         let mut machines = self.machines.lock().unwrap();
         if let Some(config) = machines.get_mut(&machine.ip) {
@@ -127,6 +135,12 @@ impl TurnOffLimiter {
             // Machine not found, initialize it
             drop(machines);
             self.initialize_machine(machine, turn_off_port);
+        }
+    }
+
+    pub fn remove_machine(&self, ip: Ipv4Addr) {
+        if let Ok(mut machines) = self.machines.lock() {
+            machines.remove(&ip);
         }
     }
 
@@ -373,27 +387,6 @@ impl TurnOffLimiter {
         config: Arc<Config>,
         access_log: Arc<RwLock<AccessLog>>,
     ) -> Result<()> {
-        // Initialize machine configuration if turn-off is enabled
-        if machine.can_be_turned_off {
-            if let Some(port) = machine.turn_off_port {
-                limiter.initialize_machine(&machine, port);
-                info!(
-                    "Initialized inactivity monitoring for machine {} ({}): {}min",
-                    machine.mac, machine.ip, machine.inactivity_period
-                );
-            } else {
-                debug!(
-                    "Turn off port not configured for {}, skipping inactivity-based shutdown",
-                    machine.mac
-                );
-            }
-        } else {
-            info!(
-                "Machine {} cannot be turned off automatically (feature disabled)",
-                machine.mac
-            );
-        }
-
         limiter
             .proxy_internal(local_port, remote_addr, machine, rx, config, access_log)
             .await
@@ -437,6 +430,31 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
+
+    fn monitored_machine(minutes: u32) -> Machine {
+        serde_json::from_value(serde_json::json!({
+            "mac": "02:00:00:00:00:01", "ip": "127.0.0.1", "name": "test",
+            "description": null, "turn_off_port": 3001, "can_be_turned_off": true,
+            "inactivity_period": minutes, "port_forwards": []
+        }))
+        .expect("valid test machine")
+    }
+
+    #[test]
+    fn zero_inactivity_does_not_schedule_shutdown() {
+        let limiter = TurnOffLimiter::new();
+        limiter.initialize_machine(&monitored_machine(0), 3001);
+        assert!(limiter.machines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn setting_zero_cancels_an_existing_shutdown_timer() {
+        let limiter = TurnOffLimiter::new();
+        limiter.initialize_machine(&monitored_machine(30), 3001);
+        assert_eq!(limiter.machines.lock().unwrap().len(), 1);
+        limiter.update_machine(&monitored_machine(0), 3001);
+        assert!(limiter.machines.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn turn_off_url_formats_expected_path() {

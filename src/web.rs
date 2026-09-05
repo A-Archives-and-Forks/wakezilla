@@ -69,6 +69,8 @@ pub struct Machine {
     )]
     pub ip: Ipv4Addr,
     pub name: String,
+    #[serde(default)]
+    pub machine_type: wakezilla_common::MachineType,
     pub description: Option<String>,
     pub turn_off_port: Option<u16>,
     pub can_be_turned_off: bool,
@@ -89,6 +91,7 @@ impl std::fmt::Debug for Machine {
             .field("mac", &self.mac)
             .field("ip", &self.ip)
             .field("name", &self.name)
+            .field("machine_type", &self.machine_type)
             .field("description", &self.description)
             .field("turn_off_port", &self.turn_off_port)
             .field("can_be_turned_off", &self.can_be_turned_off)
@@ -129,7 +132,7 @@ pub fn validate_mac(mac: &str) -> Result<(), ValidationError> {
     }
 }
 pub fn get_default_inactivity_period() -> u32 {
-    30
+    60
 }
 
 #[derive(Clone)]
@@ -165,6 +168,7 @@ pub fn internal_port_forward_to_api(pf: &PortForward) -> wakezilla_common::PortF
 pub fn machine_to_api_machine(machine: &Machine) -> wakezilla_common::Machine {
     wakezilla_common::Machine {
         name: machine.name.clone(),
+        machine_type: machine.machine_type,
         mac: machine.mac.clone(),
         ip: machine.ip.to_string(),
         description: machine.description.clone(),
@@ -186,6 +190,7 @@ pub fn api_machine_to_internal(api: &wakezilla_common::Machine) -> Result<Machin
         .with_context(|| format!("Invalid IPv4 address: {}", api.ip))?;
 
     Ok(Machine {
+        machine_type: api.machine_type,
         mac: api.mac.clone(),
         ip,
         name: api.name.clone(),
@@ -257,6 +262,16 @@ fn save_machines_to_path(machines: &[Machine], path: PathBuf) -> Result<()> {
 }
 
 pub fn start_proxy_if_configured(machine: &Machine, state: &AppState) {
+    // Configure the timer before spawning forwarders so an old forwarder cannot
+    // restore a timer after an edit disables automatic shutdown.
+    if let Some(port) = machine
+        .turn_off_port
+        .filter(|_| machine.can_be_turned_off && !machine.port_forwards.is_empty())
+    {
+        state.turn_off_limiter.initialize_machine(machine, port);
+    } else {
+        state.turn_off_limiter.remove_machine(machine.ip);
+    }
     for pf in &machine.port_forwards {
         let remote_addr = SocketAddr::new(machine.ip.into(), pf.target_port);
         let local_port = pf.local_port;
@@ -410,6 +425,7 @@ mod tests {
             ip: Ipv4Addr::new(10, 0, 0, 1),
             name: "Test".to_string(),
             description: Some("Example".to_string()),
+            machine_type: Default::default(),
             turn_off_port: Some(9000),
             can_be_turned_off: true,
             shutdown_auth_key: None,

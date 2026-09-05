@@ -1,5 +1,17 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineType {
+    #[default]
+    Server,
+    Nas,
+    Computer,
+    MiniPc,
+    RaspberryPi,
+    Notebook,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ShutdownSetupStatus {
@@ -30,6 +42,8 @@ pub struct PortForward {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Machine {
     pub name: String,
+    #[serde(default)]
+    pub machine_type: MachineType,
     pub mac: String,
     pub ip: String,
     pub description: Option<String>,
@@ -43,6 +57,7 @@ impl Default for Machine {
     fn default() -> Self {
         Self {
             name: "".to_string(),
+            machine_type: MachineType::default(),
             mac: "".to_string(),
             ip: "".to_string(),
             description: None,
@@ -56,6 +71,8 @@ impl Default for Machine {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AddMachinePayload {
+    #[serde(default)]
+    pub machine_type: Option<MachineType>,
     pub mac: String,
     pub ip: String,
     pub name: String,
@@ -68,6 +85,8 @@ pub struct AddMachinePayload {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UpdateMachinePayload {
+    #[serde(default)]
+    pub machine_type: Option<MachineType>,
     pub mac: String,
     pub ip: String,
     pub name: String,
