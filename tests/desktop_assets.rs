@@ -139,12 +139,16 @@ fn validate_decoded_rgba_icon(
     let pixel_count = width * height;
     let visible_count = decoded
         .pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|pixel| pixel[3] != 0)
         .count();
     let opaque_count = decoded
         .pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|pixel| pixel[3] >= 250)
         .count();
     let visible_coverage = visible_count as f64 / pixel_count as f64;
@@ -430,7 +434,7 @@ fn icns_without_chunk(bytes: &[u8], removed_kind: &[u8; 4]) -> Vec<u8> {
 #[test]
 fn semantic_icon_validator_rejects_a_fully_transparent_fixture() {
     let mut decoded = decode_png(MASTER_PNG, "transparent fixture");
-    for pixel in decoded.pixels.chunks_exact_mut(4) {
+    for pixel in decoded.pixels.as_chunks_mut::<4>().0 {
         pixel[3] = 0;
     }
 
@@ -444,7 +448,7 @@ fn semantic_icon_validator_rejects_a_fully_transparent_fixture() {
 fn semantic_icon_validator_rejects_an_opaque_rgb_fixture() {
     let mut decoded = decode_png(MASTER_PNG, "opaque RGB fixture");
     decoded.source_color_type = png::ColorType::Rgb;
-    for pixel in decoded.pixels.chunks_exact_mut(4) {
+    for pixel in decoded.pixels.as_chunks_mut::<4>().0 {
         pixel[3] = 255;
     }
 

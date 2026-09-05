@@ -836,11 +836,15 @@ fn macos_white_mascot_rgba(rgba: &mut [u8], width: u32, height: u32) {
     assert_eq!(rgba.len(), pixel_count * 4, "tray icon must be RGBA");
 
     let alpha = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| pixel[3])
         .collect::<Vec<_>>();
     let dark = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| {
             let luma =
                 (54 * u16::from(pixel[0]) + 183 * u16::from(pixel[1]) + 19 * u16::from(pixel[2]))
@@ -879,7 +883,7 @@ fn rgba_from_png_frame(bytes: &[u8], color_type: png::ColorType) -> Result<Vec<u
         png::ColorType::Rgba => Ok(bytes.to_vec()),
         png::ColorType::Rgb => {
             let mut rgba = Vec::with_capacity(bytes.len() / 3 * 4);
-            for chunk in bytes.chunks_exact(3) {
+            for chunk in bytes.as_chunks::<3>().0 {
                 rgba.extend_from_slice(chunk);
                 rgba.push(255);
             }
@@ -894,7 +898,7 @@ fn rgba_from_png_frame(bytes: &[u8], color_type: png::ColorType) -> Result<Vec<u
         }
         png::ColorType::GrayscaleAlpha => {
             let mut rgba = Vec::with_capacity(bytes.len() / 2 * 4);
-            for chunk in bytes.chunks_exact(2) {
+            for chunk in bytes.as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
             }
             Ok(rgba)
