@@ -74,6 +74,7 @@ async function waitText(locator,text) { await locator.filter({hasText:text}).wai
    if(width===1440) state.failList=true;
    await page.goto(base);
    assert.equal(await page.locator('html').getAttribute('lang'),'en');
+   assert.equal(await page.locator('.brand').getAttribute('href'),'https://wakezilla.dev');
    if(state.failList) {await waitText(page.locator('[role=alert]'),'Could not load');state.failList=false;await page.getByRole('button',{name:'Try again'}).click();}
    await page.getByRole('button',{name:'Open NAS',exact:true}).waitFor();
    await page.locator('.machine-card.online').first().waitFor();

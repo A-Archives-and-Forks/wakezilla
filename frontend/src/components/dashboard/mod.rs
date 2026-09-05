@@ -149,7 +149,7 @@ pub fn HomePage() -> impl IntoView {
             if event.key() == "/" && !editing && state.dialog.get_untracked().is_none() { event.prevent_default(); activity.set(false); if let Some(input) = search_input.get() { let _ = input.focus(); } }
         }>
             <header class="topbar">
-                <a class="brand" href="/" aria-label="Wakezilla home"><img src="/images/wakezilla.png" alt="" width="47" height="40"/><span>"wakezilla"<span class="brand-period">"."</span></span></a>
+                <a class="brand" href="https://wakezilla.dev" aria-label="Wakezilla website"><img src="/images/wakezilla.png" alt="" width="47" height="40"/><span>"wakezilla"<span class="brand-period">"."</span></span></a>
                 <div class="topbar-actions"><button class="icon-button" id="theme-toggle" aria-label="Light theme" aria-pressed=move || light.get().to_string() title=move || if light.get() { "Use dark theme" } else { "Use light theme" } on:click=move |_| { light.update(|value| *value = !*value); browser::apply_theme(light.get_untracked()); }>{move || view! { <Icon name=if light.get() { "moon" } else { "sun" }/> }}</button></div>
             </header>
             <main class="workspace">
