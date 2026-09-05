@@ -9,7 +9,7 @@ use leptos_router::{
     path,
 };
 
-use components::{HomePage, MachineDetailPage};
+use components::HomePage;
 
 #[component]
 fn App() -> impl IntoView {
@@ -17,15 +17,12 @@ fn App() -> impl IntoView {
 
     view! {
         <Html attr:lang="en" />
-        <Stylesheet id="leptos" href="/style/main.css" />
         <Title text="Wakezilla" />
         <Router>
-            <main class="container">
-                <Routes fallback=|| "Page not found">
+                <Routes fallback=|| view! { <p>"Page not found. "<a href="/">"Return to dashboard"</a></p> }>
                     <Route path=path!("/") view=HomePage />
-                    <Route path=path!("/machines/:mac") view=MachineDetailPage />
+                    <Route path=path!("/machines/:mac") view=HomePage />
                 </Routes>
-            </main>
         </Router>
     }
 }

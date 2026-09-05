@@ -151,7 +151,7 @@ mod tests {
             "packet must start with six 0xFF bytes"
         );
 
-        for (idx, chunk) in packet[6..].chunks_exact(6).enumerate() {
+        for (idx, chunk) in packet[6..].chunks(6).enumerate() {
             assert_eq!(chunk, mac, "MAC repetition {} does not match", idx + 1);
         }
     }

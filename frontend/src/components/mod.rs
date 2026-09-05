@@ -1,9 +1,3 @@
-mod error;
-mod header;
-mod home;
-mod machines;
+mod dashboard;
 
-pub use error::ErrorDisplay;
-pub use header::Header;
-pub use home::HomePage;
-pub use machines::*;
+pub use dashboard::HomePage;

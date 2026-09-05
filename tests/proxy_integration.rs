@@ -62,6 +62,7 @@ async fn proxy_forwards_tcp_traffic_and_can_shutdown() {
         },
         name: "proxy-integration".to_string(),
         description: None,
+        machine_type: Default::default(),
         turn_off_port: None,
         can_be_turned_off: false,
         shutdown_auth_key: None,

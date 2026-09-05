@@ -59,6 +59,7 @@ fn sample_machine() -> InternalMachine {
         ip: "127.0.0.1".parse().expect("valid ip"),
         name: "Workstation".to_string(),
         description: Some("Primary workstation".to_string()),
+        machine_type: Default::default(),
         turn_off_port: None,
         can_be_turned_off: false,
         shutdown_auth_key: None,

@@ -65,9 +65,9 @@ pub async fn verify_remote_client(
 }
 
 struct MachineConfig {
+    ip: Ipv4Addr,
     window: Duration,
     turn_off_port: u16,
-    mac: String,
     shutdown_auth_key: Option<String>,
     triggered: AtomicBool,
     last_request: Instant,
@@ -75,7 +75,7 @@ struct MachineConfig {
 
 #[derive(Clone)]
 pub struct TurnOffLimiter {
-    machines: Arc<Mutex<HashMap<Ipv4Addr, MachineConfig>>>,
+    machines: Arc<Mutex<HashMap<String, MachineConfig>>>,
 }
 
 impl Default for TurnOffLimiter {
@@ -92,30 +92,38 @@ impl TurnOffLimiter {
     }
 
     pub fn initialize_machine(&self, machine: &Machine, turn_off_port: u16) {
-        let window_minutes = machine.inactivity_period.max(1);
+        if !machine.can_be_turned_off || machine.inactivity_period == 0 {
+            self.remove_machine(&machine.mac);
+            return;
+        }
+        let window_minutes = machine.inactivity_period;
         let window_secs = window_minutes.saturating_mul(60);
         let config = MachineConfig {
+            ip: machine.ip,
             window: Duration::from_secs(window_secs as u64),
             turn_off_port,
-            mac: machine.mac.clone(),
             shutdown_auth_key: machine.shutdown_auth_key.clone(),
             triggered: AtomicBool::new(false),
             last_request: Instant::now(),
         };
         let mut machines = self.machines.lock().unwrap();
-        machines.insert(machine.ip, config);
+        machines.insert(machine.mac.clone(), config);
     }
 
     #[allow(dead_code)]
     pub fn update_machine(&self, machine: &Machine, turn_off_port: u16) {
-        let window_minutes = machine.inactivity_period.max(1);
+        if !machine.can_be_turned_off || machine.inactivity_period == 0 {
+            self.remove_machine(&machine.mac);
+            return;
+        }
+        let window_minutes = machine.inactivity_period;
         let window_secs = window_minutes.saturating_mul(60);
         let mut machines = self.machines.lock().unwrap();
-        if let Some(config) = machines.get_mut(&machine.ip) {
+        if let Some(config) = machines.get_mut(&machine.mac) {
             // Update existing configuration
+            config.ip = machine.ip;
             config.window = Duration::from_secs(window_secs as u64);
             config.turn_off_port = turn_off_port;
-            config.mac = machine.mac.clone();
             config.shutdown_auth_key = machine.shutdown_auth_key.clone();
             // Reset triggered flag so it can trigger again if needed
             config.triggered.store(false, Ordering::SeqCst);
@@ -130,14 +138,20 @@ impl TurnOffLimiter {
         }
     }
 
-    pub fn update_last_request(&self, ip: Ipv4Addr) {
+    pub fn remove_machine(&self, mac: &str) {
+        if let Ok(mut machines) = self.machines.lock() {
+            machines.remove(mac);
+        }
+    }
+
+    pub fn update_last_request(&self, mac: &str) {
         let mut machines = self.machines.lock().unwrap();
-        if let Some(config) = machines.get_mut(&ip) {
+        if let Some(config) = machines.get_mut(mac) {
             config.last_request = Instant::now();
             config.triggered.store(false, Ordering::SeqCst);
             debug!(
                 "Updated last_request for machine {} (IP: {})",
-                config.mac, ip
+                mac, config.ip
             );
         }
     }
@@ -153,23 +167,23 @@ impl TurnOffLimiter {
                     let machines = limiter.machines.lock().unwrap();
                     machines
                         .iter()
-                        .filter_map(|(ip, config)| {
+                        .filter_map(|(mac, config)| {
                             let time_since_last_request = now.duration_since(config.last_request);
                             debug!(
                                 "Checking inactivity for machine {} (IP: {}): last request was {:?} ago, window is {:?}",
-                                config.mac, ip, time_since_last_request, config.window
+                                mac, config.ip, time_since_last_request, config.window
                             );
                             if time_since_last_request > config.window {
                                 // Use swap to atomically check and set triggered flag
                                 if !config.triggered.swap(true, Ordering::SeqCst) {
                                     debug!(
                                         "Machine {} (IP: {}) has been inactive for {:?}, exceeding window of {:?}",
-                                        config.mac, ip, time_since_last_request, config.window
+                                        mac, config.ip, time_since_last_request, config.window
                                     );
                                     Some((
-                                        *ip,
+                                        config.ip,
                                         config.turn_off_port,
-                                        config.mac.clone(),
+                                        mac.clone(),
                                         config.shutdown_auth_key.clone(),
                                     ))
                                 } else {
@@ -227,8 +241,6 @@ impl TurnOffLimiter {
             listen_addr, remote_addr, machine.inactivity_period
         );
 
-        let machine_ip = machine.ip;
-
         // Note: Monitor is started globally, not per proxy
 
         loop {
@@ -255,12 +267,12 @@ impl TurnOffLimiter {
                     let remote_addr_clone = remote_addr;
                     let mac_str_clone = machine.mac.clone();
                     let rate_limiter = self.clone();
-                    let machine_ip_clone = machine_ip;
+                    let machine_mac_clone = machine.mac.clone();
                     let config_clone = Arc::clone(&config);
 
                     tokio::spawn(async move {
                         // Update last_request whenever we receive a connection
-                        rate_limiter.update_last_request(machine_ip_clone);
+                        rate_limiter.update_last_request(&machine_mac_clone);
 
                         let connect_timeout = Duration::from_millis(1000);
                         if !wol::tcp_check(remote_addr_clone, connect_timeout).await {
@@ -373,27 +385,6 @@ impl TurnOffLimiter {
         config: Arc<Config>,
         access_log: Arc<RwLock<AccessLog>>,
     ) -> Result<()> {
-        // Initialize machine configuration if turn-off is enabled
-        if machine.can_be_turned_off {
-            if let Some(port) = machine.turn_off_port {
-                limiter.initialize_machine(&machine, port);
-                info!(
-                    "Initialized inactivity monitoring for machine {} ({}): {}min",
-                    machine.mac, machine.ip, machine.inactivity_period
-                );
-            } else {
-                debug!(
-                    "Turn off port not configured for {}, skipping inactivity-based shutdown",
-                    machine.mac
-                );
-            }
-        } else {
-            info!(
-                "Machine {} cannot be turned off automatically (feature disabled)",
-                machine.mac
-            );
-        }
-
         limiter
             .proxy_internal(local_port, remote_addr, machine, rx, config, access_log)
             .await
@@ -437,6 +428,46 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
+
+    fn monitored_machine(minutes: u32) -> Machine {
+        serde_json::from_value(serde_json::json!({
+            "mac": "02:00:00:00:00:01", "ip": "127.0.0.1", "name": "test",
+            "description": null, "turn_off_port": 3001, "can_be_turned_off": true,
+            "inactivity_period": minutes, "port_forwards": []
+        }))
+        .expect("valid test machine")
+    }
+
+    #[test]
+    fn zero_inactivity_does_not_schedule_shutdown() {
+        let limiter = TurnOffLimiter::new();
+        limiter.initialize_machine(&monitored_machine(0), 3001);
+        assert!(limiter.machines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn setting_zero_cancels_an_existing_shutdown_timer() {
+        let limiter = TurnOffLimiter::new();
+        limiter.initialize_machine(&monitored_machine(30), 3001);
+        assert_eq!(limiter.machines.lock().unwrap().len(), 1);
+        limiter.update_machine(&monitored_machine(0), 3001);
+        assert!(limiter.machines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn disabled_machine_with_shared_ip_does_not_cancel_another_timer() {
+        let limiter = TurnOffLimiter::new();
+        let monitored = monitored_machine(30);
+        let mut disabled = monitored_machine(0);
+        disabled.mac = "02:00:00:00:00:02".to_string();
+
+        limiter.initialize_machine(&monitored, 3001);
+        limiter.initialize_machine(&disabled, 3001);
+
+        let machines = limiter.machines.lock().unwrap();
+        assert_eq!(machines.len(), 1);
+        assert!(machines.contains_key(&monitored.mac));
+    }
 
     #[test]
     fn turn_off_url_formats_expected_path() {

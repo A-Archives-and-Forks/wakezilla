@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 pub use wakezilla_common::{
-    AccessHistory, DiscoveredDevice, Machine, NetworkInterface, PortForward, ServiceAccessHistory,
-    ShutdownSetup, ShutdownSetupStatus, UpdateMachinePayload,
+    AccessHistory, DiscoveredDevice, Machine, MachineType, NetworkInterface, PortForward,
+    ServiceAccessHistory, ShutdownSetup, ShutdownSetupStatus, UpdateMachinePayload,
 };
 
 pub fn validate_machine_form(machine: &Machine) -> HashMap<String, Vec<String>> {
@@ -12,7 +12,7 @@ pub fn validate_machine_form(machine: &Machine) -> HashMap<String, Vec<String>> 
         errors.insert("name".to_string(), vec!["Name is required".to_string()]);
     }
 
-    if machine.ip.parse::<std::net::IpAddr>().is_err() {
+    if machine.ip.parse::<std::net::Ipv4Addr>().is_err() {
         errors.insert("ip".to_string(), vec!["Invalid IP address".to_string()]);
     }
 
@@ -58,6 +58,7 @@ mod tests {
             mac: "AA:BB:CC:DD:EE:FF".into(),
             ip: "bad-ip".into(),
             description: None,
+            machine_type: Default::default(),
             turn_off_port: None,
             can_be_turned_off: false,
             inactivity_period: 30,
