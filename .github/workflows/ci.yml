@@ -387,7 +387,7 @@ jobs:
       - name: Install Trunk
         uses: taiki-e/install-action@v2
         with:
-          tool: trunk
+          tool: trunk@0.21.14
 
       - name: Build frontend
         env:
