@@ -1,1 +1,18 @@
-<svg class="hardware-art" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="m22 10 44 8v36l-43-7Z" fill="#a0b9c6"/><path d="m26 15 36 6v27l-36-6Z" fill="#345362"/><path d="m26 32 14-10 22 18v8l-36-6Z" fill="#567c89"/><path d="m39 42 15-14 8 5v15Z" fill="#88a4ab"/><path d="m23 47 43 7-17 15-43-9Z" fill="#a8b9bd"/><path d="m6 60 43 9 17-15v4L49 73 6 64Z" fill="#6c8992"/><path d="m25 50 32 6-9 8-32-7Z" fill="#3d5963"/><path d="m23 53 28 5m-31-2 27 5m-20-9-5 5m11-4-5 6m12-5-6 6m12-5-6 7" stroke="#8ba5ad" stroke-width=".7"/><path d="m30 61 9 2-4 4-9-2Z" fill="#90a8b0"/><circle cx="40" cy="59" r=".9" fill="#e89785"/></svg>
+<svg viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <defs>
+    <linearGradient id="laptop-screen" x1="25" y1="22" x2="70" y2="54" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#416877"/>
+      <stop offset="1" stop-color="#7297A2"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="48" cy="83" rx="39" ry="5" fill="#102123" fill-opacity=".24"/>
+  <rect x="12" y="13" width="72" height="50" rx="7" fill="#AFC8CE" stroke="#29434A" stroke-width="2.5"/>
+  <rect x="19" y="20" width="58" height="34" rx="3" fill="url(#laptop-screen)" stroke="#29434A" stroke-width="2"/>
+  <path d="m19 45 17-14 11 9 11-12 19 16v10H19V45Z" fill="#94B0B8"/>
+  <circle cx="48" cy="17" r="1.5" fill="#536F76"/>
+  <path d="M13 62h70l9 13c2 3 0 6-4 6H8c-4 0-6-3-4-6l9-13Z" fill="#B7CDD0" stroke="#29434A" stroke-width="2.5" stroke-linejoin="round"/>
+  <path d="M21 66h54l7 9H14l7-9Z" fill="#3D5B62"/>
+  <path d="M29 69h38M24 73h48M36 67l-3 8M47 67v8M58 67l3 8" stroke="#87A4AA" stroke-width="2" stroke-linecap="round"/>
+  <path d="M40 77h17l-3 3H42l-2-3Z" fill="#E1EAE6"/>
+  <circle cx="75" cy="73" r="2" fill="#F2A184"/>
+</svg>

@@ -1,1 +1,15 @@
-<svg class="hardware-art" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="m13 38 24-13c2-1 4-1 6 0l24 13v16c0 3-1 4-4 6L44 71c-3 2-6 2-9 0L16 60c-2-1-3-3-3-5Z" fill="#889695"/><path d="M13 39c0-2 1-4 4-5l19-10c3-2 6-2 9 0l20 11c3 2 3 5 0 7L44 54c-3 2-6 2-9 0L16 44c-2-1-3-3-3-5Z" fill="#d1d7d3"/><path d="M40 55v18c2 0 3-.4 4-1l20-12c3-2 4-4 4-7V39c-1 2-3 3-4 4L45 54c-2 1-3 1-5 1Z" fill="#aab6b0"/><path d="m21 51 5 3m2 1 5 3" stroke="#455652" stroke-width="2" stroke-linecap="round"/><circle cx="35" cy="60" r="1" fill="#e7faf1"/><path d="m38 34 5 3-4 3-5-3Z" fill="#9aa7a0"/></svg>
+<svg viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <defs>
+    <linearGradient id="mini-top" x1="17" y1="25" x2="74" y2="61" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#EDF1EC"/>
+      <stop offset="1" stop-color="#AFC2B9"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="48" cy="78" rx="34" ry="7" fill="#102123" fill-opacity=".24"/>
+  <path d="M15 42c0-5 3-9 8-12l18-10c4-2 10-2 14 0l18 10c5 3 8 7 8 12v22c0 5-3 9-8 12L55 86c-4 2-10 2-14 0L23 76c-5-3-8-7-8-12V42Z" fill="#7E9B90" stroke="#29433F" stroke-width="2"/>
+  <path d="M15 42c0-5 3-9 8-12l18-10c4-2 10-2 14 0l18 10c10 6 10 17 0 23L55 63c-4 2-10 2-14 0L23 53c-5-3-8-7-8-11Z" fill="url(#mini-top)" stroke="#29433F" stroke-width="2"/>
+  <path d="M48 65v22M18 50v14c0 4 2 7 6 9l17 10" stroke="#55766B" stroke-width="2"/>
+  <path d="m41 37 7-4 7 4-7 4-7-4Z" fill="#91A79D"/>
+  <path d="M25 65h12M25 70h8" stroke="#365750" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="41" cy="72" r="2.5" fill="#A8E8BE"/>
+</svg>
