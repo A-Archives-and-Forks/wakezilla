@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           if ! command -v trunk &> /dev/null; then
-            cargo install trunk
+            cargo install trunk --version 0.21.14 --locked
           fi
 
       - name: Build frontend
@@ -307,7 +307,7 @@ jobs:
         run: |
           rustup toolchain install nightly --allow-downgrade
           rustup target add wasm32-unknown-unknown --toolchain nightly
-          cargo install trunk --locked
+          cargo install trunk --version 0.21.14 --locked
           cargo install wasm-bindgen-cli --locked
 
       - name: Build packaged frontend assets
