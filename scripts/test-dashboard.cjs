@@ -92,6 +92,7 @@ async function waitText(locator,text) { await locator.filter({hasText:text}).wai
     const surfaces=await page.evaluate(()=>({dialog:getComputedStyle(document.querySelector('dialog')).backgroundColor,input:getComputedStyle(document.querySelector('#machine-name')).backgroundColor}));
     assert.equal(surfaces.dialog,theme==='light'?'rgb(243, 246, 240)':'rgb(30, 43, 42)');
     assert.equal(surfaces.input,theme==='light'?'rgb(252, 253, 249)':'rgba(8, 20, 20, 0.25)');
+    const inactivity=page.locator('#machine-idle');await inactivity.fill('17');await inactivity.fill('');assert.equal(await inactivity.inputValue(),'');assert.equal(await inactivity.evaluate(input=>input.checkValidity()),false);await inactivity.fill('0');
     await page.screenshot({path:`${output}/edit-${width}-${theme}.png`,animations:'disabled'});await close(page);
    }
    await page.getByRole('button',{name:'List view'}).click();await noOverflow(page);await page.getByRole('button',{name:'Grid view'}).click();

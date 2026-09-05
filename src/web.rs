@@ -270,7 +270,7 @@ pub fn start_proxy_if_configured(machine: &Machine, state: &AppState) {
     {
         state.turn_off_limiter.initialize_machine(machine, port);
     } else {
-        state.turn_off_limiter.remove_machine(machine.ip);
+        state.turn_off_limiter.remove_machine(&machine.mac);
     }
     for pf in &machine.port_forwards {
         let remote_addr = SocketAddr::new(machine.ip.into(), pf.target_port);

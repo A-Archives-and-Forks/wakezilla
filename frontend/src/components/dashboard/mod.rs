@@ -159,7 +159,7 @@ pub fn HomePage() -> impl IntoView {
                         <div class="panel-title"><Icon name="network"/><h2>"Overview"</h2></div>
                         <div class="overview-ring"><svg viewBox="0 0 120 120" aria-hidden="true"><circle class="ring-track" cx="60" cy="60" r="49"/><circle class="ring-progress" cx="60" cy="60" r="49" style:stroke-dashoffset=move || (307.9 * (1.0 - online() as f64 / state.machines.get().len().max(1) as f64)).to_string()/></svg><div><strong>{online}<span>{move || format!("/{}", state.machines.get().len())}</span></strong><span>"machines online"</span></div></div>
                         <div class="summary-stats"><div><span class="status-dot green"></span>"Online"<strong>{online}</strong></div><div><span class="status-dot muted"></span>"Unreachable"<strong>{offline}</strong></div><div><Icon name="zap"/>"Configured services"<strong>{move || state.machines.with(|machines| machines.iter().map(|machine| machine.port_forwards.len()).sum::<usize>())}</strong></div></div>
-                        <Show when={move || state.machines.get().len() > online() + offline()}><p class="summary-note">{move || format!("{} without a confirmed status", state.machines.get().len() - online() - offline())}</p></Show>
+                        <Show when={move || state.machines.get().len() > online() + offline()}><p class="summary-note">{move || format!("{} without a confirmed status", state.machines.get().len().saturating_sub(online()).saturating_sub(offline()))}</p></Show>
                     </section>
                 </aside>
                 <div class="main-content">

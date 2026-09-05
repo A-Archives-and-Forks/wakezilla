@@ -57,6 +57,7 @@ fn save_and_load_machines_round_trip() {
     assert_eq!(loaded_machine.ip, original.ip);
     assert_eq!(loaded_machine.name, original.name);
     assert_eq!(loaded_machine.description, original.description);
+    assert_eq!(loaded_machine.machine_type, original.machine_type);
     assert_eq!(loaded_machine.turn_off_port, original.turn_off_port);
     assert_eq!(loaded_machine.can_be_turned_off, original.can_be_turned_off);
     assert_eq!(loaded_machine.shutdown_auth_key, original.shutdown_auth_key);

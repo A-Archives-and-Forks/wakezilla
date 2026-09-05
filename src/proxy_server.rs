@@ -777,7 +777,7 @@ async fn update_machine_api(
         ));
     }
     *machines = updated;
-    state.turn_off_limiter.remove_machine(old_machine.ip);
+    state.turn_off_limiter.remove_machine(&old_machine.mac);
 
     // Stop old proxies if machine existed
     {
@@ -831,7 +831,7 @@ async fn delete_machine_api(
     }
     *machines = updated;
     if let Some(machine) = removed {
-        state.turn_off_limiter.remove_machine(machine.ip);
+        state.turn_off_limiter.remove_machine(&machine.mac);
     }
     let mut proxies = state.proxies.write().await;
     let prefix = format!("{}-", payload.mac);
